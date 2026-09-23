@@ -56,7 +56,7 @@ ai-work-order/
 ### 阶段 2：Tool Gateway
 - 实现 MCP 兼容接口，暴露两个工具：
   - `search_knowledge(query: str, tenant_id: str) -> list[{question, answer, score}]`：v1 用简单的关键词模糊匹配/全文检索（PostgreSQL `pg_trgm` 或简单 `ILIKE` 即可，不做向量化）。
-  - `create_ticket(summary: str, category: str, conversation_ref: str, tenant_id: str) -> {ticket_id}`：写入 `tickets` 表，状态置为 `open`。
+  - `create_ticket(summary: str, category: str, conversation_ref: str, tenant_id: str, idempotency_key: str) -> {ticket_id}`：写入 `tickets` 表，状态置为 `open`。**已补充 idempotency_key**：Agent Runtime 基于 LangGraph checkpoint 做崩溃恢复重跑（架构文档 3.3 节），可能重放一次已经成功但结果未落盘的 create_ticket 调用；`tickets` 表加了 `(tenant_id, idempotency_key)` 局部唯一索引，重放用同一个 key 会原样返回已建工单的 id，不会重复建单。这个 key 应由调用方在第一次尝试前生成并写入 checkpoint 状态，重放时复用同一个值。
   - 补充 `update_ticket_status(ticket_id: str, status: str, tenant_id: str) -> {ok: bool}`。**已从原计划的 (ticket_id, status) 改为带 tenant_id**：RLS 隔离要求调用方声明租户来限定会话上下文，没有 tenant_id 就无法对这个工具应用和另外两个工具一致的隔离策略，属于原计划的疏漏，实现时已修正。
 - 内部按架构文档 3.4 节实现 `TicketProvider` 抽象，v1 只有一个 `InternalTicketProvider` 实现。
 - 每次工具调用写审计日志（`tenant_id`、工具名、参数摘要、耗时、结果状态），落到独立的 `tool_call_logs` 表或结构化日志均可，两者选一但要有。

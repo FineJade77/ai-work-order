@@ -26,9 +26,24 @@ def search_knowledge(query: str, tenant_id: str) -> list[KnowledgeResult]:
 
 
 @mcp_server.tool()
-def create_ticket(summary: str, category: str, conversation_ref: str, tenant_id: str) -> CreateTicketResult:
-    """Create an IT ticket for this tenant, linked to the source conversation."""
-    params_summary = json.dumps({"summary": summary, "category": category, "conversation_ref": conversation_ref})
+def create_ticket(
+    summary: str, category: str, conversation_ref: str, tenant_id: str, idempotency_key: str
+) -> CreateTicketResult:
+    """Create an IT ticket for this tenant, linked to the source conversation.
+
+    idempotency_key: caller-generated and stable across retries of the *same* logical
+    ticket-creation decision (e.g. persisted in Agent Runtime's LangGraph checkpoint
+    state before the first attempt). Retrying with the same key returns the original
+    ticket_id instead of creating a duplicate; a new key means a genuinely new ticket.
+    """
+    params_summary = json.dumps(
+        {
+            "summary": summary,
+            "category": category,
+            "conversation_ref": conversation_ref,
+            "idempotency_key": idempotency_key,
+        }
+    )
     try:
         parse_tenant_id(tenant_id)
     except ValueError as exc:
@@ -37,7 +52,11 @@ def create_ticket(summary: str, category: str, conversation_ref: str, tenant_id:
 
     with audit_tool_call("create_ticket", tenant_id, params_summary):
         ticket_id = ticket_provider.create(
-            tenant_id=tenant_id, summary=summary, category=category, conversation_ref=conversation_ref
+            tenant_id=tenant_id,
+            summary=summary,
+            category=category,
+            conversation_ref=conversation_ref,
+            idempotency_key=idempotency_key,
         )
         return CreateTicketResult(ticket_id=ticket_id)
 
