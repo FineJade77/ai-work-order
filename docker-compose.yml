@@ -61,5 +61,16 @@ services:
       redis:
         condition: service_healthy
 
+  migrate:
+    build: ./libs/shared
+    environment:
+      DATABASE_URL: postgresql+psycopg://work_order:work_order@postgres:5432/work_order
+      APP_DATABASE_URL: postgresql+psycopg://app_runtime:app_runtime_dev_password@postgres:5432/work_order
+      APP_DB_PASSWORD: app_runtime_dev_password
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: ["tools"]
+
 volumes:
   postgres-data:
