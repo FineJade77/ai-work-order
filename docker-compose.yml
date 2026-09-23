@@ -46,9 +46,13 @@ services:
         condition: service_healthy
 
   tool-gateway:
-    build: ./services/tool-gateway
+    build:
+      context: .
+      dockerfile: services/tool-gateway/Dockerfile
     ports:
       - "8003:8003"
+    environment:
+      APP_DATABASE_URL: postgresql+psycopg://app_runtime:app_runtime_dev_password@postgres:5432/work_order
     depends_on:
       postgres:
         condition: service_healthy

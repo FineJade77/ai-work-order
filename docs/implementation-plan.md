@@ -57,7 +57,7 @@ ai-work-order/
 - 实现 MCP 兼容接口，暴露两个工具：
   - `search_knowledge(query: str, tenant_id: str) -> list[{question, answer, score}]`：v1 用简单的关键词模糊匹配/全文检索（PostgreSQL `pg_trgm` 或简单 `ILIKE` 即可，不做向量化）。
   - `create_ticket(summary: str, category: str, conversation_ref: str, tenant_id: str) -> {ticket_id}`：写入 `tickets` 表，状态置为 `open`。
-  - 补充 `update_ticket_status(ticket_id: str, status: str) -> {ok: bool}`。
+  - 补充 `update_ticket_status(ticket_id: str, status: str, tenant_id: str) -> {ok: bool}`。**已从原计划的 (ticket_id, status) 改为带 tenant_id**：RLS 隔离要求调用方声明租户来限定会话上下文，没有 tenant_id 就无法对这个工具应用和另外两个工具一致的隔离策略，属于原计划的疏漏，实现时已修正。
 - 内部按架构文档 3.4 节实现 `TicketProvider` 抽象，v1 只有一个 `InternalTicketProvider` 实现。
 - 每次工具调用写审计日志（`tenant_id`、工具名、参数摘要、耗时、结果状态），落到独立的 `tool_call_logs` 表或结构化日志均可，两者选一但要有。
 - 对无效/缺失 `tenant_id` 的调用直接拒绝。
