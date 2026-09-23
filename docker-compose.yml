@@ -58,11 +58,18 @@ services:
         condition: service_healthy
 
   ai-gateway:
-    build: ./services/ai-gateway
+    build:
+      context: .
+      dockerfile: services/ai-gateway/Dockerfile
     ports:
       - "8004:8004"
+    environment:
+      APP_DATABASE_URL: postgresql+psycopg://app_runtime:app_runtime_dev_password@postgres:5432/work_order
+      MODEL_BASE_URL: https://api.deepseek.com
+      MODEL_NAME: deepseek-chat
+      MODEL_API_KEY: ${DEEPSEEK_API_KEY}
     depends_on:
-      redis:
+      postgres:
         condition: service_healthy
 
   migrate:
