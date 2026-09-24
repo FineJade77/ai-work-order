@@ -94,7 +94,8 @@ async def await_feedback(state: AgentState, runtime: Runtime[Deps]) -> dict:
     # Ends this run. The conversation's next message resumes here as the interrupt's value, and
     # this node then runs again from the top, so nothing may come before interrupt().
     reply = interrupt({"awaiting": "feedback"})
-    return {"task_id": str(runtime.context.task.task_id), "messages": [{"role": "user", "content": reply}]}
+    task = runtime.context.task
+    return {"task_id": str(task.task_id), "seq": task.seq, "messages": [{"role": "user", "content": reply}]}
 
 
 async def check_resolution(state: AgentState, runtime: Runtime[Deps]) -> dict:

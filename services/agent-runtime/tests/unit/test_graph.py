@@ -5,7 +5,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from app.graph import prompts
 from app.graph.builder import build_graph
-from app.worker.runner import TaskRunner
+from app.worker.runner import SUPERSEDED, TaskRunner
 from tests.fakes import FakeModels, FakeTools, RecordingEvents, make_task
 
 pytestmark = pytest.mark.anyio
@@ -18,12 +18,15 @@ class Env:
         self.events: list[tuple] = []
         self.conversation = uuid.uuid4()
         self.user = uuid.uuid4()
+        self.seq = 0
         self.runner = TaskRunner(
             build_graph(InMemorySaver()), self.tools, self.models, lambda t: RecordingEvents(t, self.events)
         )
 
     def task(self, content):
-        return make_task(self.conversation, content, user_id=self.user)
+        """The conversation's next turn, numbered like app-service numbers them."""
+        self.seq += 1
+        return make_task(self.conversation, content, user_id=self.user, seq=self.seq)
 
     def types(self, task=None):
         return [typ for tid, typ, _ in self.events if task is None or tid == str(task.task_id)]
@@ -170,3 +173,20 @@ async def test_redelivered_finished_task_only_republishes_done(env):
     assert await env.runner.run(task) == "awaiting_feedback"
     assert (env.models.calls, env.tools.calls) == calls_before
     assert env.types(task)[-2:] == ["done", "done"]
+
+
+async def test_stale_copy_of_an_older_turn_is_not_taken_as_feedback(env):
+    first = env.task("VPN 连不上")
+    await env.runner.run(first)
+    env.models.resolution, env.models.category = "new_question", "email"
+    second = env.task("邮箱无法收发邮件")
+    assert await env.runner.run(second) == "awaiting_feedback"
+    config = {"configurable": {"thread_id": str(env.conversation)}}
+    state_before = (await env.runner._graph.aget_state(config)).values
+    seen = (list(env.events), list(env.models.calls), list(env.tools.calls))
+
+    # Redelivered after turn 2 already ran, the thread waiting on turn 2's answer.
+    assert await env.runner.run(first) == SUPERSEDED
+    assert (env.events, env.models.calls, env.tools.calls) == seen
+    assert (await env.runner._graph.aget_state(config)).values == state_before
+    assert state_before["seq"] == second.seq

@@ -10,7 +10,7 @@ from app.core.errors import RetryLater
 from app.events import EventPublisher
 from app.schemas.tasks import AgentTask
 from app.worker.locks import ConversationLock
-from app.worker.queue import Delivery, TaskQueue
+from app.worker.queue import Delivery, TaskQueue, floor_key
 from app.worker.runner import TaskRunner
 
 logger = logging.getLogger("agent_runtime.consumer")
@@ -22,7 +22,8 @@ FAILED_MESSAGE = "抱歉，这条消息处理失败了。请稍后重试，或�
 class TaskConsumer:
     """Pulls tasks and runs up to worker_concurrency of them at once.
 
-    A task is acknowledged only after its run finished and published 'done'. Anything else
+    A task is acknowledged only after its run finished and published 'done', or once it is known
+    to be a stale copy of an older turn (then nothing is published). Anything else
     (crash, timeout, error, RetryLater) leaves it pending, to be reclaimed by some consumer
     after claim_idle_seconds and resumed from its last checkpoint.
     """
@@ -80,6 +81,14 @@ class TaskConsumer:
             logger.info("conversation %s is busy; task_id=%s will be redelivered", task.conversation_id, task.task_id)
             return
         try:
+            # Checked under the lock, so a newer turn cannot start between this check and the run.
+            if await self._below_floor(task):
+                logger.warning(
+                    "skipping stale task_id=%s seq=%d: conversation %s has a newer turn",
+                    task.task_id, task.seq, task.conversation_id,
+                )
+                await self._queue.ack(delivery)
+                return
             with anyio.fail_after(self._settings.task_timeout_seconds):
                 await self._runner.run(task)
             await self._queue.ack(delivery)
@@ -87,3 +96,9 @@ class TaskConsumer:
             logger.info("task_id=%s retry later: %s", task.task_id, exc)
         finally:
             await lock.release()
+
+    async def _below_floor(self, task: AgentTask) -> bool:
+        # No floor (expired, or lost with Redis) means no verdict here; the runner's checkpointed
+        # seq still refuses anything older than what the thread has already processed.
+        floor = await self._redis.get(floor_key(task.conversation_id))
+        return floor is not None and task.seq < int(floor)

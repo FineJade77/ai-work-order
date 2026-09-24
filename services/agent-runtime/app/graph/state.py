@@ -12,6 +12,8 @@ class AgentState(TypedDict, total=False):
 
     # The task whose run last advanced this thread; tells a redelivered task whether to resume.
     task_id: str
+    # That task's seq; a task with a lower one is a stale copy and must not touch the thread.
+    seq: int
     # {"role": "user" | "assistant", "content": str}
     messages: Annotated[list[dict], operator.add]
     intent: str | None  # in_scope | out_of_scope | ticket_request | chitchat

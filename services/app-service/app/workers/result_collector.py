@@ -24,6 +24,7 @@ class ResultCollector:
 
     Consumer group, so replicas share the work and an unacknowledged result is redelivered.
     Handling is idempotent (the reply is upserted per turn), since delivery is at least once.
+    A late answer replaces a failed turn's notice only while that turn is still the newest.
     """
 
     def __init__(self, redis: Redis, consumer: str):
@@ -83,6 +84,10 @@ class ResultCollector:
                 logger.warning("result for unknown turn task_id=%s", task_id)
                 return
             if turn.status == "done":  # a redelivered result; a later failure never undoes an answer
+                return
+            if turn.status == "failed" and await repo.has_newer_turn(session, turn):
+                # The employee has moved on since this turn failed; an answer now would land out of order.
+                logger.warning("dropping late %s result for superseded task_id=%s", status, task_id)
                 return
             await repo.upsert_assistant_reply(session, turn, fields["content"])
             turn.status = status

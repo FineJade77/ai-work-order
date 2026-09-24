@@ -4,7 +4,7 @@ import uuid
 import anyio
 import pytest
 
-from app.clients.agent_bus import RESULT_STREAM, TASK_STREAM, AgentBus, event_stream_key
+from app.clients.agent_bus import RESULT_STREAM, TASK_STREAM, AgentBus, event_stream_key, floor_key
 from app.core.config import get_settings
 from app.workers.requeuer import NO_RESULT_MESSAGE, Requeuer
 from tests.integration.env import PASSWORD
@@ -71,9 +71,10 @@ async def test_send_enqueues_a_task_and_refuses_a_second_while_one_is_in_flight(
 
     [(_, task)] = await redis.xrange(TASK_STREAM)
     assert task == {
-        "task_id": task_id, "conversation_id": conversation, "tenant_id": str(tenant.id),
+        "task_id": task_id, "seq": "1", "conversation_id": conversation, "tenant_id": str(tenant.id),
         "user_id": str(tenant.alice.id), "content": "VPN 连不上",
     }
+    assert await redis.get(floor_key(conversation)) == "1"
     second = await send(client, alice, conversation, "还有一个问题")
     assert (second.status_code, second.json()["error"]["code"]) == (409, "TURN_IN_PROGRESS")
     assert (await history(client, alice, conversation))["active_task_id"] == task_id
@@ -93,6 +94,8 @@ async def test_result_is_stored_once_and_frees_the_conversation(client, redis, t
         ("assistant", "请重启 VPN 客户端。", task_id),
     ]
     assert (await send(client, alice, conversation, "还是不行")).status_code == 202
+    [_, (_, second)] = await redis.xrange(TASK_STREAM)
+    assert second["seq"] == "2" and await redis.get(floor_key(conversation)) == "2"
 
 
 async def test_late_answer_replaces_a_failure_notice(client, redis, tenant, login, admin_db):
@@ -111,6 +114,26 @@ async def test_late_answer_replaces_a_failure_notice(client, redis, tenant, logi
     assert len(final["messages"]) == 2
     row = admin_db.execute("SELECT status, outcome, ticket_id::text FROM turns WHERE id = %s", (task_id,)).fetchone()
     assert row == ("done", "ticket_created", ticket_id)
+
+
+async def test_late_answer_for_a_superseded_turn_is_dropped(client, redis, tenant, login, admin_db):
+    """Once the employee has sent a newer message, a failed turn's late answer would land out of order."""
+    alice = await login(tenant.alice)
+    conversation = await start_conversation(client, alice)
+    old_task = (await send(client, alice, conversation)).json()["task_id"]
+    await report(redis, tenant, conversation, old_task, status="failed", error_code="TASK_FAILED", content="处理失败")
+    await wait_for(lambda: _history_when(client, alice, conversation, lambda h: h["active_task_id"] is None))
+    new_task = (await send(client, alice, conversation, "邮箱无法收发邮件")).json()["task_id"]
+
+    await report(redis, tenant, conversation, old_task, status="done", outcome="awaiting_feedback",
+                 content="迟到的回答", ticket_id="")
+    await report(redis, tenant, conversation, new_task, status="done", outcome="awaiting_feedback",
+                 content="新问题的回答", ticket_id="")
+    final = await wait_for(lambda: _history_when(client, alice, conversation, lambda h: h["active_task_id"] is None))
+    # Results are handled in stream order, so once the newer one is stored the late one was already dropped.
+    assert [m["content"] for m in final["messages"]] == ["VPN 连不上", "处理失败", "邮箱无法收发邮件", "新问题的回答"]
+    row = admin_db.execute("SELECT status, error_code FROM turns WHERE id = %s", (old_task,)).fetchone()
+    assert row == ("failed", "TASK_FAILED")
 
 
 async def test_stream_relays_this_turns_events_and_resumes_after_last_event_id(client, redis, tenant, login):
@@ -143,8 +166,8 @@ async def test_requeuer_re_enqueues_a_lost_task_then_gives_up(client, redis, ten
 
     age_turn()
     await requeuer.sweep()
-    tasks = [fields["task_id"] for _, fields in await redis.xrange(TASK_STREAM)]
-    assert tasks == [task_id, task_id]  # same task_id: agent-runtime treats it idempotently
+    tasks = [(fields["task_id"], fields["seq"]) for _, fields in await redis.xrange(TASK_STREAM)]
+    assert tasks == [(task_id, "1"), (task_id, "1")]  # same task: agent-runtime treats it idempotently
 
     age_turn()
     await requeuer.sweep()

@@ -11,6 +11,9 @@ class AgentTask(BaseModel):
     """
 
     task_id: uuid.UUID
+    # The turn's position in its conversation (1, 2, 3...). A task older than one the conversation
+    # has already moved past is a stale copy (e.g. requeued by app-service) and is skipped.
+    seq: int = Field(ge=1)
     conversation_id: uuid.UUID
     tenant_id: uuid.UUID
     user_id: uuid.UUID

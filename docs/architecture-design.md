@@ -85,7 +85,7 @@
   - `Tenant`：租户，带唯一的 `slug`（登录时用来确定租户）
   - `User`：用户（属于某租户），角色 `employee` / `it_staff`，scrypt 密码哈希
   - `Conversation` / `Message`：问答会话
-  - `Turn`：一条用户消息及其处理状态（`queued/done/failed`），`id` 就是投递给 Agent Runtime 的 `task_id`；部分唯一索引保证同一会话同时只有一轮在处理
+  - `Turn`：一条用户消息及其处理状态（`queued/done/failed`），`id` 就是投递给 Agent Runtime 的 `task_id`，`seq` 是它在会话内的序号（1、2、3…，唯一约束）；部分唯一索引保证同一会话同时只有一轮在处理
   - 工单不在这里：归 ticket-service 所有（见 3.7 节）。员工"我的工单"、IT 人员处理工单的页面由应用服务调用 ticket-service 的内部接口实现，`start`/`resolve` 这类 IT 操作的角色权限也在应用服务里判断。
 - 核心业务流程：
   1. 接收用户提问 → 创建/追加 `Conversation`。
@@ -94,8 +94,8 @@
   4. 若 Agent 返回「需要转工单」或用户主动要求 → 调用 Tool Gateway 的 `create_ticket` 生成工单，返回工单号给用户。
 - 登录与鉴权：`POST /v1/auth/login {tenant, email, password}`，先按 slug 查租户（`tenants` 无 RLS），再在租户作用域内查用户；三种失败统一 401，账号不存在时也做一次假校验，耗时一致。签发 HS256 JWT（`sub/tid/role`，8 小时，无刷新），之后所有接口的租户和用户只取自 JWT。scrypt 在线程里执行，并限制同时最多 4 个（每个约 128 MiB）。以后上 API Gateway 时改 RS256。
 - 会话接口：`POST/GET /v1/conversations`、`GET /v1/conversations/{id}/messages`（含进行中的 `active_task_id`，页面刷新后可重新接上 SSE）、`POST .../messages`（202 `{task_id}`；上一轮未结束返回 409 `TURN_IN_PROGRESS`）、`GET .../stream?task_id=`（SSE）。会话只有本人可见，其他人一律 404。
-- 回复落库：后台消费 `agent_results`（消费组 `app_service`），按轮次 upsert 唯一的助手消息并关闭轮次，可重复投递；不依赖 SSE 连接。晚到的成功结果会覆盖此前的失败提示。
-- 补偿：每 30 秒一次（advisory lock 保证只有一个副本在扫），把 `queued` 超过 5 分钟的轮次用同一个 `task_id` 重新入队，最多 2 次，之后标记失败并写 `error` 事件。5 分钟大于 Agent Runtime 自身重试的最长时间（3 次 × 90 秒）。
+- 回复落库：后台消费 `agent_results`（消费组 `app_service`），按轮次 upsert 唯一的助手消息并关闭轮次，可重复投递；不依赖 SSE 连接。晚到的结果只在该轮仍是会话最新一轮时覆盖此前的失败提示；员工已经发了新消息的，丢弃并记日志，免得旧回答插到新消息后面。
+- 补偿：每 30 秒一次（advisory lock 保证只有一个副本在扫），把 `queued` 超过 10 分钟的轮次用同一个 `task_id` 和 `seq` 重新入队，最多 2 次，之后标记失败并写 `error` 事件。阈值必须大于 Agent Runtime 自身重试的最长时间：3 次 ×（接管空闲 90 秒 + 扫描间隔 10 秒 + 任务超时 60 秒）= 480 秒，配置里强制校验；否则只是慢的任务会被复制一份，与原任务赛跑。
 - 工单页面（BFF）：员工的列表固定按本人过滤，看别人的工单返回 404；`start`/`resolve` 只允许 `it_staff`，`start` 固定指派给自己；`actor_id` 总是当前用户。ticket-service 的业务错误（400/403/404/409）原样透传。
 - 对 Agent Runtime 是**异步任务分发**：应用服务不直接同步调用 Agent Runtime，而是把任务（`conversation_id` + 上下文 + `tenant_id`）写入 Redis Streams 队列即返回；随后从该会话的事件 Stream（`conversation:{conversation_id}:events`）读取 Agent Runtime 陆续写入的中间事件（"正在检索知识库…"、增量 token、最终结果）通过 SSE/WebSocket 转发给前端。对前端而言体验仍是"流式返回"，但应用服务与 Agent Runtime 之间是解耦的异步关系，见 3.3 节。
 
@@ -120,13 +120,16 @@
   6. `summarize_ticket` → `create_ticket`：先由 LLM 写工单描述（问题、现象、已尝试的知识库方案），再调用 Tool Gateway 创建工单。两步分开，是为了崩溃重跑时发出的建单请求完全相同。
   - 场景外、明确要求开工单、检索无命中、反馈没解决，都**自动建单**；寒暄或描述不清回复固定引导语。
 - 状态持久化：LangGraph checkpoint 存 **Postgres**（独立的 `agent_runtime` 库，`AsyncPostgresSaver`），`thread_id = conversation_id`，多轮历史就在图状态里，任务里只带最新一条消息。表结构由 langgraph-checkpoint-postgres 管理（迁移任务里跑 `setup()`，不走 Alembic）；表里没有 `tenant_id`，不做 RLS，只有 Agent Runtime 能连这个库。
-- 任务契约：`agent_tasks` 消息字段 `task_id, conversation_id, tenant_id, user_id, content`，由应用服务写入。调用 Tool Gateway 时 `session_id = conversation_id`，`user_id` 原样透传，`agent_role` 取配置（`it_support_agent`）。
+- 任务契约：`agent_tasks` 消息字段 `task_id, seq, conversation_id, tenant_id, user_id, content`，由应用服务写入；投递时在同一个 Redis 事务里把会话下限 `agent:floor:{conversation_id}` 提高到这个 `seq`（只升不降，24 小时过期）。调用 Tool Gateway 时 `session_id = conversation_id`，`user_id` 原样透传，`agent_role` 取配置（`it_support_agent`）。
 - 崩溃恢复与不重复建单：
   - 每个任务结束时，在写 `done`/`error` 事件的同一个 Redis 事务里，向全局 `agent_results` Stream 写一条结果（状态、outcome、这一轮唯一的助手消息、ticket_id），应用服务用消费组消费并落库，不依赖浏览器是否还连着。
   - 图跑到结束或 interrupt、并写出 `done` 事件后才 XACK；未确认的消息空闲超过阈值后由任一 Worker 用 XAUTOCLAIM 接管，投递超过 3 次进死信 `agent_tasks:dead` 并写 `error` 事件。
   - 接管后按 `thread_id` 从最后一个 checkpoint 续跑（`durability="sync"`，每个节点完成即落盘），只重跑崩溃时正在执行的节点；重跑回答前写 `resumed` 事件，前端丢弃已显示的半截回答。
   - 建单幂等键固定为 `conversation_id:task_id`：Tool Gateway 重放已成功的调用；上次卡在 running 时返回 `IN_PROGRESS`，Worker 不确认，等下次接管；ticket-service 也按同一个键去重。
   - 同一会话串行：应用服务在上一轮未结束时拒绝新消息，Worker 再加会话级 Redis 锁兜底。
+  - 旧任务不执行：应用服务放弃一轮后（重新入队用尽），这一轮的副本可能还在队列里，而员工已经发了下一条；副本晚到时，如果线程正停在等待反馈，旧问题会被当成对新回答的反馈。两道检查，命中即 XACK、不跑图、不写事件和结果（该轮在应用服务里早已结束）：
+    1. 拿到会话锁后，`seq` 低于 Redis 会话下限的任务跳过——挡住"旧副本先于新任务拿到锁"的情况；
+    2. 图状态里记录最近一轮的 `seq`（与 `task_id` 同时写入），`seq` 更小的任务跳过——Redis 丢了下限时的兜底。
   - 时序约束 `任务超时(60s) < 会话锁 TTL(75s) < 接管空闲阈值(90s)`，配置里强制校验：锁要比任何存活的运行更久；被 kill 的 Worker 留下的锁要在任务被接管前过期，否则接管会白白消耗投递次数。接管阈值同时大于 Tool Gateway 的 running 过期时间（60s）。
 - 进程形态：单进程内按信号量并发跑多个任务（默认 8，都是 IO 等待）；`/healthz` 只给探针用，不建 Service。任务队列放在 `TaskQueue` 接口后面，以后换 RabbitMQ 只改这一层。
 - 多租户：图的运行时上下文携带 `tenant_id`，所有工具调用、模型调用都需透传，Tool Gateway/AI Gateway 侧做租户级配置隔离（如某租户自定义知识库、自定义系统提示词）。

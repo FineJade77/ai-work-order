@@ -10,9 +10,12 @@ TENANT = uuid.UUID("e0e112f3-5afb-4229-869b-c0bd012324bb")  # demo tenant: has k
 VPN_HIT = {"question": "VPN 连不上怎么办？", "answer": "重启 VPN 客户端后重新登录。", "score": 1.0}
 
 
-def make_task(conversation_id: uuid.UUID, content: str, *, user_id: uuid.UUID | None = None) -> AgentTask:
+def make_task(
+    conversation_id: uuid.UUID, content: str, *, user_id: uuid.UUID | None = None, seq: int = 1
+) -> AgentTask:
     return AgentTask(
         task_id=uuid.uuid4(),
+        seq=seq,
         conversation_id=conversation_id,
         tenant_id=TENANT,
         user_id=user_id or uuid.uuid4(),

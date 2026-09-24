@@ -17,7 +17,7 @@ from app.clients.tool_gateway import ToolGatewayClient
 from app.events import RESULT_STREAM, EventPublisher, event_stream_key
 from app.graph.builder import build_graph
 from app.worker.consumer import TaskConsumer
-from app.worker.queue import CONSUMER_GROUP, TASK_STREAM, RedisStreamTaskQueue
+from app.worker.queue import CONSUMER_GROUP, TASK_STREAM, RedisStreamTaskQueue, floor_key
 from app.worker.runner import TaskRunner
 from tests.fakes import TENANT, FakeModels, make_task
 from tests.integration.env import (
@@ -96,7 +96,7 @@ async def worker(redis, settings):
     except PoolTimeout as exc:
         await http.aclose()
         pytest.skip(f"agent_runtime database not reachable: {exc}")
-    w.conversation, w.user = uuid.uuid4(), uuid.uuid4()
+    w.conversation, w.user, w.seq = uuid.uuid4(), uuid.uuid4(), 0
     yield w
     await w.stop()
     await http.aclose()
@@ -122,10 +122,20 @@ def _tickets(conversation):
         ).fetchall()
 
 
+def task_fields(task) -> dict[str, str]:
+    return {k: str(v) for k, v in task.model_dump().items()}
+
+
 async def send(w: Worker, content: str) -> list[tuple[str, dict]]:
-    """Enqueues a message the way app-service will and waits for its run's 'done' event."""
-    task = make_task(w.conversation, content, user_id=w.user)
-    await w.redis.xadd(TASK_STREAM, {k: str(v) for k, v in task.model_dump().items()})
+    """Enqueues the conversation's next message the way app-service does (floor raised to its seq
+    in the same transaction) and waits for its run's 'done' event."""
+    w.seq += 1
+    task = make_task(w.conversation, content, user_id=w.user, seq=w.seq)
+    w.last_task = task
+    async with w.redis.pipeline(transaction=True) as pipe:
+        pipe.set(floor_key(w.conversation), task.seq)
+        pipe.xadd(TASK_STREAM, task_fields(task))
+        await pipe.execute()
     with anyio.fail_after(20):
         while True:
             entries = await w.redis.xrange(event_stream_key(w.conversation))
@@ -165,3 +175,40 @@ async def test_crash_after_the_ticket_was_created_does_not_file_a_second_one(wor
     assert "resumed" in types and types[-2:] == ["ticket_created", "done"]
     [(ticket_id, *_)] = _tickets(worker.conversation)
     assert str(ticket_id) == events[-2][1]["ticket_id"]
+
+
+async def _drained(redis) -> bool:
+    [group] = await redis.xinfo_groups(TASK_STREAM)
+    return group["lag"] == 0 and group["pending"] == 0
+
+
+@pytest.mark.parametrize("floor", ["kept", "lost"], ids=["redis-floor", "checkpoint-seq"])
+async def test_stale_copy_of_an_older_turn_is_skipped(worker, floor):
+    """A copy of turn 1 (e.g. requeued by app-service while the original was only slow) reaches
+    the worker after turn 2 has left the thread waiting for feedback. It must not be taken as that
+    feedback. With the floor lost (Redis failover), the checkpointed seq still refuses it."""
+    await send(worker, "VPN 连不上")
+    first = worker.last_task
+    worker.models.resolution, worker.models.category = "new_question", "email"
+    events = await send(worker, "邮箱无法收发邮件")
+    assert events[-1][1] == {"outcome": "awaiting_feedback"}
+    events_before = await worker.redis.xlen(event_stream_key(worker.conversation))
+    results_before = await worker.redis.xlen(RESULT_STREAM)
+    model_calls_before = list(worker.models.calls)
+
+    if floor == "lost":
+        await worker.redis.delete(floor_key(worker.conversation))
+    await worker.redis.xadd(TASK_STREAM, task_fields(first))
+    with anyio.fail_after(10):
+        while not await _drained(worker.redis):
+            await anyio.sleep(0.1)
+
+    assert await worker.redis.xlen(event_stream_key(worker.conversation)) == events_before
+    assert await worker.redis.xlen(RESULT_STREAM) == results_before
+    assert worker.models.calls == model_calls_before and _tickets(worker.conversation) == []
+    # The thread still waits for feedback on turn 2, which the employee's real reply then gives.
+    worker.models.resolution = "unresolved"
+    events = await send(worker, "照着做了，还是收不到")
+    assert [t for t, _ in events] == ["ticket_created", "done"]
+    [(_, _, category, _)] = _tickets(worker.conversation)
+    assert category == "email"

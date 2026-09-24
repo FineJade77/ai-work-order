@@ -10,6 +10,13 @@ CONSUMER_GROUP = "agent_runtime"
 DEAD_LETTER_STREAM = "agent_tasks:dead"
 
 
+def floor_key(conversation_id: object) -> str:
+    """Set by app-service, in the same transaction as each enqueue, to that task's seq (only ever
+    raised): the conversation's newest turn. A task below it belongs to a turn app-service has
+    already closed, so it must not run."""
+    return f"agent:floor:{conversation_id}"
+
+
 @dataclass(frozen=True)
 class Delivery:
     id: str

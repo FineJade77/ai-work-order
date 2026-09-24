@@ -57,7 +57,7 @@ kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/k8s/overlays/dev
 ## 上生产前还要做的
 
 - **Secret**：base 只引用 Secret 名称（清单见 `base/config.yaml` 的注释）。生产环境从密钥管理系统注入（例如 External Secrets），不要沿用 dev overlay 里的凭据。
-- **Postgres / Redis**：换成 Operator（CloudNativePG、Redis Operator）或托管服务，修改连接串和 `REDIS_URL`；建库建账号交给基础设施，不用 db-init Job。Redis 至少开启 AOF，否则主从切换可能丢任务（app-service 的补偿机制会在 5 分钟后重新投递）。
+- **Postgres / Redis**：换成 Operator（CloudNativePG、Redis Operator）或托管服务，修改连接串和 `REDIS_URL`；建库建账号交给基础设施，不用 db-init Job。Redis 至少开启 AOF，否则主从切换可能丢任务（app-service 的补偿机制会在 10 分钟后重新投递）。
 - **部署顺序**：用 Helm hook 或 Argo CD sync wave 表达"迁移完成后再更新服务"，替代 apply-dev.sh。
 - **扩缩容**：在 overlay 里启用 `components/autoscaling`，需要 metrics-server，agent-runtime 还需要 KEDA。
   - agent-runtime 按队列积压（`lagCount`）扩缩容，而不是 CPU，因为它的任务大部分时间在等模型。

@@ -13,6 +13,8 @@ logger = logging.getLogger("agent_runtime.runner")
 
 # Upper bound on node executions per run: stops a classify → check_resolution loop that never ends.
 RECURSION_LIMIT = 25
+# run()'s return for a stale task that was skipped; not an outcome, so never published.
+SUPERSEDED = "superseded"
 
 
 class TaskRunner:
@@ -37,9 +39,18 @@ class TaskRunner:
         events = self._events_for(task)
         config = {"configurable": {"thread_id": str(task.conversation_id)}, "recursion_limit": RECURSION_LIMIT}
         snapshot = await self._graph.aget_state(config)
+        values = snapshot.values or {}
         task_id = str(task.task_id)
 
-        if (snapshot.values or {}).get("task_id") == task_id:
+        # Threads checkpointed before seq existed have none; their next task sets it.
+        if values.get("seq") is not None and task.seq < values["seq"]:
+            # A copy of a turn the thread has moved past. Run it and, if the thread is waiting for
+            # feedback, its old question would be taken as the answer to a newer one. Its turn was
+            # closed in app-service long ago, so there is nothing to report either.
+            logger.warning("skipping stale task_id=%s seq=%d: thread is at seq %d", task_id, task.seq, values["seq"])
+            return SUPERSEDED
+
+        if values.get("task_id") == task_id:
             if snapshot.interrupts or not snapshot.next:
                 # This task's run had already finished; only the acknowledgement was lost.
                 return await self._finish(config, events)
@@ -50,7 +61,12 @@ class TaskRunner:
             # The previous run stopped at await_feedback; this message is the feedback.
             graph_input = Command(resume=task.content)
         else:
-            graph_input = {"task_id": task_id, "messages": [{"role": "user", "content": task.content}], **RUN_FIELDS_RESET}
+            graph_input = {
+                "task_id": task_id,
+                "seq": task.seq,
+                "messages": [{"role": "user", "content": task.content}],
+                **RUN_FIELDS_RESET,
+            }
 
         deps = Deps(task=task, tools=self._tools, models=self._models, events=events)
         # durability="sync": each completed node is checkpointed before the next starts, so a

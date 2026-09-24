@@ -201,7 +201,7 @@ scripts/test-all.sh app-service     # 只跑指定服务
 - **端口被占用**：compose 用到 8001、8003–8006、25432（Postgres）、26379（Redis）。
 - **发消息后迟迟没有回复，或收到 `error` 事件**：多半是模型调用失败。检查 `.env` 里的 `DEEPSEEK_API_KEY`，看 `docker compose logs ai-gateway agent-runtime`。Worker 会自动重试，每次间隔约 90 秒，3 次都失败后任务进入死信：
   `docker compose exec redis redis-cli XRANGE agent_tasks:dead - +`
-- **409 `TURN_IN_PROGRESS`**：同一会话上一条消息还没处理完。等它的 `done`；如果任务丢了，app-service 最多 5 分钟后会自动重新投递。
+- **409 `TURN_IN_PROGRESS`**：同一会话上一条消息还没处理完。等它的 `done`；如果任务丢了，app-service 最多 10 分钟后会自动重新投递。
 - **改了 `.env` 不生效**：`docker compose up -d` 会用新配置重建相关容器。
 - **重置所有本地数据**：`docker compose down -v`（会删除数据库和 Redis 的数据卷），再 `docker compose up -d --build`。
 

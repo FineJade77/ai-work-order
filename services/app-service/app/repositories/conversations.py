@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import exists, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,6 +33,20 @@ async def messages(session: AsyncSession, conversation_id: uuid.UUID) -> list[Me
 
 async def queued_turn(session: AsyncSession, conversation_id: uuid.UUID) -> Turn | None:
     return await session.scalar(select(Turn).where(Turn.conversation_id == conversation_id, Turn.status == "queued"))
+
+
+async def next_turn_seq(session: AsyncSession, conversation_id: uuid.UUID) -> int:
+    """Two concurrent sends can read the same value; uq_turns_conversation_seq lets only one insert it."""
+    current = await session.scalar(select(func.max(Turn.seq)).where(Turn.conversation_id == conversation_id))
+    return (current or 0) + 1
+
+
+async def has_newer_turn(session: AsyncSession, turn: Turn) -> bool:
+    return bool(
+        await session.scalar(
+            select(exists().where(Turn.conversation_id == turn.conversation_id, Turn.seq > turn.seq))
+        )
+    )
 
 
 async def turn(session: AsyncSession, turn_id: uuid.UUID, *, for_update: bool = False) -> Turn | None:

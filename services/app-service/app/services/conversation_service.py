@@ -49,18 +49,23 @@ async def send_message(user: CurrentUser, conversation_id: uuid.UUID, content: s
     async with Session() as session, tenant_scope(session, user.tenant_id):
         if await repo.owned_conversation(session, conversation_id, user.id) is None:
             raise _NOT_FOUND
+        seq = await repo.next_turn_seq(session, conversation_id)
         session.add(Message(id=message_id, conversation_id=conversation_id, role="user", content=content, task_id=turn_id))
         await session.flush()
-        session.add(Turn(id=turn_id, tenant_id=user.tenant_id, conversation_id=conversation_id, user_message_id=message_id))
+        session.add(
+            Turn(id=turn_id, tenant_id=user.tenant_id, conversation_id=conversation_id, user_message_id=message_id, seq=seq)
+        )
         try:
             await session.commit()
         except IntegrityError as exc:
-            if "uq_turns_one_queued_per_conversation" in str(exc):
+            # Either constraint means another message for this conversation got in first.
+            if any(c in str(exc) for c in ("uq_turns_one_queued_per_conversation", "uq_turns_conversation_seq")):
                 raise ApiError(409, "TURN_IN_PROGRESS", "the previous message is still being answered") from exc
             raise
     try:
         await bus.enqueue(
-            task_id=turn_id, conversation_id=conversation_id, tenant_id=user.tenant_id, user_id=user.id, content=content
+            task_id=turn_id, seq=seq, conversation_id=conversation_id, tenant_id=user.tenant_id, user_id=user.id,
+            content=content,
         )
     except (RedisError, OSError):
         # The turn is committed; the requeuer enqueues it once it has waited requeue_after_seconds.

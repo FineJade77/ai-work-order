@@ -83,6 +83,8 @@ class Turn(Base):
     user_message_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("messages.id", ondelete="CASCADE"), nullable=False
     )
+    # 1, 2, 3... within the conversation; agent-runtime skips a task older than one it has seen.
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default="queued")  # queued | done | failed
     outcome: Mapped[str | None] = mapped_column(Text, nullable=True)
     ticket_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)

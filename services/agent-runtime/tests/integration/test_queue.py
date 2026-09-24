@@ -8,7 +8,7 @@ from app.core.errors import RetryLater
 from app.events import RESULT_STREAM, event_stream_key
 from app.worker.consumer import TaskConsumer
 from app.worker.locks import ConversationLock
-from app.worker.queue import CONSUMER_GROUP, DEAD_LETTER_STREAM, TASK_STREAM, RedisStreamTaskQueue
+from app.worker.queue import CONSUMER_GROUP, DEAD_LETTER_STREAM, TASK_STREAM, RedisStreamTaskQueue, floor_key
 from tests.fakes import make_task
 
 pytestmark = pytest.mark.anyio
@@ -123,3 +123,20 @@ async def test_busy_conversation_leaves_the_task_pending(redis, settings):
     runner = FakeRunner()
     await TaskConsumer(q, runner, redis, settings).handle(delivery)
     assert runner.ran == [] and await pending_count(redis) == 1
+
+
+@pytest.mark.parametrize(("seq", "runs"), [(1, False), (2, True)])
+async def test_task_below_the_conversation_floor_is_acked_without_running(redis, settings, seq, runs):
+    q = queue(redis)
+    await q.setup()
+    task = make_task(uuid.uuid4(), "hi", seq=seq)
+    await redis.set(floor_key(task.conversation_id), 2)  # app-service has since enqueued turn 2
+    await redis.xadd(TASK_STREAM, task_fields(task))
+    [delivery] = await q.receive(1, block_ms=100)
+
+    runner = FakeRunner()
+    await TaskConsumer(q, runner, redis, settings).handle(delivery)
+    assert runner.ran == ([task.task_id] if runs else [])
+    assert await pending_count(redis) == 0
+    assert await redis.xlen(event_stream_key(task.conversation_id)) == 0  # nothing reported for the stale copy
+    assert await redis.xlen(RESULT_STREAM) == 0

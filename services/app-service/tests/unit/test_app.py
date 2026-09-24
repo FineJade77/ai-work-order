@@ -3,7 +3,7 @@ import uuid
 import httpx
 import pytest
 
-from app.core.config import Settings, get_settings
+from app.core.config import AGENT_RUNTIME_MAX_RETRY_SECONDS, Settings, get_settings
 from app.main import create_app
 
 pytestmark = pytest.mark.anyio
@@ -47,3 +47,10 @@ async def test_everything_but_login_requires_a_valid_token(client, method, path,
     resp = await client.request(method, path, headers=headers, json={"content": "x"} if method == "POST" else None)
     assert resp.status_code == 401
     assert resp.json()["error"]["code"] == "INVALID_TOKEN"
+
+
+def test_requeue_must_wait_out_agent_runtimes_own_retries():
+    # Requeuing sooner would duplicate a task that is only slow, not lost.
+    with pytest.raises(ValueError):
+        SETTINGS.model_validate({**SETTINGS.model_dump(), "requeue_after_seconds": AGENT_RUNTIME_MAX_RETRY_SECONDS - 1})
+    assert SETTINGS.requeue_after_seconds > AGENT_RUNTIME_MAX_RETRY_SECONDS

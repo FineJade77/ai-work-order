@@ -20,7 +20,7 @@ NO_RESULT_MESSAGE = "抱歉，这条消息处理失败了。请稍后重试，�
 
 class Requeuer:
     """Covers tasks Redis lost (e.g. in a failover): a turn still queued after requeue_after_seconds
-    is enqueued again under the same task_id, which agent-runtime treats idempotently (it resumes
+    is enqueued again under the same task_id and seq, which agent-runtime treats idempotently (it resumes
     or just re-reports the result). After max_requeues the turn is marked failed."""
 
     def __init__(self, bus: AgentBus, settings: Settings):
@@ -62,7 +62,7 @@ class Requeuer:
                         # Enqueued before commit: if the commit then fails, the next sweep enqueues it
                         # again, and a duplicate task is harmless.
                         await self._bus.enqueue(
-                            task_id=turn.id, conversation_id=turn.conversation_id, tenant_id=tenant_id,
+                            task_id=turn.id, seq=turn.seq, conversation_id=turn.conversation_id, tenant_id=tenant_id,
                             user_id=user_id, content=content,
                         )
                         turn.enqueue_count += 1
