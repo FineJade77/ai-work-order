@@ -77,17 +77,20 @@ ai-work-order/
 - **验收标准**：给定一个测试 prompt，能拿到流式返回的 token，且用量记录可查询。
 
 ### 阶段 4：Agent Runtime
-- 用 LangGraph 实现状态图，节点：`classify_intent → retrieve_knowledge → generate_answer → check_resolution → (end | create_ticket)`。
-- `classify_intent` 判断问题是否属于 V1 支持的 3 个场景之一；不属于则直接走 `create_ticket` 分支（附带"未命中知识库场景"标记），不勉强调用模型作答。
-- 作为无状态 Worker：通过 Consumer Group 消费 Redis Streams 的 `agent_tasks` 队列（消息体含 `conversation_id`、`tenant_id`、`user_id`、最新用户消息、历史上下文引用；`user_id` 要原样传给 Tool Gateway 作为提单人）。
-- 执行中把事件（`retrieving`、`answer_chunk`、`ticket_created`、`done`）发布到 `conversation:{conversation_id}` 的 Pub/Sub 频道。
-- 用 LangGraph checkpoint（存 Redis）保存图执行状态，支持 crash 后从断点恢复而不是从头重跑。
-- **验收标准**：向 `agent_tasks` 队列手工写入一条测试任务，Worker 能完整跑完图并在 Pub/Sub 频道观察到预期事件序列；杀掉 Worker 进程重启后，未完成的任务能续跑而不是丢失或重复产生工单。
+> 最初计划 checkpoint 存 Redis、事件走 Pub/Sub，后改为 checkpoint 存 Postgres、事件写每会话 Redis Stream（架构文档 3.3 节）。以下为当前版本。
+- 用 LangGraph 实现固定状态图：`classify_intent → retrieve_knowledge → generate_answer → await_feedback(interrupt) → check_resolution → (end | summarize_ticket → create_ticket)`，另有 `reply`（寒暄/描述不清）分支；`new_question` 回到 `classify_intent`。
+- `classify_intent` 判断问题是否属于 V1 的 3 个场景；场景外、明确要求开工单、检索无命中、反馈没解决都自动建单（场景外的工单描述带"未命中知识库场景"标记），不勉强让模型作答。
+- 作为无状态 Worker：通过 Consumer Group 消费 `agent_tasks`（消息字段 `task_id, conversation_id, tenant_id, user_id, content`；`user_id` 原样传给 Tool Gateway 作为提单人）。历史上下文在 checkpoint 里，不随任务传。
+- 执行事件（`retrieving`、`answer_chunk`、`answer`、`reply`、`ticket_created`、`resumed`、`error`、`done`）写入 `conversation:{conversation_id}:events` Stream。
+- checkpoint 存 Postgres `agent_runtime` 库（`agent-runtime-migrate` 任务跑 `setup()` 并授权运行时账号），`durability="sync"`，crash 后从断点续跑。
+- 调用 AI Gateway 带服务令牌。
+- **验收标准**：`tests/unit`（假网关 + 内存 checkpointer，覆盖每条分支、interrupt/resume、解析失败兜底、崩溃续跑）与 `tests/integration`（真 Redis、Postgres、tool-gateway、ticket-service，模型用假实现）全部通过；向 `agent_tasks` 写入测试任务，能在事件 Stream 上看到预期序列；分别在回答输出途中和生成工单摘要途中 `kill -9` Worker 再重启，任务续跑完成且该会话只有一张工单。
 
 ### 阶段 5：应用服务
 > 工单数据与接口已在 ticket-service（阶段 2.5）。本阶段的员工"我的工单"和 IT 处理页面由应用服务调用 ticket-service 实现，`start`/`resolve` 的 IT 角色校验在应用服务做。
 - 实现 `POST /conversations/{id}/messages`：写入用户消息，把任务推入 `agent_tasks` 队列，立即返回 202。
-- 实现 `GET /conversations/{id}/stream`（SSE）：订阅对应 Pub/Sub 频道，把事件转发给客户端，`done`/`ticket_created` 后关闭连接。
+- 实现 `GET /conversations/{id}/stream`（SSE）：读取该会话的事件 Stream（`conversation:{id}:events`，用 Stream ID 作为 SSE 的 event id，支持 Last-Event-ID 续读），`done`/`error` 后关闭连接。
+- 上一轮任务未结束时拒绝同一会话的新消息（409）；记录每个任务的状态，定时把长时间没有 `done` 的任务重新入队，弥补 Redis 丢消息。
 - 面向员工/IT 的工单接口：`GET /tickets/{id}`、`GET /tickets`（员工只看自己的）、状态流转，均转调 ticket-service，租户和用户取自 JWT 而不是请求参数。
 - 简单的用户/租户模型 + JWT 鉴权中间件（v1 自建账号体系，登录接口签发 JWT，`tenant_id` 编码进 token）。
 - **验收标准**：用 curl/httpie 完整跑通一次"提问 → SSE 收到检索中事件 → 收到回答 → 未解决时收到 ticket_created 事件 → 查询该工单"的闭环。
