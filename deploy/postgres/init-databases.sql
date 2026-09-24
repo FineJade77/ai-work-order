@@ -14,7 +14,9 @@ FROM (VALUES
     ('ai_gateway_owner',   'ai_gateway_owner_dev'),
     ('ai_gateway_app',     'ai_gateway_app_dev'),
     ('ticket_service_owner', 'ticket_service_owner_dev'),
-    ('ticket_service_app',   'ticket_service_app_dev')
+    ('ticket_service_app',   'ticket_service_app_dev'),
+    ('agent_runtime_owner',  'agent_runtime_owner_dev'),
+    ('agent_runtime_app',    'agent_runtime_app_dev')
 ) AS r(name, password)
 WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r.name)
 \gexec
@@ -24,14 +26,16 @@ FROM (VALUES
     ('app_service',  'app_service_owner'),
     ('tool_gateway', 'tool_gateway_owner'),
     ('ai_gateway',   'ai_gateway_owner'),
-    ('ticket_service', 'ticket_service_owner')
+    ('ticket_service', 'ticket_service_owner'),
+    ('agent_runtime',  'agent_runtime_owner')
 ) AS d(name, owner)
 WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = d.name)
 \gexec
 
 -- Each runtime account can reach only its own service's database.
-REVOKE CONNECT ON DATABASE app_service, tool_gateway, ai_gateway, ticket_service FROM PUBLIC;
+REVOKE CONNECT ON DATABASE app_service, tool_gateway, ai_gateway, ticket_service, agent_runtime FROM PUBLIC;
 GRANT CONNECT ON DATABASE app_service TO app_service_app;
 GRANT CONNECT ON DATABASE tool_gateway TO tool_gateway_app;
 GRANT CONNECT ON DATABASE ai_gateway TO ai_gateway_app;
 GRANT CONNECT ON DATABASE ticket_service TO ticket_service_app;
+GRANT CONNECT ON DATABASE agent_runtime TO agent_runtime_app;

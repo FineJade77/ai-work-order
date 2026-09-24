@@ -60,13 +60,35 @@ services:
       app-service-migrate:
         condition: service_completed_successfully
 
+  agent-runtime-migrate:
+    build: ./services/agent-runtime
+    command: ["python", "-m", "app.migrate"]
+    environment:
+      # Plain psycopg conninfo (no +psycopg): the LangGraph checkpointer talks to psycopg directly.
+      MIGRATION_DATABASE_URL: postgresql://agent_runtime_owner:agent_runtime_owner_dev@postgres:5432/agent_runtime
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+
+  # A queue worker: no published port. /healthz on 8002 is for probes only.
   agent-runtime:
     build: ./services/agent-runtime
-    ports:
-      - "8002:8002"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      CHECKPOINT_DATABASE_URL: postgresql://agent_runtime_app:agent_runtime_app_dev@postgres:5432/agent_runtime
+      TOOL_GATEWAY_URL: http://tool-gateway:8003
+      TOOL_GATEWAY_SERVICE_TOKEN: ${TOOL_GATEWAY_SERVICE_TOKEN:-dev-tool-gateway-token}
+      AI_GATEWAY_URL: http://ai-gateway:8004
+      AI_GATEWAY_SERVICE_TOKEN: ${AI_GATEWAY_SERVICE_TOKEN:-dev-ai-gateway-token}
     depends_on:
       redis:
         condition: service_healthy
+      agent-runtime-migrate:
+        condition: service_completed_successfully
+      tool-gateway:
+        condition: service_started
+      ai-gateway:
+        condition: service_started
 
   tool-gateway-migrate:
     build: ./services/tool-gateway

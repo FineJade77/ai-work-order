@@ -1,0 +1,49 @@
+import operator
+from dataclasses import dataclass
+from typing import Annotated, Protocol, TypedDict
+
+from app.clients.ai_gateway import AIGatewayClient
+from app.clients.tool_gateway import ToolGatewayClient
+from app.schemas.tasks import AgentTask
+
+
+class AgentState(TypedDict, total=False):
+    """Checkpointed per conversation (thread_id = conversation_id), so it carries the history."""
+
+    # The task whose run last advanced this thread; tells a redelivered task whether to resume.
+    task_id: str
+    # {"role": "user" | "assistant", "content": str}
+    messages: Annotated[list[dict], operator.add]
+    intent: str | None  # in_scope | out_of_scope | ticket_request | chitchat
+    category: str | None  # vpn | account | email | other (create_ticket's category enum)
+    knowledge: list[dict] | None
+    resolution: str | None  # resolved | unresolved | new_question
+    ticket_summary: str | None
+    ticket_id: str | None
+    outcome: str | None  # resolved | replied | ticket_created; awaiting_feedback is the interrupt
+
+
+# Per-run fields, cleared when a new run starts on a thread whose previous run has ended.
+RUN_FIELDS_RESET: dict = {
+    "intent": None,
+    "category": None,
+    "knowledge": None,
+    "resolution": None,
+    "ticket_summary": None,
+    "ticket_id": None,
+    "outcome": None,
+}
+
+
+class Events(Protocol):
+    async def publish(self, type_: str, **data: object) -> None: ...
+
+
+@dataclass(frozen=True)
+class Deps:
+    """Run context (LangGraph context_schema): not checkpointed, supplied again on every run."""
+
+    task: AgentTask
+    tools: ToolGatewayClient
+    models: AIGatewayClient
+    events: Events
