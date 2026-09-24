@@ -2,11 +2,11 @@
 docker compose run --rm app-service-migrate python scripts/seed.py
 """
 
+import asyncio
 import os
 
-from sqlalchemy import create_engine
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from app.db.models import Conversation, Tenant, User
 from app.db.session import tenant_scope
@@ -31,24 +31,25 @@ DEMO_TENANTS = [
 ]
 
 
-def main() -> None:
-    engine = create_engine(os.environ["MIGRATION_DATABASE_URL"])
+async def main() -> None:
+    engine = create_async_engine(os.environ["MIGRATION_DATABASE_URL"])
     for t in DEMO_TENANTS:
-        with Session(engine) as session, tenant_scope(session, t["tenant_id"]):
-            session.execute(pg_insert(Tenant).values(id=t["tenant_id"], name=t["name"]).on_conflict_do_nothing())
-            session.execute(
+        async with AsyncSession(engine) as session, tenant_scope(session, t["tenant_id"]):
+            await session.execute(pg_insert(Tenant).values(id=t["tenant_id"], name=t["name"]).on_conflict_do_nothing())
+            await session.execute(
                 pg_insert(User)
                 .values(id=t["user_id"], tenant_id=t["tenant_id"], name="Demo User", email=t["email"])
                 .on_conflict_do_nothing()
             )
-            session.execute(
+            await session.execute(
                 pg_insert(Conversation)
                 .values(id=t["conversation_id"], tenant_id=t["tenant_id"], user_id=t["user_id"])
                 .on_conflict_do_nothing()
             )
-            session.commit()
+            await session.commit()
         print(f"tenant_id={t['tenant_id']} user_id={t['user_id']} conversation_id={t['conversation_id']}")
+    await engine.dispose()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

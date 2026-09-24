@@ -16,7 +16,7 @@ def create_app() -> FastAPI:
     app = FastAPI(title="app-service", lifespan=lifespan)
 
     @app.get("/healthz")
-    def healthz() -> dict[str, str]:
+    async def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
     return app
