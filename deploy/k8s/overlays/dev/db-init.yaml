@@ -1,0 +1,36 @@
+# Creates each service's database and its owner/runtime accounts (same script as compose's db-init).
+# Safe to re-run. In production, infrastructure provisioning does this with secret-manager passwords.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-init
+  labels:
+    app.kubernetes.io/name: db-init
+    app.kubernetes.io/component: db-init
+spec:
+  backoffLimit: 10  # retries until Postgres accepts connections
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: db-init
+        app.kubernetes.io/component: db-init
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      containers:
+        - name: db-init
+          image: postgres:16-alpine
+          command: ["psql", "-h", "postgres", "-U", "work_order", "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-f", "/sql/init-databases.sql"]
+          env:
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-superuser
+                  key: POSTGRES_PASSWORD
+          volumeMounts:
+            - name: sql
+              mountPath: /sql
+      volumes:
+        - name: sql
+          configMap:
+            name: db-init-sql

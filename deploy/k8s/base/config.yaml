@@ -1,0 +1,26 @@
+# Non-secret settings. In-cluster addresses assume Postgres/Redis Services named postgres/redis in
+# this namespace (overlays/dev); point them elsewhere for managed instances.
+#
+# Secrets the overlay must provide (key names are the env var names):
+#   service-tokens            TOOL_GATEWAY_SERVICE_TOKEN, KNOWLEDGE_SERVICE_TOKEN,
+#                             TICKET_SERVICE_TOKEN, AI_GATEWAY_SERVICE_TOKEN
+#   app-service-jwt           JWT_SECRET
+#   ai-gateway-model          MODEL_API_KEY
+#   <svc>-database            DATABASE_URL (runtime account), MIGRATION_DATABASE_URL (owner account)
+#                             for app-service, tool-gateway, ai-gateway, ticket-service
+#   agent-runtime-database    CHECKPOINT_DATABASE_URL, MIGRATION_DATABASE_URL (plain postgresql://)
+# In production they come from the secret manager (e.g. External Secrets), never from this repo.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: service-endpoints
+  labels:
+    app.kubernetes.io/component: config
+data:
+  REDIS_URL: redis://redis:6379/0
+  KNOWLEDGE_SERVICE_URL: http://knowledge-service:8005
+  TICKET_SERVICE_URL: http://ticket-service:8006
+  TOOL_GATEWAY_URL: http://tool-gateway:8003
+  AI_GATEWAY_URL: http://ai-gateway:8004
+  MODEL_BASE_URL: https://api.deepseek.com
+  MODEL_NAME: deepseek-chat

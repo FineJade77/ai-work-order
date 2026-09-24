@@ -1,0 +1,8 @@
+# Optional: add under `components:` in an overlay. Starting points, not tuned values
+# (architecture-design.md section 5). With these, the Deployments' replicas field is managed by the
+# autoscalers; remove it from the Deployments if a GitOps tool keeps resetting it.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - hpa.yaml
+  - agent-runtime-scaledobject.yaml

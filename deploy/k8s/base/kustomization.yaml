@@ -1,0 +1,17 @@
+# Environment-neutral manifests. An overlay supplies the images, the Secrets listed in config.yaml
+# and, if it wants them in-cluster, Postgres and Redis (overlays/dev does all three).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: ai-work-order
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: ai-work-order
+resources:
+  - namespace.yaml
+  - config.yaml
+  - knowledge-service.yaml
+  - ticket-service.yaml
+  - tool-gateway.yaml
+  - ai-gateway.yaml
+  - agent-runtime.yaml
+  - app-service.yaml

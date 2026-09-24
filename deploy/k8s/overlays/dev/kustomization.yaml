@@ -1,0 +1,72 @@
+# Local/dev clusters only: single-instance Postgres and Redis, demo seeds and dev credentials
+# (the same ones docker-compose.yml uses). Deploy with ../../apply-dev.sh, which applies in
+# dependency order. Rendering needs --load-restrictor LoadRestrictionsNone because the database
+# init script is shared with compose (deploy/postgres/init-databases.sql).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: ai-work-order
+resources:
+  - ../../base
+  - postgres.yaml
+  - redis.yaml
+  - db-init.yaml
+  - seed-jobs.yaml
+# components:
+#   - ../../components/autoscaling   # needs metrics-server, and KEDA for agent-runtime
+
+# What `docker compose build` produces. Load them into the cluster's nodes first (e.g. `kind load
+# docker-image`), or push them to a registry the cluster can pull from and change newName.
+images:
+  - {name: ai-work-order/app-service, newName: ai-work-order-app-service, newTag: latest}
+  - {name: ai-work-order/agent-runtime, newName: ai-work-order-agent-runtime, newTag: latest}
+  - {name: ai-work-order/tool-gateway, newName: ai-work-order-tool-gateway, newTag: latest}
+  - {name: ai-work-order/ai-gateway, newName: ai-work-order-ai-gateway, newTag: latest}
+  - {name: ai-work-order/knowledge-service, newName: ai-work-order-knowledge-service, newTag: latest}
+  - {name: ai-work-order/ticket-service, newName: ai-work-order-ticket-service, newTag: latest}
+
+generatorOptions:
+  labels:
+    app.kubernetes.io/component: config
+
+configMapGenerator:
+  - name: db-init-sql
+    files:
+      - init-databases.sql=../../../postgres/init-databases.sql
+
+secretGenerator:
+  - name: postgres-superuser
+    literals:
+      - POSTGRES_PASSWORD=work_order
+  - name: service-tokens
+    literals:
+      - TOOL_GATEWAY_SERVICE_TOKEN=dev-tool-gateway-token
+      - KNOWLEDGE_SERVICE_TOKEN=dev-knowledge-service-token
+      - TICKET_SERVICE_TOKEN=dev-ticket-service-token
+      - AI_GATEWAY_SERVICE_TOKEN=dev-ai-gateway-token
+  - name: app-service-jwt
+    literals:
+      - JWT_SECRET=dev-jwt-secret-change-me-in-any-real-deployment
+  # Not in git: copy deepseek.env.example to deepseek.env and fill in MODEL_API_KEY.
+  - name: ai-gateway-model
+    envs:
+      - deepseek.env
+  - name: app-service-database
+    literals:
+      - DATABASE_URL=postgresql+psycopg://app_service_app:app_service_app_dev@postgres:5432/app_service
+      - MIGRATION_DATABASE_URL=postgresql+psycopg://app_service_owner:app_service_owner_dev@postgres:5432/app_service
+  - name: tool-gateway-database
+    literals:
+      - DATABASE_URL=postgresql+psycopg://tool_gateway_app:tool_gateway_app_dev@postgres:5432/tool_gateway
+      - MIGRATION_DATABASE_URL=postgresql+psycopg://tool_gateway_owner:tool_gateway_owner_dev@postgres:5432/tool_gateway
+  - name: ai-gateway-database
+    literals:
+      - DATABASE_URL=postgresql+psycopg://ai_gateway_app:ai_gateway_app_dev@postgres:5432/ai_gateway
+      - MIGRATION_DATABASE_URL=postgresql+psycopg://ai_gateway_owner:ai_gateway_owner_dev@postgres:5432/ai_gateway
+  - name: ticket-service-database
+    literals:
+      - DATABASE_URL=postgresql+psycopg://ticket_service_app:ticket_service_app_dev@postgres:5432/ticket_service
+      - MIGRATION_DATABASE_URL=postgresql+psycopg://ticket_service_owner:ticket_service_owner_dev@postgres:5432/ticket_service
+  - name: agent-runtime-database
+    literals:
+      - CHECKPOINT_DATABASE_URL=postgresql://agent_runtime_app:agent_runtime_app_dev@postgres:5432/agent_runtime
+      - MIGRATION_DATABASE_URL=postgresql://agent_runtime_owner:agent_runtime_owner_dev@postgres:5432/agent_runtime

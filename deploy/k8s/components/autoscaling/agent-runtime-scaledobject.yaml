@@ -1,0 +1,24 @@
+# agent-runtime scales on queue backlog, not CPU: its tasks mostly wait on the model (needs KEDA).
+# lagCount counts entries not yet delivered to the consumer group (KEDA 2.12+, Redis 7+; check the
+# field names against the installed KEDA's redis-streams scaler). pendingEntriesCount would be the
+# wrong signal: each replica only takes as many tasks as it runs (WORKER_CONCURRENCY, default 8),
+# so pending entries plateau at 8 x replicas however long the queue grows.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: agent-runtime
+  labels:
+    app.kubernetes.io/name: agent-runtime
+    app.kubernetes.io/component: autoscaling
+spec:
+  scaleTargetRef:
+    name: agent-runtime
+  minReplicaCount: 1
+  maxReplicaCount: 20
+  triggers:
+    - type: redis-streams
+      metadata:
+        address: redis:6379
+        stream: agent_tasks
+        consumerGroup: agent_runtime
+        lagCount: "8"

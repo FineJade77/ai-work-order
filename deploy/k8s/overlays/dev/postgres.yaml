@@ -1,0 +1,76 @@
+# DEV ONLY: one instance, no backups, no HA. Production uses an operator (e.g. CloudNativePG) or a
+# managed Postgres (architecture-design.md section 5); services only need the connection strings.
+# The official image starts as root and drops privileges itself, so no runAsNonRoot here.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/component: database
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: work_order
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-superuser
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              value: postgres
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata  # a subdirectory: the volume root may hold lost+found
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "work_order", "-d", "postgres"]
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+spec:
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres

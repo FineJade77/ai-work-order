@@ -1,0 +1,81 @@
+# Static per-tenant data shipped in the image: no database, no migration.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: knowledge-service
+  labels:
+    app.kubernetes.io/name: knowledge-service
+    app.kubernetes.io/component: app
+spec:
+  replicas: 1  # fixed here; components/autoscaling adds an HPA or KEDA ScaledObject
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: knowledge-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: knowledge-service
+        app.kubernetes.io/component: app
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001  # the USER in every service Dockerfile
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: knowledge-service
+          image: ai-work-order/knowledge-service
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8005
+          env:
+            - name: KNOWLEDGE_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: service-tokens
+                  key: KNOWLEDGE_SERVICE_TOKEN
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: knowledge-service
+  labels:
+    app.kubernetes.io/name: knowledge-service
+    app.kubernetes.io/component: app
+spec:
+  selector:
+    app.kubernetes.io/name: knowledge-service
+  ports:
+    - name: http
+      port: 8005
+      targetPort: http
