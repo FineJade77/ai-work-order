@@ -53,8 +53,14 @@ services:
       - "8003:8003"
     environment:
       APP_DATABASE_URL: postgresql+psycopg://app_runtime:app_runtime_dev_password@postgres:5432/work_order
+      REDIS_URL: redis://redis:6379/0
+      TOOL_GATEWAY_SERVICE_TOKEN: ${TOOL_GATEWAY_SERVICE_TOKEN:-dev-tool-gateway-token}
+      TOOL_RATE_LIMIT_CAPACITY: ${TOOL_RATE_LIMIT_CAPACITY:-20}
+      TOOL_RATE_LIMIT_REFILL_PER_SEC: ${TOOL_RATE_LIMIT_REFILL_PER_SEC:-5}
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
   ai-gateway:

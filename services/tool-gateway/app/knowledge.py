@@ -1,13 +1,14 @@
+from typing import Any
+
 from sqlalchemy import func, or_
 
-from app.models import KnowledgeResult
 from shared.db.models import KnowledgeItem
 from shared.db.session import app_session_factory, tenant_scope
 
 RESULT_LIMIT = 5
 
 
-def search_knowledge_impl(query: str, tenant_id: str) -> list[KnowledgeResult]:
+def search_knowledge_impl(query: str, tenant_id: str) -> list[dict[str, Any]]:
     """v1 search: ILIKE substring match, ranked by pg_trgm similarity. No vectorization yet."""
     Session = app_session_factory()
     with Session() as session, tenant_scope(session, tenant_id):
@@ -24,6 +25,6 @@ def search_knowledge_impl(query: str, tenant_id: str) -> list[KnowledgeResult]:
             .all()
         )
         return [
-            KnowledgeResult(question=item.question, answer=item.answer, score=float(item_score))
+            {"question": item.question, "answer": item.answer, "score": round(float(item_score), 4)}
             for item, item_score in rows
         ]

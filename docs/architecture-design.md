@@ -45,10 +45,11 @@
 │  · 会话记忆/上下文管理    │
 │  · 执行中事件发布回 Pub/Sub（供应用服务转 SSE） │
 └───────┬────────────────┘
-        │ 工具调用协议(MCP/内部Schema)
+        │ REST: /v1/tools/list, /v1/tools/call（OpenAI function 元数据）
 ┌───────▼──────────────────────────────────────────────────────────────┐
-│  Tool Gateway                                                         │
-│  · 工具注册中心 / 统一鉴权与审计 / 参数校验 / 超时熔断                   │
+│  Tool Gateway（工具策略网关）                                          │
+│  · 角色-工具绑定 / JSON Schema 校验 / 幂等 / Redis 令牌桶 / HITL 审批    │
+│  · 审计日志 / 返回体脱敏 / 服务间令牌鉴权                                 │
 │  · search_knowledge（知识检索工具，可插拔实现）                        │
 │  · create_ticket / update_ticket（工单 Provider 接口，默认对接自建工单模块）│
 │  · 预留：外部系统工具适配位（Jira/ServiceNow/企业IM，未来可插拔）        │
@@ -113,13 +114,18 @@
 - 多租户：图的运行时上下文携带 `tenant_id`，所有工具调用、模型调用都需透传，Tool Gateway/AI Gateway 侧做租户级配置隔离（如某租户自定义知识库、自定义系统提示词）。
 - 第一期场景范围：通过配置/路由规则限定只处理"部分场景"（如 VPN、账号密码、邮箱），未命中场景直接引导人工提单，而非勉强让模型作答。
 
-### 3.4 Tool Gateway
-- 职责：工具的**统一注册、鉴权、参数校验、超时/熔断、调用审计**，是 Agent 与真实世界交互的唯一通道。
-- 建议基于 **MCP（Model Context Protocol）** 或等价的内部 Schema 定义工具，便于未来切换/新增 Agent 框架时复用工具集。
-- 核心工具（v1）：
-  - `search_knowledge(query, tenant_id) -> results[]`：知识检索，v1 后端是简单 FAQ/QA 表精确+模糊匹配，接口保持不变，v2 平滑替换为向量检索，Agent 侧无感知。
-  - `create_ticket(summary, category, conversation_ref, tenant_id) -> ticket_id`：创建工单，默认路由到"自建工单模块"。
-  - `update_ticket_status(ticket_id, status)`：供后续人工反馈/关闭工单回写会话。
+### 3.4 Tool Gateway（工具策略网关）
+- 定位：Agent Runtime 与真实世界之间的**唯一策略执行点**。Agent Runtime 是多副本无状态 Worker，权限、限流、幂等、审批如果放在 Worker 里，每个副本各管一份就失效了，所以集中在这里。
+- 接口（REST，取代早期的 MCP 方案——MCP 端点没有角色权限/限流/审批，保留它等于留一条绕过策略的后门）：
+  - `GET /v1/tools/list?tenant_id&agent_role`：返回该角色可用工具的 OpenAI function 元数据，**不含密钥、下游地址、handler**。
+  - `POST /v1/tools/call`：入参 `tenant_id, session_id, agent_role, tool_name, arguments`，副作用工具必须带 `Idempotency-Key` 头。返回 `success / pending_approval / error` 三态信封。
+  - `GET /v1/approvals?tenant_id&status`、`POST /v1/approvals/{id}/resolve`：HITL 审批，记录存 PG（`tool_approvals`）。
+- 错误分两类：**模型可处理的**（无权限、参数不合法、限流、审批被拒、执行失败）走 200 信封回给模型；**调用方违约的**（非法 tenant、缺幂等键、幂等键冲突、并发执行中）走 HTTP 4xx，只给 Agent Runtime 看。
+- 调用管线：租户校验 → 工具存在 → 角色绑定 → JSON Schema → 幂等重放（在限流之前，重试已完成的调用不消耗令牌）→ Redis 令牌桶 → 原子占位 → 审批或执行 → 脱敏 → 记录结果 → 审计。
+- 上下文注入：`session_id`（即会话 ID）和幂等键由网关注入给 handler，不出现在给模型看的参数 schema 里，模型没法伪造或写错。
+- HITL 恢复：审批通过后网关直接执行工具并存结果，然后向 Redis Stream `tool_approval_events` 发恢复事件；Agent Runtime 收到后用**同一个幂等键**重新调用 `/v1/tools/call` 拿到已存结果，审批和幂等共用一条路径。
+- 幂等分两层：网关 `tool_calls` 表覆盖普通重试；执行完成但结果未落盘就崩溃的窗口，靠卡住的 `running` 记录超时后可被重新占位、再执行，因此有副作用的 handler 自身也必须幂等（`create_ticket` 把同一个键传到工单表）。
+- 核心工具（v1）：`search_knowledge(query)`、`create_ticket(summary, category)`、`update_ticket_status(ticket_id, status)`（demo 租户中此工具需要审批）。
 - 扩展设计：`TicketProvider` 接口预留多实现（`InternalTicketProvider` 默认启用，未来可加 `JiraTicketProvider`、`FeishuTicketProvider`），通过租户级配置选择实现，不改动 Agent/应用服务代码。
 
 ### 3.5 AI Gateway

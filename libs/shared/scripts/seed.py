@@ -1,7 +1,18 @@
-from shared.db.models import KnowledgeItem, Tenant
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+from shared.db.models import KnowledgeItem, RoleToolBinding, Tenant
 from shared.db.session import admin_session_factory
 
 TENANT_NAME = "Demo Tenant"
+
+AGENT_ROLE = "it_support_agent"
+# (tool_name, requires_approval). Changing a ticket's status (e.g. closing it) is gated
+# on a human; searching and filing tickets are not.
+ROLE_TOOLS: list[tuple[str, bool]] = [
+    ("search_knowledge", False),
+    ("create_ticket", False),
+    ("update_ticket_status", True),
+]
 
 SCENARIOS: dict[str, list[tuple[str, str]]] = {
     "vpn": [
@@ -38,6 +49,18 @@ def main() -> None:
                     session.add(
                         KnowledgeItem(tenant_id=tenant.id, question=question, answer=answer, tags=[tag])
                     )
+
+        for tool_name, requires_approval in ROLE_TOOLS:
+            session.execute(
+                pg_insert(RoleToolBinding)
+                .values(
+                    tenant_id=tenant.id,
+                    agent_role=AGENT_ROLE,
+                    tool_name=tool_name,
+                    requires_approval=requires_approval,
+                )
+                .on_conflict_do_nothing(index_elements=["tenant_id", "agent_role", "tool_name"])
+            )
 
         session.commit()
         print(f"tenant_id={tenant.id}")
