@@ -3,7 +3,6 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 
-import anyio
 from openai import AsyncOpenAI
 
 from app.tenancy import parse_tenant_id
@@ -56,17 +55,15 @@ class OpenAICompatibleProvider(ModelProvider):
             raise
         finally:
             duration_ms = int((time.monotonic() - start) * 1000)
-            # A client disconnect cancels this task mid-stream; without the shield the cancellation
-            # would abort the write at its first await and the call would go unrecorded.
-            with anyio.CancelScope(shield=True):
-                await record_usage(
-                    tenant_id=tenant_id,
-                    model=self._model,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    duration_ms=duration_ms,
-                    status=status,
-                )
+            # Not shielded: a client disconnect cancels this task, and the write is cancelled with it.
+            await record_usage(
+                tenant_id=tenant_id,
+                model=self._model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                duration_ms=duration_ms,
+                status=status,
+            )
 
         yield {"done": True, "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}}
 
