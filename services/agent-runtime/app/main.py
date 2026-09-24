@@ -57,7 +57,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             build_graph(AsyncPostgresSaver(pool)),
             ToolGatewayClient(tool_http, settings.agent_role),
             AIGatewayClient(ai_http),
-            lambda task: EventPublisher(redis, task.conversation_id, task.task_id),
+            lambda task: EventPublisher(redis, task),
         )
         queue = RedisStreamTaskQueue(
             redis, settings.consumer_name, claim_idle_ms=int(settings.claim_idle_seconds * 1000)

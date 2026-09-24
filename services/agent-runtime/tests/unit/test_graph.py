@@ -143,6 +143,26 @@ async def test_crash_mid_answer_resumes_at_the_answer(env):
     assert types.index("resumed") < types.index("answer")
 
 
+def _result(env, task):
+    return next(d for tid, t, d in reversed(env.events) if tid == str(task.task_id) and t == "done")
+
+
+async def test_each_run_reports_its_single_assistant_message_as_the_result(env):
+    first = env.task("VPN 连不上")
+    await env.runner.run(first)
+    assert _result(env, first) == {"outcome": "awaiting_feedback", "content": env.models.answer, "ticket_id": None}
+
+    second = env.task("还是不行")
+    await env.runner.run(second)
+    result = _result(env, second)
+    assert result["ticket_id"] == "T-1" and result["content"] == prompts.TICKET_CREATED_REPLY.format(ticket_id="T-1")
+
+    env.models.intent = "chitchat"
+    third = env.task("谢谢")
+    await env.runner.run(third)
+    assert _result(env, third) == {"outcome": "replied", "content": prompts.CHITCHAT_REPLY, "ticket_id": None}
+
+
 async def test_redelivered_finished_task_only_republishes_done(env):
     task = env.task("VPN 连不上")
     await env.runner.run(task)

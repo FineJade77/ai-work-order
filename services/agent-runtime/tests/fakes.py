@@ -81,9 +81,14 @@ class FakeTools:
 
 
 class RecordingEvents:
+    """Logs events as (task_id, type, data); a finished run logs 'done' with its result fields."""
+
     def __init__(self, task: AgentTask, log: list[tuple]):
         self._task_id = str(task.task_id)
         self._log = log
 
     async def publish(self, type_: str, **data) -> None:
         self._log.append((self._task_id, type_, data))
+
+    async def finish(self, *, outcome: str, content: str, ticket_id: str | None) -> None:
+        self._log.append((self._task_id, "done", {"outcome": outcome, "content": content, "ticket_id": ticket_id}))

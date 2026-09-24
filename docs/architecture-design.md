@@ -116,6 +116,7 @@
 - 状态持久化：LangGraph checkpoint 存 **Postgres**（独立的 `agent_runtime` 库，`AsyncPostgresSaver`），`thread_id = conversation_id`，多轮历史就在图状态里，任务里只带最新一条消息。表结构由 langgraph-checkpoint-postgres 管理（迁移任务里跑 `setup()`，不走 Alembic）；表里没有 `tenant_id`，不做 RLS，只有 Agent Runtime 能连这个库。
 - 任务契约：`agent_tasks` 消息字段 `task_id, conversation_id, tenant_id, user_id, content`，由应用服务写入。调用 Tool Gateway 时 `session_id = conversation_id`，`user_id` 原样透传，`agent_role` 取配置（`it_support_agent`）。
 - 崩溃恢复与不重复建单：
+  - 每个任务结束时，在写 `done`/`error` 事件的同一个 Redis 事务里，向全局 `agent_results` Stream 写一条结果（状态、outcome、这一轮唯一的助手消息、ticket_id），应用服务用消费组消费并落库，不依赖浏览器是否还连着。
   - 图跑到结束或 interrupt、并写出 `done` 事件后才 XACK；未确认的消息空闲超过阈值后由任一 Worker 用 XAUTOCLAIM 接管，投递超过 3 次进死信 `agent_tasks:dead` 并写 `error` 事件。
   - 接管后按 `thread_id` 从最后一个 checkpoint 续跑（`durability="sync"`，每个节点完成即落盘），只重跑崩溃时正在执行的节点；重跑回答前写 `resumed` 事件，前端丢弃已显示的半截回答。
   - 建单幂等键固定为 `conversation_id:task_id`：Tool Gateway 重放已成功的调用；上次卡在 running 时返回 `IN_PROGRESS`，Worker 不确认，等下次接管；ticket-service 也按同一个键去重。

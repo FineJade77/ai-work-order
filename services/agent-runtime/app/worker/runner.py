@@ -60,6 +60,9 @@ class TaskRunner:
 
     async def _finish(self, config: dict, events: Events) -> str:
         snapshot = await self._graph.aget_state(config)
-        outcome = "awaiting_feedback" if snapshot.interrupts else snapshot.values["outcome"]
-        await events.publish("done", outcome=outcome)
+        values = snapshot.values
+        outcome = "awaiting_feedback" if snapshot.interrupts else values["outcome"]
+        # Every run ends with exactly one assistant message: the answer, a reply, or the ticket notice.
+        content = next(m["content"] for m in reversed(values["messages"]) if m["role"] == "assistant")
+        await events.finish(outcome=outcome, content=content, ticket_id=values.get("ticket_id"))
         return outcome

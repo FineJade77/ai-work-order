@@ -14,7 +14,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
 from app.clients.tool_gateway import ToolGatewayClient
-from app.events import EventPublisher, event_stream_key
+from app.events import RESULT_STREAM, EventPublisher, event_stream_key
 from app.graph.builder import build_graph
 from app.worker.consumer import TaskConsumer
 from app.worker.queue import CONSUMER_GROUP, TASK_STREAM, RedisStreamTaskQueue
@@ -64,7 +64,7 @@ class Worker:
             build_graph(AsyncPostgresSaver(self._pool)),
             self.tools,
             self.models,
-            lambda t: EventPublisher(self.redis, t.conversation_id, t.task_id),
+            lambda t: EventPublisher(self.redis, t),
         )
         queue = RedisStreamTaskQueue(
             self.redis, "e2e", claim_idle_ms=int(self.settings.claim_idle_seconds * 1000), claim_interval_s=0.2
@@ -148,6 +148,11 @@ async def test_answer_then_unresolved_feedback_files_one_ticket_across_a_restart
     [(ticket_id, requester, category, summary)] = _tickets(worker.conversation)
     assert str(ticket_id) == events[0][1]["ticket_id"]
     assert (str(requester), category, summary) == (str(worker.user), "vpn", worker.models.summary)
+
+    results = [fields for _, fields in await worker.redis.xrange(RESULT_STREAM)]
+    assert [(r["status"], r["outcome"]) for r in results] == [("done", "awaiting_feedback"), ("done", "ticket_created")]
+    assert results[0]["content"] == worker.models.answer and results[0]["ticket_id"] == ""
+    assert results[1]["ticket_id"] == str(ticket_id) and results[1]["tenant_id"] == str(TENANT)
     assert (await worker.redis.xpending(TASK_STREAM, CONSUMER_GROUP))["pending"] == 0
 
 

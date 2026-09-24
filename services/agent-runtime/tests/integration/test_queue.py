@@ -5,7 +5,7 @@ import anyio
 import pytest
 
 from app.core.errors import RetryLater
-from app.events import event_stream_key
+from app.events import RESULT_STREAM, event_stream_key
 from app.worker.consumer import TaskConsumer
 from app.worker.locks import ConversationLock
 from app.worker.queue import CONSUMER_GROUP, DEAD_LETTER_STREAM, TASK_STREAM, RedisStreamTaskQueue
@@ -107,6 +107,8 @@ async def test_task_past_max_deliveries_is_dead_lettered_and_reported(redis, set
     assert len(await redis.xrange(DEAD_LETTER_STREAM)) == 1
     [(_, event)] = await redis.xrange(event_stream_key(task.conversation_id))
     assert event["type"] == "error" and json.loads(event["data"])["code"] == "TASK_FAILED"
+    [(_, result)] = await redis.xrange(RESULT_STREAM)
+    assert (result["task_id"], result["status"], result["error_code"]) == (str(task.task_id), "failed", "TASK_FAILED")
 
 
 async def test_busy_conversation_leaves_the_task_pending(redis, settings):

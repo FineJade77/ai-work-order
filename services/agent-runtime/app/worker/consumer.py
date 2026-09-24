@@ -72,8 +72,7 @@ class TaskConsumer:
 
         if delivery.attempt > self._settings.max_deliveries:
             await self._queue.dead_letter(delivery, f"gave up after {delivery.attempt - 1} attempts")
-            events = EventPublisher(self._redis, task.conversation_id, task.task_id)
-            await events.publish("error", code="TASK_FAILED", message=FAILED_MESSAGE)
+            await EventPublisher(self._redis, task).fail(code="TASK_FAILED", message=FAILED_MESSAGE)
             return
 
         lock = ConversationLock(self._redis, task.conversation_id, self._settings.conversation_lock_seconds)

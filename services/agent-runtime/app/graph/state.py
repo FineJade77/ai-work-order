@@ -38,6 +38,8 @@ RUN_FIELDS_RESET: dict = {
 class Events(Protocol):
     async def publish(self, type_: str, **data: object) -> None: ...
 
+    async def finish(self, *, outcome: str, content: str, ticket_id: str | None) -> None: ...
+
 
 @dataclass(frozen=True)
 class Deps:
