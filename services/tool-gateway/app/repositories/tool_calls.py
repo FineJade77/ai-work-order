@@ -1,0 +1,123 @@
+"""Idempotency records for side-effecting tool calls.
+
+Each function runs its own short transaction on purpose. A claim must be committed before
+the tool executes so that concurrent requests with the same key see it; folding these steps
+into one request-scoped transaction would break that guarantee.
+"""
+
+from dataclasses import dataclass
+from datetime import timedelta
+from typing import Any
+
+from shared.db.models import ToolCall
+from shared.db.session import app_session_factory, tenant_scope
+from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+# A 'running' row older than this is presumed orphaned by a crashed gateway replica and
+# may be reclaimed by a retry. Must exceed the slowest tool's expected execution time.
+STALE_RUNNING_AFTER = timedelta(seconds=60)
+
+
+@dataclass(frozen=True)
+class CallRecord:
+    id: str
+    tool_name: str
+    arguments: dict[str, Any]
+    request_hash: str
+    status: str
+    result: Any
+    error_code: str | None
+    error_message: str | None
+
+
+def _record(call: ToolCall) -> CallRecord:
+    return CallRecord(
+        id=str(call.id),
+        tool_name=call.tool_name,
+        arguments=call.arguments,
+        request_hash=call.request_hash,
+        status=call.status,
+        result=call.result,
+        error_code=call.error_code,
+        error_message=call.error_message,
+    )
+
+
+def find_by_idempotency_key(tenant_id: str, idempotency_key: str) -> CallRecord | None:
+    Session = app_session_factory()
+    with Session() as session, tenant_scope(session, tenant_id):
+        call = session.execute(
+            select(ToolCall).where(ToolCall.idempotency_key == idempotency_key)
+        ).scalar_one_or_none()
+    return _record(call) if call else None
+
+
+def claim(
+    *,
+    tenant_id: str,
+    session_id: str,
+    agent_role: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+    request_hash: str,
+    idempotency_key: str,
+) -> str | None:
+    """Records a new 'running' call. Returns its id, or None if another request already holds the key."""
+    Session = app_session_factory()
+    with Session() as session, tenant_scope(session, tenant_id):
+        call_id = session.execute(
+            pg_insert(ToolCall)
+            .values(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                agent_role=agent_role,
+                tool_name=tool_name,
+                arguments=arguments,
+                request_hash=request_hash,
+                idempotency_key=idempotency_key,
+                status="running",
+            )
+            .on_conflict_do_nothing(
+                index_elements=["tenant_id", "idempotency_key"],
+                index_where=ToolCall.idempotency_key.is_not(None),
+            )
+            .returning(ToolCall.id)
+        ).scalar_one_or_none()
+        session.commit()
+    return str(call_id) if call_id else None
+
+
+def reclaim(tenant_id: str, call_id: str) -> bool:
+    """Moves a failed or orphaned call back to 'running'. Only one concurrent retrier can win."""
+    Session = app_session_factory()
+    with Session() as session, tenant_scope(session, tenant_id):
+        claimed = session.execute(
+            update(ToolCall)
+            .where(ToolCall.id == call_id)
+            .where(
+                or_(
+                    ToolCall.status == "error",
+                    and_(ToolCall.status == "running", ToolCall.updated_at < func.now() - STALE_RUNNING_AFTER),
+                )
+            )
+            .values(status="running", error_code=None, error_message=None, updated_at=func.now())
+            .returning(ToolCall.id)
+        ).scalar_one_or_none()
+        session.commit()
+    return claimed is not None
+
+
+def complete(tenant_id: str, call_id: str, result: Any) -> None:
+    _update(tenant_id, call_id, status="success", result=result)
+
+
+def fail(tenant_id: str, call_id: str, code: str, message: str) -> None:
+    _update(tenant_id, call_id, status="error", error_code=code, error_message=message)
+
+
+def _update(tenant_id: str, call_id: str, **values: Any) -> None:
+    Session = app_session_factory()
+    with Session() as session, tenant_scope(session, tenant_id):
+        session.execute(update(ToolCall).where(ToolCall.id == call_id).values(updated_at=func.now(), **values))
+        session.commit()

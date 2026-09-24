@@ -56,11 +56,11 @@ ai-work-order/
 ### 阶段 2：Tool Gateway（工具策略网关）
 > 最初按 MCP 接口实现，后改为 REST 策略网关（架构文档 3.4 节）。以下为当前版本。
 - `GET /v1/tools/list?tenant_id&agent_role`：返回角色可用工具的 OpenAI function 元数据，不含密钥/下游地址。
-- `POST /v1/tools/call`：`tenant_id, session_id, agent_role, tool_name, arguments`，返回 `success / pending_approval / error`；副作用工具必须带 `Idempotency-Key` 头。
-- 审批：`GET /v1/approvals`、`POST /v1/approvals/{id}/resolve`，记录存 `tool_approvals`；审批结果通过 Redis Stream `tool_approval_events` 通知 Agent Runtime 恢复。
-- 能力：多租户（RLS）、`role_tool_bindings` 角色工具绑定（含是否需审批）、JSON Schema 参数校验、`tool_calls` 幂等记录、Redis 令牌桶限流（按租户+工具）、`tool_call_logs` 审计、返回体与审计参数脱敏、服务间 Bearer 令牌鉴权。
-- 工具：`search_knowledge(query)`（v1 `ILIKE` + `pg_trgm` 排序）、`create_ticket(summary, category)`（会话 ID 与幂等键由网关注入，工单表层面也按幂等键去重）、`update_ticket_status(ticket_id, status)`。`TicketProvider` 抽象，v1 只有 `InternalTicketProvider`。
-- **验收标准**：权限、校验、幂等重放与冲突、审批通过/拒绝及恢复、限流、脱敏、审计均有端到端用例覆盖；同一幂等键的并发请求只产生一张工单；`running` 状态孤儿记录超时后可恢复且不重复执行副作用。
+- `POST /v1/tools/call`：`tenant_id, session_id, agent_role, tool_name, arguments`，返回 `success / error`；副作用工具必须带 `Idempotency-Key` 头。
+- 能力：多租户（RLS）、`role_tool_bindings` 角色工具绑定、JSON Schema 参数校验、副作用工具的 `tool_calls` 幂等记录、`tool_call_logs` 审计（参数脱敏）、返回体凭据字段屏蔽、服务间 Bearer 令牌鉴权。HITL 审批与 Redis 限流 V1 暂不做（见架构文档 3.4 节）。
+- 工具：`search_knowledge(query)`（v1 `ILIKE` + `pg_trgm` 排序）、`create_ticket(summary, category)`（会话 ID 与幂等键由网关注入，工单表层面也按幂等键去重）。`TicketProvider` 抽象，v1 只有 `InternalTicketProvider`。
+- 代码分层：`api/v1`（路由）→ `services`（调用管线，不依赖 FastAPI）→ `repositories`（网关自身的表）/ `tools`（工具定义与 handler）；`core` 放配置、鉴权、错误、脱敏。
+- **验收标准**：`tests/unit`（无外部依赖）与 `tests/integration`（需起 postgres + tool-gateway）全部通过；覆盖权限、校验、幂等重放与冲突、脱敏、审计；同一幂等键的并发请求只产生一张工单；`running` 状态孤儿记录超时后可恢复且不重复执行副作用。
 
 ### 阶段 3：AI Gateway
 - 实现 `ModelProvider` 抽象 + 通用 `OpenAICompatibleProvider` 实现（用 OpenAI SDK 即可，只需把 `base_url` 指向配置项，不要绑定 OpenAI 官方域名），暴露统一的 `generate(messages, tenant_id, system_prompt) -> stream[chunk]` 接口（支持流式）。

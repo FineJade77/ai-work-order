@@ -3,9 +3,10 @@ import json
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 
+from shared.tenancy import parse_tenant_id
+
 from app.providers import provider
 from app.schemas import GenerateRequest
-from app.validation import parse_tenant_id
 
 app = FastAPI(title="ai-gateway")
 

@@ -5,18 +5,18 @@ from typing import Any
 from shared.db.models import ToolCallLog
 from shared.db.session import app_session_factory, tenant_scope
 
-from app.redaction import redact
+from app.core.redaction import redact_for_audit
 
 logger = logging.getLogger("tool_gateway.audit")
 
 PARAMS_SUMMARY_MAX_CHARS = 2000
 
 
-def write_audit(
+def write(
     *,
     tenant_id: str,
-    session_id: str | None,
-    agent_role: str | None,
+    session_id: str,
+    agent_role: str,
     tool_name: str,
     arguments: Any,
     status: str,
@@ -24,8 +24,9 @@ def write_audit(
     call_id: str | None,
     duration_ms: int,
 ) -> None:
-    """One row per attempt, including replays and rejections; tool_calls holds the deduplicated state."""
-    params_summary = json.dumps(redact(arguments), ensure_ascii=False)[:PARAMS_SUMMARY_MAX_CHARS]
+    """One row per attempt, including replays and rejections. Redaction happens here so no
+    caller can store raw arguments by accident."""
+    params_summary = json.dumps(redact_for_audit(arguments), ensure_ascii=False)[:PARAMS_SUMMARY_MAX_CHARS]
     try:
         Session = app_session_factory()
         with Session() as session, tenant_scope(session, tenant_id):

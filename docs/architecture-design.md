@@ -48,10 +48,9 @@
         │ REST: /v1/tools/list, /v1/tools/call（OpenAI function 元数据）
 ┌───────▼──────────────────────────────────────────────────────────────┐
 │  Tool Gateway（工具策略网关）                                          │
-│  · 角色-工具绑定 / JSON Schema 校验 / 幂等 / Redis 令牌桶 / HITL 审批    │
-│  · 审计日志 / 返回体脱敏 / 服务间令牌鉴权                                 │
+│  · 角色-工具绑定 / JSON Schema 校验 / 幂等 / 审计 / 服务间令牌鉴权       │
 │  · search_knowledge（知识检索工具，可插拔实现）                        │
-│  · create_ticket / update_ticket（工单 Provider 接口，默认对接自建工单模块）│
+│  · create_ticket（工单 Provider 接口，默认对接自建工单模块）             │
 │  · 预留：外部系统工具适配位（Jira/ServiceNow/企业IM，未来可插拔）        │
 └───────┬────────────────────────────────────────────────┬─────────────┘
         │                                                 │
@@ -115,17 +114,19 @@
 - 第一期场景范围：通过配置/路由规则限定只处理"部分场景"（如 VPN、账号密码、邮箱），未命中场景直接引导人工提单，而非勉强让模型作答。
 
 ### 3.4 Tool Gateway（工具策略网关）
-- 定位：Agent Runtime 与真实世界之间的**唯一策略执行点**。Agent Runtime 是多副本无状态 Worker，权限、限流、幂等、审批如果放在 Worker 里，每个副本各管一份就失效了，所以集中在这里。
-- 接口（REST，取代早期的 MCP 方案——MCP 端点没有角色权限/限流/审批，保留它等于留一条绕过策略的后门）：
+- 定位：Agent Runtime 与真实世界之间的**唯一策略执行点**。Agent Runtime 是多副本无状态 Worker，权限、幂等如果放在 Worker 里，每个副本各管一份就失效了，所以集中在这里。
+- 接口（REST，取代早期的 MCP 方案——MCP 端点不经过权限校验，保留它等于留一条绕过策略的后门）：
   - `GET /v1/tools/list?tenant_id&agent_role`：返回该角色可用工具的 OpenAI function 元数据，**不含密钥、下游地址、handler**。
-  - `POST /v1/tools/call`：入参 `tenant_id, session_id, agent_role, tool_name, arguments`，副作用工具必须带 `Idempotency-Key` 头。返回 `success / pending_approval / error` 三态信封。
-  - `GET /v1/approvals?tenant_id&status`、`POST /v1/approvals/{id}/resolve`：HITL 审批，记录存 PG（`tool_approvals`）。
-- 错误分两类：**模型可处理的**（无权限、参数不合法、限流、审批被拒、执行失败）走 200 信封回给模型；**调用方违约的**（非法 tenant、缺幂等键、幂等键冲突、并发执行中）走 HTTP 4xx，只给 Agent Runtime 看。
-- 调用管线：租户校验 → 工具存在 → 角色绑定 → JSON Schema → 幂等重放（在限流之前，重试已完成的调用不消耗令牌）→ Redis 令牌桶 → 原子占位 → 审批或执行 → 脱敏 → 记录结果 → 审计。
+  - `POST /v1/tools/call`：入参 `tenant_id, session_id, agent_role, tool_name, arguments`，副作用工具必须带 `Idempotency-Key` 头。返回 `success / error` 信封。
+- 错误分两类：**模型可处理的**（未知工具、无权限、参数不合法、执行失败）走 200 信封回给模型；**调用方违约的**（非法 tenant、缺幂等键、幂等键冲突、并发执行中）走 HTTP 4xx，只给 Agent Runtime 看。
+- 调用管线：租户校验 → 工具存在 → 角色绑定 → JSON Schema → 只读工具直接执行；副作用工具走幂等重放 / 原子占位 → 执行 → 记录结果 → 审计。
 - 上下文注入：`session_id`（即会话 ID）和幂等键由网关注入给 handler，不出现在给模型看的参数 schema 里，模型没法伪造或写错。
-- HITL 恢复：审批通过后网关直接执行工具并存结果，然后向 Redis Stream `tool_approval_events` 发恢复事件；Agent Runtime 收到后用**同一个幂等键**重新调用 `/v1/tools/call` 拿到已存结果，审批和幂等共用一条路径。
-- 幂等分两层：网关 `tool_calls` 表覆盖普通重试；执行完成但结果未落盘就崩溃的窗口，靠卡住的 `running` 记录超时后可被重新占位、再执行，因此有副作用的 handler 自身也必须幂等（`create_ticket` 把同一个键传到工单表）。
-- 核心工具（v1）：`search_knowledge(query)`、`create_ticket(summary, category)`、`update_ticket_status(ticket_id, status)`（demo 租户中此工具需要审批）。
+- 幂等分两层：网关 `tool_calls` 表覆盖普通重试；执行完成但结果未落盘就崩溃的窗口，靠卡住的 `running` 记录超时后可被重新占位、再执行，因此有副作用的 handler 自身也必须幂等（`create_ticket` 把同一个键传到工单表）。只读工具不写 `tool_calls`。
+- 脱敏：返回体只屏蔽 password/token 等凭据字段（知识库内容里的 IT 值班电话是员工需要的）；审计记录额外对手机号/邮箱/身份证做正则脱敏。
+- 核心工具（v1）：`search_knowledge(query)`、`create_ticket(summary, category)`。
+- **V1 暂不做、已有设计可恢复**（实现见提交 `f36530d`）：
+  - HITL 审批：`pending_approval` 状态、审批接口、`tool_approvals` 表、Redis Stream 恢复事件。等出现重置密码/解锁账号/开通权限这类高风险工具时再加。
+  - Redis 令牌桶限流：V1 工具都是 PG 查询、量小；按用户限流放在 API Gateway，Agent 死循环靠 LangGraph `recursion_limit`。
 - 扩展设计：`TicketProvider` 接口预留多实现（`InternalTicketProvider` 默认启用，未来可加 `JiraTicketProvider`、`FeishuTicketProvider`），通过租户级配置选择实现，不改动 Agent/应用服务代码。
 
 ### 3.5 AI Gateway

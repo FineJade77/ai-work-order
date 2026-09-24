@@ -1,9 +1,13 @@
 from abc import ABC, abstractmethod
-
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+from typing import Any
 
 from shared.db.models import Ticket
 from shared.db.session import app_session_factory, tenant_scope
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+from app.tools.base import ToolContext, ToolSpec
+
+TICKET_CATEGORIES = ["vpn", "account", "email", "other"]
 
 
 class TicketProvider(ABC):
@@ -11,9 +15,6 @@ class TicketProvider(ABC):
     def create(
         self, *, tenant_id: str, summary: str, category: str, conversation_ref: str, idempotency_key: str
     ) -> str: ...
-
-    @abstractmethod
-    def update_status(self, *, tenant_id: str, ticket_id: str, status: str) -> bool: ...
 
 
 class InternalTicketProvider(TicketProvider):
@@ -28,11 +29,9 @@ class InternalTicketProvider(TicketProvider):
     ) -> str:
         """Retrying with the same idempotency_key returns the original ticket_id.
 
-        Agent Runtime resumes from a LangGraph checkpoint after a crash (see
-        architecture-design.md 3.3), which can replay a create_ticket call whose result
-        was never durably recorded. Without this, that replay creates a duplicate ticket.
-        The insert-or-return-existing below is one atomic statement, so concurrent
-        retries with the same key can't race into two rows either.
+        The gateway's tool_calls record covers ordinary retries. This covers the remaining
+        window: a crash after the ticket row is written but before the gateway records
+        success, after which the orphaned call is reclaimed and this runs a second time.
         """
         Session = app_session_factory()
         with Session() as session, tenant_scope(session, tenant_id):
@@ -61,22 +60,43 @@ class InternalTicketProvider(TicketProvider):
                 return str(inserted_id)
 
             existing = (
-                session.query(Ticket)
-                .filter_by(tenant_id=tenant_id, idempotency_key=idempotency_key)
-                .one()
+                session.query(Ticket).filter_by(tenant_id=tenant_id, idempotency_key=idempotency_key).one()
             )
             session.commit()
             return str(existing.id)
 
-    def update_status(self, *, tenant_id: str, ticket_id: str, status: str) -> bool:
-        Session = app_session_factory()
-        with Session() as session, tenant_scope(session, tenant_id):
-            ticket = session.get(Ticket, ticket_id)
-            if ticket is None:
-                return False
-            ticket.status = status
-            session.commit()
-            return True
-
 
 ticket_provider: TicketProvider = InternalTicketProvider()
+
+
+def _handle(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
+    ticket_id = ticket_provider.create(
+        tenant_id=ctx.tenant_id,
+        summary=args["summary"],
+        category=args["category"],
+        conversation_ref=ctx.session_id,
+        idempotency_key=ctx.idempotency_key,
+    )
+    return {"ticket_id": ticket_id}
+
+
+CREATE_TICKET = ToolSpec(
+    name="create_ticket",
+    description="知识库方案无法解决员工问题时，为其创建一张 IT 工单。",
+    parameters={
+        "type": "object",
+        "properties": {
+            "summary": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 500,
+                "description": "问题描述，包含已尝试过的知识库方案",
+            },
+            "category": {"type": "string", "enum": TICKET_CATEGORIES, "description": "问题类别"},
+        },
+        "required": ["summary", "category"],
+        "additionalProperties": False,
+    },
+    handler=_handle,
+    side_effect=True,
+)

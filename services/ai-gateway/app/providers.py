@@ -4,9 +4,9 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 
 from openai import AsyncOpenAI
+from shared.tenancy import parse_tenant_id
 
 from app.usage import record_usage
-from app.validation import parse_tenant_id
 
 
 class ModelProvider(ABC):
