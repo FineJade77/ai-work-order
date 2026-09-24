@@ -12,7 +12,7 @@ router = APIRouter(prefix="/knowledge", tags=["knowledge"], dependencies=[Depend
 
 
 @router.get("/search")
-def search(
+async def search(
     repo: Annotated[KnowledgeRepository, Depends(get_repository)],
     tenant_id: str,
     q: Annotated[str, Query(min_length=1, max_length=200)],
@@ -22,6 +22,7 @@ def search(
         canonical_tenant = str(parse_tenant_id(tenant_id))
     except ValueError as exc:
         raise ApiError(400, "INVALID_TENANT", str(exc)) from exc
+    # In-memory matching over a few dozen items takes microseconds; safe on the event loop.
     hits = repo.search(canonical_tenant, q, limit)
     return SearchResponse(
         results=[
