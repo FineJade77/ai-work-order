@@ -1,0 +1,28 @@
+{
+  "tenants": {
+    "e0e112f3-5afb-4229-869b-c0bd012324bb": {
+      "name": "Demo Tenant",
+      "items": [
+        {"id": "vpn-001", "category": "vpn", "question": "VPN 连不上怎么办？", "answer": "请先确认本机网络正常，然后检查 VPN 客户端版本是否为最新版，重启客户端后重试。"},
+        {"id": "vpn-002", "category": "vpn", "question": "VPN 提示证书错误", "answer": "证书可能已过期，请在 VPN 客户端设置中点击“更新证书”，或重新下载安装最新客户端。"},
+        {"id": "vpn-003", "category": "vpn", "question": "VPN 连接后无法访问内网系统", "answer": "请确认连接的是正确的 VPN 线路（生产/办公网），并检查目标系统是否在您所在线路的访问范围内。"},
+        {"id": "account-001", "category": "account", "question": "忘记密码怎么办？", "answer": "请前往企业统一登录页面点击“忘记密码”，通过绑定的手机号或邮箱验证后重置密码。"},
+        {"id": "account-002", "category": "account", "question": "账号被锁定怎么解锁？", "answer": "连续输错密码超过 5 次会自动锁定 30 分钟，也可联系 IT 立即解锁。"},
+        {"id": "account-003", "category": "account", "question": "多次输错密码提示账号异常", "answer": "这是账号保护机制触发，请等待 30 分钟后重试，或通过“忘记密码”流程重置。"},
+        {"id": "email-001", "category": "email", "question": "邮箱无法收发邮件", "answer": "请检查网络连接与邮箱客户端账号配置是否正确，必要时重新输入授权码登录。"},
+        {"id": "email-002", "category": "email", "question": "邮箱提示存储空间已满", "answer": "请清理垃圾邮件和大附件邮件以释放空间，或联系 IT 申请扩容。"},
+        {"id": "email-003", "category": "email", "question": "如何在手机上配置公司邮箱", "answer": "在手机邮件App中选择“Exchange”账号类型，服务器地址、用户名密码与电脑端一致。"},
+        {"id": "other-001", "category": "other", "question": "夜间 IT 值班联系方式", "answer": "夜间请拨打 IT 值班电话 400-800-1234，或在企业微信搜索“IT 值班”。"}
+      ]
+    },
+    "9b2d6c1a-4e7f-4a3b-8c5d-2f1e0a9b8c7d": {
+      "name": "Northwind 分公司",
+      "items": [
+        {"id": "vpn-001", "category": "vpn", "question": "VPN 连不上怎么办？", "answer": "本公司使用 FortiClient：请退出后以管理员身份重新打开 FortiClient，并确认连接的是 “NW-Office” 配置。"},
+        {"id": "account-001", "category": "account", "question": "忘记密码怎么办？", "answer": "请在自助服务门户 selfservice.northwind.example 使用短信验证码重置，无需联系 IT。"},
+        {"id": "email-001", "category": "email", "question": "邮箱无法收发邮件", "answer": "本公司邮箱为 Google Workspace，请在浏览器打开 Gmail 确认是否正常，客户端问题请重新授权。"},
+        {"id": "printer-001", "category": "other", "question": "打印机无法打印", "answer": "请在打印机面板确认纸张与墨粉，仍无法打印请在工位系统中选择“NW-Printer-3F”重新添加。"}
+      ]
+    }
+  }
+}

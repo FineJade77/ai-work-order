@@ -115,6 +115,13 @@ services:
       ai-gateway-migrate:
         condition: service_completed_successfully
 
+  knowledge-service:
+    build: ./services/knowledge-service
+    ports:
+      - "8005:8005"
+    environment:
+      KNOWLEDGE_SERVICE_TOKEN: ${KNOWLEDGE_SERVICE_TOKEN:-dev-knowledge-service-token}
+
   ticket-service-migrate:
     build: ./services/ticket-service
     command: ["alembic", "upgrade", "head"]
