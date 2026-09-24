@@ -1,6 +1,7 @@
 # One Postgres instance, one database per service (deploy/postgres/init-databases.sql).
 # Startup order: postgres -> db-init -> <service>-migrate -> <service>.
 # The work_order superuser is for db-init and test fixtures only; services never use it.
+# It has no database of its own: it connects to the built-in 'postgres' maintenance database.
 
 services:
   postgres:
@@ -8,13 +9,13 @@ services:
     environment:
       POSTGRES_USER: work_order
       POSTGRES_PASSWORD: work_order
-      POSTGRES_DB: work_order
+      POSTGRES_DB: postgres
     ports:
       - "25432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U work_order"]
+      test: ["CMD-SHELL", "pg_isready -U work_order -d postgres"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -35,7 +36,7 @@ services:
       PGPASSWORD: work_order
     volumes:
       - ./deploy/postgres/init-databases.sql:/init-databases.sql:ro
-    command: ["psql", "-h", "postgres", "-U", "work_order", "-d", "work_order", "-v", "ON_ERROR_STOP=1", "-f", "/init-databases.sql"]
+    command: ["psql", "-h", "postgres", "-U", "work_order", "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-f", "/init-databases.sql"]
     depends_on:
       postgres:
         condition: service_healthy
