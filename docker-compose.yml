@@ -1,5 +1,6 @@
 # One Postgres instance, one database per service (deploy/postgres/init-databases.sql).
-# Startup order: postgres -> db-init -> <service>-migrate -> <service>.
+# Startup order: postgres -> db-init -> <service>-migrate -> (<service>-seed) -> <service>.
+# Seeds are local demo data (idempotent), so `docker compose up -d --build` yields a usable stack.
 # The work_order superuser is for db-init and test fixtures only; services never use it.
 # It has no database of its own: it connects to the built-in 'postgres' maintenance database.
 
@@ -50,6 +51,15 @@ services:
       db-init:
         condition: service_completed_successfully
 
+  app-service-seed:
+    build: ./services/app-service
+    command: ["python", "scripts/seed.py"]
+    environment:
+      MIGRATION_DATABASE_URL: postgresql+psycopg://app_service_owner:app_service_owner_dev@postgres:5432/app_service
+    depends_on:
+      app-service-migrate:
+        condition: service_completed_successfully
+
   app-service:
     build: ./services/app-service
     ports:
@@ -61,7 +71,7 @@ services:
       TICKET_SERVICE_URL: http://ticket-service:8006
       TICKET_SERVICE_TOKEN: ${TICKET_SERVICE_TOKEN:-dev-ticket-service-token}
     depends_on:
-      app-service-migrate:
+      app-service-seed:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
@@ -107,6 +117,15 @@ services:
       db-init:
         condition: service_completed_successfully
 
+  tool-gateway-seed:
+    build: ./services/tool-gateway
+    command: ["python", "scripts/seed.py"]
+    environment:
+      MIGRATION_DATABASE_URL: postgresql+psycopg://tool_gateway_owner:tool_gateway_owner_dev@postgres:5432/tool_gateway
+    depends_on:
+      tool-gateway-migrate:
+        condition: service_completed_successfully
+
   tool-gateway:
     build: ./services/tool-gateway
     ports:
@@ -119,7 +138,7 @@ services:
       TICKET_SERVICE_URL: http://ticket-service:8006
       TICKET_SERVICE_TOKEN: ${TICKET_SERVICE_TOKEN:-dev-ticket-service-token}
     depends_on:
-      tool-gateway-migrate:
+      tool-gateway-seed:
         condition: service_completed_successfully
       knowledge-service:
         condition: service_started
