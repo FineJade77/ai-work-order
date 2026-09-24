@@ -10,6 +10,7 @@ from app.tools.registry import REGISTRY
 
 TENANT = str(uuid.uuid4())
 SESSION = str(uuid.uuid4())
+USER = str(uuid.uuid4())
 ROLE = "it_support_agent"
 TICKET_ARGS = {"summary": "VPN 连不上", "category": "vpn"}
 
@@ -24,7 +25,7 @@ class FakeToolCalls:
         row = self.rows.get(key)
         return CallRecord(**{k: v for k, v in row.items() if k != "key"}) if row else None
 
-    def claim(self, *, tenant_id, session_id, agent_role, tool_name, arguments, request_hash, idempotency_key):
+    def claim(self, *, tenant_id, session_id, user_id, agent_role, tool_name, arguments, request_hash, idempotency_key):
         if idempotency_key in self.rows:
             return None
         call_id = str(uuid.uuid4())
@@ -72,9 +73,15 @@ def env(monkeypatch):
     return fake, audits, handler_calls
 
 
-def call(tool="create_ticket", args=TICKET_ARGS, key="k1", role=ROLE, tenant=TENANT):
+def call(tool="create_ticket", args=TICKET_ARGS, key="k1", role=ROLE, tenant=TENANT, user=USER):
     return svc.call_tool(
-        tenant_id=tenant, session_id=SESSION, agent_role=role, tool_name=tool, arguments=args, idempotency_key=key
+        tenant_id=tenant,
+        session_id=SESSION,
+        user_id=user,
+        agent_role=role,
+        tool_name=tool,
+        arguments=args,
+        idempotency_key=key,
     )
 
 
@@ -140,8 +147,8 @@ def test_same_key_with_different_arguments_is_a_conflict(env):
 
 def test_call_still_running_elsewhere_is_in_progress(env):
     fake, _, _ = env
-    fake.claim(tenant_id=TENANT, session_id=SESSION, agent_role=ROLE, tool_name="create_ticket",
-               arguments=TICKET_ARGS, request_hash=svc.request_hash(SESSION, ROLE, "create_ticket", TICKET_ARGS),
+    fake.claim(tenant_id=TENANT, session_id=SESSION, user_id=USER, agent_role=ROLE, tool_name="create_ticket",
+               arguments=TICKET_ARGS, request_hash=svc.request_hash(SESSION, USER, ROLE, "create_ticket", TICKET_ARGS),
                idempotency_key="k1")
     with pytest.raises(CallerError) as exc:
         call()
@@ -167,6 +174,33 @@ def test_internal_failure_is_masked_and_retryable(env, monkeypatch):
 
 
 def test_request_hash_ignores_key_order():
-    a = svc.request_hash(SESSION, ROLE, "create_ticket", {"summary": "s", "category": "vpn"})
-    b = svc.request_hash(SESSION, ROLE, "create_ticket", {"category": "vpn", "summary": "s"})
+    a = svc.request_hash(SESSION, USER, ROLE, "create_ticket", {"summary": "s", "category": "vpn"})
+    b = svc.request_hash(SESSION, USER, ROLE, "create_ticket", {"category": "vpn", "summary": "s"})
     assert a == b
+
+
+def test_invalid_user_is_a_caller_error_and_audited(env):
+    _, audits, handler_calls = env
+    with pytest.raises(CallerError) as exc:
+        call(user="not-a-uuid")
+    assert (exc.value.http_status, exc.value.code) == (400, "INVALID_USER")
+    assert audits[-1]["error_code"] == "INVALID_USER"
+    assert handler_calls == []
+
+
+def test_same_key_from_a_different_user_is_a_conflict(env):
+    call()
+    with pytest.raises(CallerError) as exc:
+        call(user=str(uuid.uuid4()))
+    assert exc.value.code == "IDEMPOTENCY_CONFLICT"
+
+
+def test_handler_receives_the_user_as_context(env, monkeypatch):
+    seen = []
+    monkeypatch.setitem(
+        REGISTRY,
+        "create_ticket",
+        dataclasses.replace(REGISTRY["create_ticket"], handler=lambda ctx, args: seen.append(ctx.user_id) or {"ticket_id": "T"}),
+    )
+    call()
+    assert seen == [USER]

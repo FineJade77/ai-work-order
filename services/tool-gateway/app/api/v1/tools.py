@@ -23,6 +23,7 @@ def call_tool(
     outcome = tool_call_service.call_tool(
         tenant_id=req.tenant_id,
         session_id=req.session_id,
+        user_id=req.user_id,
         agent_role=req.agent_role,
         tool_name=req.tool_name,
         arguments=req.arguments,

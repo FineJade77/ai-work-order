@@ -10,6 +10,8 @@ class ToolListResponse(BaseModel):
 class ToolCallRequest(BaseModel):
     tenant_id: str
     session_id: str = Field(min_length=1)
+    # The employee the agent is acting for; runtime context like session_id, never from the model.
+    user_id: str = Field(min_length=1)
     agent_role: str = Field(min_length=1)
     tool_name: str = Field(min_length=1)
     arguments: dict[str, Any] = Field(default_factory=dict)

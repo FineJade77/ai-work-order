@@ -85,12 +85,16 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://tool_gateway_app:tool_gateway_app_dev@postgres:5432/tool_gateway
       TOOL_GATEWAY_SERVICE_TOKEN: ${TOOL_GATEWAY_SERVICE_TOKEN:-dev-tool-gateway-token}
-      APP_SERVICE_URL: http://app-service:8001
-      APP_SERVICE_TOKEN: ${APP_SERVICE_INTERNAL_TOKEN:-dev-app-service-token}
+      KNOWLEDGE_SERVICE_URL: http://knowledge-service:8005
+      KNOWLEDGE_SERVICE_TOKEN: ${KNOWLEDGE_SERVICE_TOKEN:-dev-knowledge-service-token}
+      TICKET_SERVICE_URL: http://ticket-service:8006
+      TICKET_SERVICE_TOKEN: ${TICKET_SERVICE_TOKEN:-dev-ticket-service-token}
     depends_on:
       tool-gateway-migrate:
         condition: service_completed_successfully
-      app-service:
+      knowledge-service:
+        condition: service_started
+      ticket-service:
         condition: service_started
 
   ai-gateway-migrate:

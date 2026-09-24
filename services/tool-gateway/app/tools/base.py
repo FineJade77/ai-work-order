@@ -18,6 +18,7 @@ class ToolContext:
 
     tenant_id: str
     session_id: str
+    user_id: str
     agent_role: str
     idempotency_key: str | None
 

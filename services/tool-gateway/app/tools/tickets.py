@@ -13,15 +13,16 @@ TICKET_CATEGORIES = ["vpn", "account", "email", "other"]
 class TicketProvider(ABC):
     @abstractmethod
     def create(
-        self, *, tenant_id: str, summary: str, category: str, conversation_ref: str, idempotency_key: str
+        self, *, tenant_id: str, requester_id: str, summary: str, category: str, conversation_ref: str,
+        idempotency_key: str,
     ) -> str: ...
 
 
 class InternalTicketProvider(TicketProvider):
-    """Creates tickets through app-service, which owns the tickets table (architecture-design.md 3.2).
+    """Creates tickets through ticket-service, which owns ticket data and lifecycle.
 
     Same shape as a future Jira/ServiceNow provider: an HTTP call to the system that owns
-    tickets. The idempotency key is passed through, so app-service deduplicates too; that
+    tickets. The idempotency key is passed through, so ticket-service deduplicates too; that
     covers a crash after the ticket was created but before the gateway recorded success.
     """
 
@@ -31,12 +32,14 @@ class InternalTicketProvider(TicketProvider):
         )
 
     def create(
-        self, *, tenant_id: str, summary: str, category: str, conversation_ref: str, idempotency_key: str
+        self, *, tenant_id: str, requester_id: str, summary: str, category: str, conversation_ref: str,
+        idempotency_key: str,
     ) -> str:
         resp = self._client.post(
             "/internal/v1/tickets",
             json={
                 "tenant_id": tenant_id,
+                "requester_id": requester_id,
                 "conversation_id": conversation_ref,
                 "summary": summary,
                 "category": category,
@@ -44,18 +47,19 @@ class InternalTicketProvider(TicketProvider):
             headers={"Idempotency-Key": idempotency_key},
         )
         resp.raise_for_status()
-        return resp.json()["ticket_id"]
+        return resp.json()["ticket"]["id"]
 
 
 @lru_cache
 def get_ticket_provider() -> TicketProvider:
     settings = get_settings()
-    return InternalTicketProvider(settings.app_service_url, settings.app_service_token)
+    return InternalTicketProvider(settings.ticket_service_url, settings.ticket_service_token)
 
 
 def _handle(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
     ticket_id = get_ticket_provider().create(
         tenant_id=ctx.tenant_id,
+        requester_id=ctx.user_id,
         summary=args["summary"],
         category=args["category"],
         conversation_ref=ctx.session_id,

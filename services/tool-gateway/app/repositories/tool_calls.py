@@ -58,6 +58,7 @@ def claim(
     *,
     tenant_id: str,
     session_id: str,
+    user_id: str,
     agent_role: str,
     tool_name: str,
     arguments: dict[str, Any],
@@ -72,6 +73,7 @@ def claim(
             .values(
                 tenant_id=tenant_id,
                 session_id=session_id,
+                user_id=user_id,
                 agent_role=agent_role,
                 tool_name=tool_name,
                 arguments=arguments,

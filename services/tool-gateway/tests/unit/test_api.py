@@ -16,8 +16,10 @@ def client():
     app.dependency_overrides[get_settings] = lambda: Settings(
         tool_gateway_service_token=TOKEN,
         database_url="postgresql+psycopg://unused",
-        app_service_url="http://unused",
-        app_service_token="unused",
+        knowledge_service_url="http://unused",
+        knowledge_service_token="unused",
+        ticket_service_url="http://unused",
+        ticket_service_token="unused",
     )
     return TestClient(app)
 
@@ -45,7 +47,7 @@ def test_caller_error_maps_to_http_status_and_error_body(client, monkeypatch):
     resp = client.post(
         "/v1/tools/call",
         headers=AUTH,
-        json={"tenant_id": "t", "session_id": "s", "agent_role": "r", "tool_name": "x"},
+        json={"tenant_id": "t", "session_id": "s", "user_id": "u", "agent_role": "r", "tool_name": "x"},
     )
     assert resp.status_code == 409
     assert resp.json() == {"error": {"code": "IDEMPOTENCY_CONFLICT", "message": "reused key"}}

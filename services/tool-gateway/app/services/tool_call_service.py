@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -56,9 +57,24 @@ def require_tenant(tenant_id: str) -> None:
         raise CallerError(400, "INVALID_TENANT", str(exc)) from exc
 
 
-def request_hash(session_id: str, agent_role: str, tool_name: str, arguments: dict[str, Any]) -> str:
+def require_user(user_id: str) -> None:
+    try:
+        uuid.UUID(user_id)
+    except ValueError as exc:
+        raise CallerError(400, "INVALID_USER", f"user_id is not a valid UUID: {user_id!r}") from exc
+
+
+def request_hash(
+    session_id: str, user_id: str, agent_role: str, tool_name: str, arguments: dict[str, Any]
+) -> str:
     canonical = json.dumps(
-        {"session_id": session_id, "agent_role": agent_role, "tool_name": tool_name, "arguments": arguments},
+        {
+            "session_id": session_id,
+            "user_id": user_id,
+            "agent_role": agent_role,
+            "tool_name": tool_name,
+            "arguments": arguments,
+        },
         sort_keys=True,
         ensure_ascii=False,
         separators=(",", ":"),
@@ -76,6 +92,7 @@ def call_tool(
     *,
     tenant_id: str,
     session_id: str,
+    user_id: str,
     agent_role: str,
     tool_name: str,
     arguments: dict[str, Any],
@@ -93,6 +110,7 @@ def call_tool(
         outcome = _call_tool(
             tenant_id=tenant_id,
             session_id=session_id,
+            user_id=user_id,
             agent_role=agent_role,
             tool_name=tool_name,
             arguments=arguments,
@@ -107,6 +125,7 @@ def call_tool(
         audit.write(
             tenant_id=tenant_id,
             session_id=session_id,
+            user_id=user_id,
             agent_role=agent_role,
             tool_name=tool_name,
             arguments=arguments,
@@ -121,11 +140,14 @@ def _call_tool(
     *,
     tenant_id: str,
     session_id: str,
+    user_id: str,
     agent_role: str,
     tool_name: str,
     arguments: dict[str, Any],
     idempotency_key: str | None,
 ) -> CallOutcome:
+    require_user(user_id)
+
     spec = REGISTRY.get(tool_name)
     if spec is None:
         return _error("UNKNOWN_TOOL", f"unknown tool: {tool_name}")
@@ -138,7 +160,11 @@ def _call_tool(
         return _error("INVALID_ARGUMENTS", violation)
 
     ctx = ToolContext(
-        tenant_id=tenant_id, session_id=session_id, agent_role=agent_role, idempotency_key=idempotency_key
+        tenant_id=tenant_id,
+        session_id=session_id,
+        user_id=user_id,
+        agent_role=agent_role,
+        idempotency_key=idempotency_key,
     )
 
     # Read-only tools have nothing to deduplicate; skip the two extra transactions.
@@ -153,7 +179,7 @@ def _call_tool(
             400, "MISSING_IDEMPOTENCY_KEY", f"{tool_name} has side effects; an Idempotency-Key header is required"
         )
 
-    fingerprint = request_hash(session_id, agent_role, tool_name, arguments)
+    fingerprint = request_hash(session_id, user_id, agent_role, tool_name, arguments)
     existing = tool_calls.find_by_idempotency_key(tenant_id, idempotency_key)
     if existing is not None:
         return _resume(existing, fingerprint, spec, ctx)
@@ -161,6 +187,7 @@ def _call_tool(
     call_id = tool_calls.claim(
         tenant_id=tenant_id,
         session_id=session_id,
+        user_id=user_id,
         agent_role=agent_role,
         tool_name=tool_name,
         arguments=arguments,

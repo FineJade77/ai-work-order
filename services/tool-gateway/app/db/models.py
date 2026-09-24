@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import CheckConstraint, DateTime, Text, UniqueConstraint, text
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
@@ -24,22 +24,6 @@ def _created_at() -> Mapped[datetime]:
     return mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
-class KnowledgeItem(Base):
-    """V1 knowledge store. Replaced by a dedicated knowledge service later."""
-
-    __tablename__ = "knowledge_items"
-
-    id: Mapped[uuid.UUID] = _pk()
-    tenant_id: Mapped[uuid.UUID] = _tenant_id()
-    question: Mapped[str] = mapped_column(Text, nullable=False)
-    answer: Mapped[str] = mapped_column(Text, nullable=False)
-    tags: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False, server_default=text("'{}'"))
-    source: Mapped[str | None] = mapped_column(Text, nullable=True)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
-    )
-
-
 class RoleToolBinding(Base):
     __tablename__ = "role_tool_bindings"
     __table_args__ = (UniqueConstraint("tenant_id", "agent_role", "tool_name", name="uq_role_tool_bindings"),)
@@ -58,6 +42,7 @@ class ToolCall(Base):
     id: Mapped[uuid.UUID] = _pk()
     tenant_id: Mapped[uuid.UUID] = _tenant_id()
     session_id: Mapped[str] = mapped_column(Text, nullable=False)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     agent_role: Mapped[str] = mapped_column(Text, nullable=False)
     tool_name: Mapped[str] = mapped_column(Text, nullable=False)
     arguments: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
@@ -82,6 +67,7 @@ class ToolCallLog(Base):
     id: Mapped[uuid.UUID] = _pk()
     tenant_id: Mapped[uuid.UUID] = _tenant_id()
     session_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     agent_role: Mapped[str | None] = mapped_column(Text, nullable=True)
     call_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     tool_name: Mapped[str] = mapped_column(Text, nullable=False)

@@ -1,5 +1,6 @@
 import json
 import logging
+import uuid
 from typing import Any
 
 from app.core.redaction import redact_for_audit
@@ -15,6 +16,7 @@ def write(
     *,
     tenant_id: str,
     session_id: str,
+    user_id: str,
     agent_role: str,
     tool_name: str,
     arguments: Any,
@@ -33,6 +35,7 @@ def write(
                 ToolCallLog(
                     tenant_id=tenant_id,
                     session_id=session_id,
+                    user_id=_uuid_or_none(user_id),
                     agent_role=agent_role,
                     call_id=call_id,
                     tool_name=tool_name,
@@ -50,3 +53,11 @@ def write(
 def log_unscoped_rejection(*, tenant_id: str, tool_name: str, reason: str) -> None:
     """For requests with no valid tenant: RLS can't accept a row without a tenant context."""
     logger.warning("tool_call rejected tool=%s tenant_id=%r reason=%s", tool_name, tenant_id, reason)
+
+
+def _uuid_or_none(value: str) -> str | None:
+    """A call rejected for a malformed user_id must still be audited; store NULL rather than fail."""
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        return None
