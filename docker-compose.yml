@@ -56,9 +56,17 @@ services:
       - "8001:8001"
     environment:
       DATABASE_URL: postgresql+psycopg://app_service_app:app_service_app_dev@postgres:5432/app_service
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:-dev-jwt-secret-change-me-in-any-real-deployment}
+      TICKET_SERVICE_URL: http://ticket-service:8006
+      TICKET_SERVICE_TOKEN: ${TICKET_SERVICE_TOKEN:-dev-ticket-service-token}
     depends_on:
       app-service-migrate:
         condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      ticket-service:
+        condition: service_started
 
   agent-runtime-migrate:
     build: ./services/agent-runtime
