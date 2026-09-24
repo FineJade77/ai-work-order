@@ -82,15 +82,21 @@
 ### 3.2 应用服务（Application Service）
 - 技术选型建议：Node.js(NestJS) 或 Python(FastAPI)，与 Agent Runtime（Python/LangGraph）同语言时集成成本最低，**推荐 FastAPI**。
 - 核心领域模型：
-  - `Tenant`：租户
-  - `User`：用户（属于某租户）
+  - `Tenant`：租户，带唯一的 `slug`（登录时用来确定租户）
+  - `User`：用户（属于某租户），角色 `employee` / `it_staff`，scrypt 密码哈希
   - `Conversation` / `Message`：问答会话
+  - `Turn`：一条用户消息及其处理状态（`queued/done/failed`），`id` 就是投递给 Agent Runtime 的 `task_id`；部分唯一索引保证同一会话同时只有一轮在处理
   - 工单不在这里：归 ticket-service 所有（见 3.7 节）。员工"我的工单"、IT 人员处理工单的页面由应用服务调用 ticket-service 的内部接口实现，`start`/`resolve` 这类 IT 操作的角色权限也在应用服务里判断。
 - 核心业务流程：
   1. 接收用户提问 → 创建/追加 `Conversation`。
   2. 调用 Agent Runtime 执行任务，传入 `tenant_id`、会话上下文。
   3. 若 Agent 返回「已通过知识库解决」→ 落库回答，结束。
   4. 若 Agent 返回「需要转工单」或用户主动要求 → 调用 Tool Gateway 的 `create_ticket` 生成工单，返回工单号给用户。
+- 登录与鉴权：`POST /v1/auth/login {tenant, email, password}`，先按 slug 查租户（`tenants` 无 RLS），再在租户作用域内查用户；三种失败统一 401，账号不存在时也做一次假校验，耗时一致。签发 HS256 JWT（`sub/tid/role`，8 小时，无刷新），之后所有接口的租户和用户只取自 JWT。scrypt 在线程里执行，并限制同时最多 4 个（每个约 128 MiB）。以后上 API Gateway 时改 RS256。
+- 会话接口：`POST/GET /v1/conversations`、`GET /v1/conversations/{id}/messages`（含进行中的 `active_task_id`，页面刷新后可重新接上 SSE）、`POST .../messages`（202 `{task_id}`；上一轮未结束返回 409 `TURN_IN_PROGRESS`）、`GET .../stream?task_id=`（SSE）。会话只有本人可见，其他人一律 404。
+- 回复落库：后台消费 `agent_results`（消费组 `app_service`），按轮次 upsert 唯一的助手消息并关闭轮次，可重复投递；不依赖 SSE 连接。晚到的成功结果会覆盖此前的失败提示。
+- 补偿：每 30 秒一次（advisory lock 保证只有一个副本在扫），把 `queued` 超过 5 分钟的轮次用同一个 `task_id` 重新入队，最多 2 次，之后标记失败并写 `error` 事件。5 分钟大于 Agent Runtime 自身重试的最长时间（3 次 × 90 秒）。
+- 工单页面（BFF）：员工的列表固定按本人过滤，看别人的工单返回 404；`start`/`resolve` 只允许 `it_staff`，`start` 固定指派给自己；`actor_id` 总是当前用户。ticket-service 的业务错误（400/403/404/409）原样透传。
 - 对 Agent Runtime 是**异步任务分发**：应用服务不直接同步调用 Agent Runtime，而是把任务（`conversation_id` + 上下文 + `tenant_id`）写入 Redis Streams 队列即返回；随后从该会话的事件 Stream（`conversation:{conversation_id}:events`）读取 Agent Runtime 陆续写入的中间事件（"正在检索知识库…"、增量 token、最终结果）通过 SSE/WebSocket 转发给前端。对前端而言体验仍是"流式返回"，但应用服务与 Agent Runtime 之间是解耦的异步关系，见 3.3 节。
 
 ### 3.3 Agent Runtime（LangGraph）
@@ -181,7 +187,7 @@
 
 | 数据库 | 归属服务 | 表 |
 |---|---|---|
-| `app_service` | 应用服务 | `tenants`、`users`、`conversations`、`messages` |
+| `app_service` | 应用服务 | `tenants`、`users`、`conversations`、`messages`、`turns` |
 | `tool_gateway` | Tool Gateway | `role_tool_bindings`、`tool_calls`、`tool_call_logs` |
 | `ticket_service` | 工单服务 | `tickets`（含幂等键局部唯一索引、版本号）、`ticket_events`（只追加） |
 | `ai_gateway` | AI Gateway | `model_call_logs` |

@@ -88,12 +88,13 @@ ai-work-order/
 
 ### 阶段 5：应用服务
 > 工单数据与接口已在 ticket-service（阶段 2.5）。本阶段的员工"我的工单"和 IT 处理页面由应用服务调用 ticket-service 实现，`start`/`resolve` 的 IT 角色校验在应用服务做。
-- 实现 `POST /conversations/{id}/messages`：写入用户消息，把任务推入 `agent_tasks` 队列，立即返回 202。
-- 实现 `GET /conversations/{id}/stream`（SSE）：读取该会话的事件 Stream（`conversation:{id}:events`，用 Stream ID 作为 SSE 的 event id，支持 Last-Event-ID 续读），`done`/`error` 后关闭连接。
-- 上一轮任务未结束时拒绝同一会话的新消息（409）；记录每个任务的状态，定时把长时间没有 `done` 的任务重新入队，弥补 Redis 丢消息。
-- 面向员工/IT 的工单接口：`GET /tickets/{id}`、`GET /tickets`（员工只看自己的）、状态流转，均转调 ticket-service，租户和用户取自 JWT 而不是请求参数。
-- 简单的用户/租户模型 + JWT 鉴权中间件（v1 自建账号体系，登录接口签发 JWT，`tenant_id` 编码进 token）。
-- **验收标准**：用 curl/httpie 完整跑通一次"提问 → SSE 收到检索中事件 → 收到回答 → 未解决时收到 ticket_created 事件 → 查询该工单"的闭环。
+- 登录：`POST /v1/auth/login {tenant(slug), email, password}` 签发 HS256 JWT（`sub/tid/role`）；`GET /v1/me`。迁移 0003 加 `tenants.slug`、`users.password_hash`、角色约束（`employee/it_staff`）、`turns` 表、`messages.task_id`。
+- `POST /v1/conversations/{id}/messages`：同一事务写用户消息和 `turns`（同一会话只能有一个 `queued`，否则 409），再 XADD `agent_tasks`，返回 202 `{task_id, message_id}`。
+- `GET /v1/conversations/{id}/stream?task_id=`（SSE）：从会话事件 Stream 开头读、按 `task_id` 过滤，Stream ID 作为 SSE 的 event id，支持 Last-Event-ID 续读，`done`/`error` 后关闭；事件已过期时用数据库里的结果补发。
+- 回复落库：后台消费 `agent_results`，幂等地写助手消息、关闭轮次。补偿：`queued` 超过 5 分钟的轮次用同一 `task_id` 重新入队，最多 2 次后标记失败。
+- 工单接口：`GET /v1/tickets`（员工只看自己的）、`GET /v1/tickets/{id}`、`POST /v1/tickets/{id}/transitions`，均转调 ticket-service，租户和用户取自 JWT；`start` 固定指派给自己。
+- seed：两个 demo 租户（slug `demo`、`northwind`）各一个员工和一个 IT，开发密码 `demo-password`。
+- **验收标准**：`tests/unit` 与 `tests/integration`（真 Postgres、Redis、ticket-service）全部通过，覆盖登录失败不可区分、会话私有、并发发消息 409、结果重复投递只存一次、晚到结果覆盖失败提示、SSE 过滤与续读、补偿重投与放弃、工单可见性与角色规则；用 curl 完整跑通"登录 → 提问 → SSE 收到检索中和回答 → 反馈未解决 → 收到 ticket_created → 查询工单 → IT 处理 → 员工关闭"的闭环。
 
 ### 阶段 6：端到端联调与本地部署
 - 补齐 `deploy/k8s` 下各服务的最小 Deployment/Service manifest（不要求 HPA/KEDA 配置齐全，占位注明"生产环境需按架构文档 5 节补充自动扩缩容配置"）。
