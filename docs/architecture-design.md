@@ -26,8 +26,8 @@
                                  │
 ┌───────────────────────────────▼──────────────────────────────────────┐
 │  应用服务 (Application Service)                                       │
-│  · 会话管理 / 工单 CRUD 与状态机 / 用户与租户管理 / 权限校验             │
-│  · 编排「问答 → 未解决转工单」的业务流程                                 │
+│  · 会话管理 / 用户与租户管理 / 权限校验；员工与 IT 页面的 BFF          │
+│  · 编排「问答 → 未解决转工单」的业务流程（工单数据在 ticket-service）  │
 │  · 对下游 Agent Runtime 发起任务，接收结果落库                          │
 └───────┬───────────────────────────────────────────────┬──────────────┘
         │ 任务入队(Redis Streams)      结果订阅(Pub/Sub)   │
@@ -49,15 +49,16 @@
 ┌───────▼──────────────────────────────────────────────────────────────┐
 │  Tool Gateway（工具策略网关）                                          │
 │  · 角色-工具绑定 / JSON Schema 校验 / 幂等 / 审计 / 服务间令牌鉴权       │
-│  · search_knowledge（知识检索工具，可插拔实现）                        │
-│  · create_ticket（工单 Provider 接口，默认对接自建工单模块）             │
+│  · search_knowledge → knowledge-service                              │
+│  · create_ticket → ticket-service（TicketProvider 接口）               │
 │  · 预留：外部系统工具适配位（Jira/ServiceNow/企业IM，未来可插拔）        │
 └───────┬────────────────────────────────────────────────┬─────────────┘
         │                                                 │
 ┌───────▼─────────────┐                        ┌──────────▼─────────────┐
-│  知识库子系统         │                        │   工单子系统（自建）      │
-│  v1: 简单QA/FAQ存储   │                        │  · 工单表 + 状态机       │
-│  v2: 向量化+RAG检索   │                        │  · IT 处理人工作台        │
+│  knowledge-service    │                        │   ticket-service        │
+│  v1: 按租户写死的数据  │                        │  · 工单 + 4 状态状态机   │
+│  只读检索，无数据库    │                        │  · 乐观锁 + 处理记录     │
+│  v2: 向量化+RAG检索   │                        │  · ticket_service 库    │
 └──────────────────────┘                        └──────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -84,7 +85,7 @@
   - `Tenant`：租户
   - `User`：用户（属于某租户）
   - `Conversation` / `Message`：问答会话
-  - `Ticket`：工单（状态机：`draft → open → in_progress → resolved → closed`，附加 `reopened` 分支）
+  - 工单不在这里：归 ticket-service 所有（见 3.7 节）。员工"我的工单"、IT 人员处理工单的页面由应用服务调用 ticket-service 的内部接口实现，`start`/`resolve` 这类 IT 操作的角色权限也在应用服务里判断。
 - 核心业务流程：
   1. 接收用户提问 → 创建/追加 `Conversation`。
   2. 调用 Agent Runtime 执行任务，传入 `tenant_id`、会话上下文。
@@ -122,7 +123,8 @@
 - 调用管线：租户校验 → 工具存在 → 角色绑定 → JSON Schema → 只读工具直接执行；副作用工具走幂等重放 / 原子占位 → 执行 → 记录结果 → 审计。
 - 上下文注入：`session_id`（即会话 ID）和幂等键由网关注入给 handler，不出现在给模型看的参数 schema 里，模型没法伪造或写错。
 - 幂等分两层：网关 `tool_calls` 表覆盖普通重试；执行完成但结果未落盘就崩溃的窗口，靠卡住的 `running` 记录超时后可被重新占位、再执行，因此下游也必须幂等（`create_ticket` 把同一个键透传给 app-service 的内部建单接口）。只读工具不写 `tool_calls`。
-- 下游：`search_knowledge` 查 Tool Gateway 自己库里的 `knowledge_items`（v1），后续换成调用独立知识库服务；`create_ticket` 调 app-service 内部接口，`TicketProvider` 的内部实现和未来的 Jira 实现都是"调用工单系统的 HTTP 接口"，形态一致。
+- 下游：`search_knowledge` 调 knowledge-service（3.6 节）；`create_ticket` 调 ticket-service（3.7 节），`TicketProvider` 的内部实现和未来的 Jira 实现都是"调用工单系统的 HTTP 接口"，形态一致。
+- 运行时上下文：`/v1/tools/call` 除 `session_id` 外还要求 `user_id`（当前员工），由 Agent Runtime 提供，模型看不到；`create_ticket` 用它作为提单人 `requester_id`，审计日志也记录它，并参与幂等请求指纹。
 - 脱敏：返回体只屏蔽 password/token 等凭据字段（知识库内容里的 IT 值班电话是员工需要的）；审计记录额外对手机号/邮箱/身份证做正则脱敏。
 - 核心工具（v1）：`search_knowledge(query)`、`create_ticket(summary, category)`。
 - **V1 暂不做、已有设计可恢复**（实现见提交 `f36530d`）：
@@ -137,21 +139,46 @@
   - 后续如需接入 Anthropic Claude 等非 OpenAI-compatible 供应商，在 `ModelProvider` 抽象下新增一个专用实现（如 `AnthropicProvider`）即可，路由层按租户/模型名分发，不影响已接入的 OpenAI-compatible 供应商。
 - 记录每次调用的 `tenant_id + 模型 + token 数 + 耗时`，为后续按租户计费/限额做准备。
 
+### 3.6 知识库服务（knowledge-service）
+- 定位：知识检索的唯一出口，V1 **只读、只有检索一个接口**，不做 RAG/向量。
+- 接口：`GET /internal/v1/knowledge/search?tenant_id&q&limit`（服务令牌鉴权）→ `{results: [{id, category, question, answer, score}]}`。
+- 数据：`app/data/knowledge.json`，按租户 ID 分组、随镜像发布，改内容要重新部署。未知租户返回空列表（租户注册表归应用服务）。
+- 匹配：字符二元组覆盖率，问题中包含完整查询词时记 1.0；不需要中文分词，结果确定、可测。
+- 扩展点：`KnowledgeRepository` 接口，V1 实现是 `StaticKnowledgeRepository`；换成数据库或向量检索时接口不变，Tool Gateway 无感知。
+- 无状态、无数据库，扩容就是加副本。
+
+### 3.7 工单服务（ticket-service）
+- 定位：工单数据与生命周期的唯一所有者；Tool Gateway（Agent 建单）和应用服务（员工/IT 页面）都通过它的内部接口操作工单。
+- 状态机（4 个状态，"重新打开"是动作不是状态）：
+  - `open --start(指定处理人)--> in_progress --resolve(必须填写说明)--> resolved --close--> closed`
+  - `open --cancel--> closed`、`resolved --reopen--> open`
+  - `cancel`/`close`/`reopen` 只能由提单人本人执行（服务自己校验 `actor_id == requester_id`）；`start`/`resolve` 的 IT 角色权限由应用服务判断。
+- 接口（`/internal/v1`，服务令牌鉴权）：
+  - `POST /tickets`（`Idempotency-Key`）：建单，同一幂等键重试返回原工单；201 新建 / 200 重放。
+  - `GET /tickets/{id}?tenant_id`：详情 + 完整处理记录。
+  - `GET /tickets?tenant_id&requester_id&status&assignee_id&limit&cursor`：按创建时间倒序，游标分页。
+  - `POST /tickets/{id}/transitions`：`{action, actor_id, expected_version, assignee_id?, note?}`；非法流转 409、非提单人 403、版本号不一致 409。
+- 并发：`tickets.version` 乐观锁，流转时 `UPDATE ... WHERE version = expected` 与写 `ticket_events` 在同一事务，两个操作员同时处理同一版本只有一个成功。
+- `ticket_events` 只追加（运行时账号没有 UPDATE/DELETE 权限），同时作为处理记录和审计。
+- 暂不做：评论、附件、SLA、状态变更通知（后续可以发 `ticket_events` 到消息队列）。
+
 ## 4. 数据模型与数据归属
 
 **每个服务一个数据库，同一个 Postgres 实例**（本地一个容器，云上初期一个托管实例；单个服务要独立扩容时只改它的 `DATABASE_URL`）。服务之间不共享表、不共享模型代码，只通过 API 交互：
 
 | 数据库 | 归属服务 | 表 |
 |---|---|---|
-| `app_service` | 应用服务 | `tenants`、`users`、`conversations`、`messages`、`tickets`（含幂等键局部唯一索引） |
-| `tool_gateway` | Tool Gateway | `knowledge_items`（v1 知识库，后续由独立知识库服务替代）、`role_tool_bindings`、`tool_calls`、`tool_call_logs` |
+| `app_service` | 应用服务 | `tenants`、`users`、`conversations`、`messages` |
+| `tool_gateway` | Tool Gateway | `role_tool_bindings`、`tool_calls`、`tool_call_logs` |
+| `ticket_service` | 工单服务 | `tickets`（含幂等键局部唯一索引、版本号）、`ticket_events`（只追加） |
 | `ai_gateway` | AI Gateway | `model_call_logs` |
+| （无） | 知识库服务 | V1 为代码仓库里按租户写死的 JSON，不需要数据库 |
 
 - 每个服务有两个数据库账号：`<svc>_owner`（建表、迁移、种子数据）和 `<svc>_app`（运行时账号，不是表的所有者，RLS 对它强制生效），且只能连自己的库。本地由 `deploy/postgres/init-databases.sql` 创建，云上由基础设施创建、密码来自密钥管理。
 - 每个服务自带 Alembic 迁移，部署时以独立任务先跑迁移再起服务（compose 用 `<svc>-migrate` 服务，K8s 用 Job/initContainer）。
 - 不做跨库外键：非 app-service 的 `tenant_id` 是普通 UUID 列，租户合法性由 API Gateway 校验 JWT 保证。
 - 多租户隔离：库内仍然用 `tenant_id` + PostgreSQL RLS，每次查询都在租户作用域内执行。
-- 跨服务写数据走 API：Tool Gateway 的 `create_ticket` 调 app-service 的内部接口 `POST /internal/v1/tickets`（透传幂等键），不直接写工单表。
+- 跨服务写数据走 API：Tool Gateway 的 `create_ticket` 调 ticket-service 的内部接口 `POST /internal/v1/tickets`（透传幂等键），不直接写工单表。
 - 代价：跨服务报表（比如把工具调用和工单关联起来）不能再直接写 SQL join，需要时再做数据同步。
 
 ## 5. 部署与云原生方案
@@ -190,7 +217,8 @@
 - 部署：云无关，基于标准 Kubernetes。
 - Agent Runtime：LangGraph，异步 Worker + Redis Streams 队列 + Pub/Sub 流式回传（见 3.3 节）。
 - 工单系统：自建工单模块，`TicketProvider` 抽象预留外部系统扩展点。
-- 知识库：v1 是 Tool Gateway 库内的简单 QA 表，后续替换为独立知识库服务（向量检索）。
+- 知识库：独立的 knowledge-service，V1 只提供检索、数据按租户写死；后续在同一接口后面换成数据库/向量检索。
+- 工单：独立的 ticket-service，4 状态状态机 + 乐观锁 + 处理记录；应用服务不再持有工单表。
 - 数据：同一 Postgres 实例、每服务独立 database，库内 `tenant_id` + RLS 隔离；服务间不共享表和模型代码，没有 `libs/shared`（见第 4 节）。
 - Tool Gateway：REST 策略网关；HITL 审批与 Redis 限流 V1 暂不做（见 3.4 节）。
 - 队列服务：Redis Streams（复用会话缓存的同一 Redis 实例）。

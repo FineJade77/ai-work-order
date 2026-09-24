@@ -17,7 +17,7 @@
 - 数据库：PostgreSQL，同一实例、每服务独立 database，库内 `tenant_id` 行级隔离（RLS）。
 - 工具协议：Tool Gateway 对 Agent Runtime 暴露 REST 接口（`/v1/tools/list` 返回 OpenAI function 元数据，`/v1/tools/call` 执行），详见架构文档 3.4 节。
 - 模型供应商：AI Gateway v1 通过 OpenAI-compatible 协议接入，具体供应商为 **DeepSeek**（`base_url=https://api.deepseek.com`），用 `ModelProvider` 抽象 + 通用 `OpenAICompatibleProvider` 实现，不要为 DeepSeek 单独写一套适配代码。
-- 容器化：每个服务独立 Dockerfile，提供 `docker-compose.yml` 用于本地一键起环境（Postgres、Redis、四个服务）。
+- 容器化：每个服务独立 Dockerfile，提供 `docker-compose.yml` 用于本地一键起环境（Postgres、Redis 与全部服务）。
 
 ## 目录结构约定
 
@@ -26,9 +26,11 @@ ai-work-order/
 ├── docs/
 ├── docker-compose.yml
 ├── services/
-│   ├── app-service/         # FastAPI，会话/工单/租户/用户；库 app_service
+│   ├── app-service/         # FastAPI，会话/租户/用户，员工与 IT 页面的 BFF；库 app_service
 │   ├── agent-runtime/        # LangGraph worker，消费 Redis Streams
-│   ├── tool-gateway/         # 工具策略网关：权限/校验/幂等/审计/脱敏；库 tool_gateway（含 v1 知识库）
+│   ├── tool-gateway/         # 工具策略网关：权限/校验/幂等/审计/脱敏；库 tool_gateway
+│   ├── knowledge-service/    # 知识检索，V1 按租户写死的数据，无数据库
+│   ├── ticket-service/       # 工单生命周期：建单/详情/列表/状态流转；库 ticket_service
 │   └── ai-gateway/           # 模型调用统一出口；库 ai_gateway
 └── deploy/
     ├── postgres/             # init-databases.sql：本地创建各服务的库和账号
@@ -49,17 +51,23 @@ ai-work-order/
 ### 阶段 1：数据模型与迁移
 > 最初是一个共享库 + 一套迁移（`libs/shared`），后改为每服务独立 database、各自迁移（架构文档第 4 节）。以下为当前版本。
 - 按架构文档第 4 节的归属建表，每个服务在自己的库里用 Alembic 管理 schema，对含租户数据的表启用 `FORCE ROW LEVEL SECURITY`（按 `tenant_id` 过滤）。
-- 各服务的 seed 脚本用固定的 demo 租户 ID 插入数据：app-service 插租户/用户/会话，tool-gateway 插 3 个场景（VPN、账号密码、邮箱）各 3 条 QA 和角色工具绑定。
+- 各服务的 seed 脚本用固定的 demo 租户 ID 插入数据：app-service 插两个 demo 租户的租户/用户/会话，tool-gateway 插角色工具绑定；知识内容在 knowledge-service 的静态 JSON 里（见阶段 2.5）。
 - **验收标准**：迁移可重复执行（up/down 幂等），seed 脚本跑完后能查到预置数据，且用非本租户 `tenant_id` 查询取不到数据（验证 RLS 生效）。
 
 ### 阶段 2：Tool Gateway（工具策略网关）
 > 最初按 MCP 接口实现，后改为 REST 策略网关（架构文档 3.4 节）。以下为当前版本。
 - `GET /v1/tools/list?tenant_id&agent_role`：返回角色可用工具的 OpenAI function 元数据，不含密钥/下游地址。
-- `POST /v1/tools/call`：`tenant_id, session_id, agent_role, tool_name, arguments`，返回 `success / error`；副作用工具必须带 `Idempotency-Key` 头。
+- `POST /v1/tools/call`：`tenant_id, session_id, user_id, agent_role, tool_name, arguments`，返回 `success / error`；副作用工具必须带 `Idempotency-Key` 头。
 - 能力：多租户（RLS）、`role_tool_bindings` 角色工具绑定、JSON Schema 参数校验、副作用工具的 `tool_calls` 幂等记录、`tool_call_logs` 审计（参数脱敏）、返回体凭据字段屏蔽、服务间 Bearer 令牌鉴权。HITL 审批与 Redis 限流 V1 暂不做（见架构文档 3.4 节）。
-- 工具：`search_knowledge(query)`（v1 `ILIKE` + `pg_trgm` 排序）、`create_ticket(summary, category)`（会话 ID 与幂等键由网关注入；调用 app-service 的 `POST /internal/v1/tickets`，幂等键透传，工单表层面也按幂等键去重）。`TicketProvider` 抽象，v1 只有 `InternalTicketProvider`。
+- 工具：`search_knowledge(query)` 调 knowledge-service；`create_ticket(summary, category)` 调 ticket-service 的 `POST /internal/v1/tickets`（会话 ID、员工 `user_id`、幂等键由网关注入，幂等键透传）。`TicketProvider` 抽象，v1 只有 `InternalTicketProvider`。
+- 调用上下文：`/v1/tools/call` 必须带 `user_id`（当前员工 UUID），作为工单提单人，记入审计和幂等指纹。
 - 代码分层：`api/v1`（路由）→ `services`（调用管线，不依赖 FastAPI）→ `repositories`（网关自身的表）/ `tools`（工具定义与 handler）；`core` 放配置、鉴权、错误、脱敏。
-- **验收标准**：`tests/unit`（无外部依赖）与 `tests/integration`（需起 tool-gateway 及其依赖的 app-service）全部通过；覆盖权限、校验、幂等重放与冲突、脱敏、审计；同一幂等键的并发请求只产生一张工单；`running` 状态孤儿记录超时后可恢复且不重复执行副作用。
+- **验收标准**：`tests/unit`（无外部依赖）与 `tests/integration`（需起 tool-gateway 及其依赖的 knowledge-service、ticket-service）全部通过；覆盖权限、校验、幂等重放与冲突、脱敏、审计；同一幂等键的并发请求只产生一张工单；`running` 状态孤儿记录超时后可恢复且不重复执行副作用。
+
+### 阶段 2.5：知识库服务与工单服务
+- knowledge-service：只有 `GET /internal/v1/knowledge/search`，两个 demo 租户各自写死的 QA 数据（同一问题答案不同，用来验证租户隔离），字符二元组匹配；`KnowledgeRepository` 接口留给后续数据库/向量实现。
+- ticket-service：自己的库和迁移；建单（幂等）、详情（含处理记录）、列表（游标分页）、状态流转（4 状态状态机、提单人专属动作、`version` 乐观锁、`ticket_events` 只追加）。
+- **验收标准**：knowledge-service 单测覆盖匹配、租户隔离、鉴权，容器测试确认数据文件随镜像发布；ticket-service 覆盖完整生命周期、非法流转、非提单人拒绝、版本冲突、8 路并发流转只有一个成功、分页无遗漏无重复、跨租户不可见。
 
 ### 阶段 3：AI Gateway
 - 实现 `ModelProvider` 抽象 + 通用 `OpenAICompatibleProvider` 实现（用 OpenAI SDK 即可，只需把 `base_url` 指向配置项，不要绑定 OpenAI 官方域名），暴露统一的 `generate(messages, tenant_id, system_prompt) -> stream[chunk]` 接口（支持流式）。
@@ -71,21 +79,21 @@ ai-work-order/
 ### 阶段 4：Agent Runtime
 - 用 LangGraph 实现状态图，节点：`classify_intent → retrieve_knowledge → generate_answer → check_resolution → (end | create_ticket)`。
 - `classify_intent` 判断问题是否属于 V1 支持的 3 个场景之一；不属于则直接走 `create_ticket` 分支（附带"未命中知识库场景"标记），不勉强调用模型作答。
-- 作为无状态 Worker：通过 Consumer Group 消费 Redis Streams 的 `agent_tasks` 队列（消息体含 `conversation_id`、`tenant_id`、最新用户消息、历史上下文引用）。
+- 作为无状态 Worker：通过 Consumer Group 消费 Redis Streams 的 `agent_tasks` 队列（消息体含 `conversation_id`、`tenant_id`、`user_id`、最新用户消息、历史上下文引用；`user_id` 要原样传给 Tool Gateway 作为提单人）。
 - 执行中把事件（`retrieving`、`answer_chunk`、`ticket_created`、`done`）发布到 `conversation:{conversation_id}` 的 Pub/Sub 频道。
 - 用 LangGraph checkpoint（存 Redis）保存图执行状态，支持 crash 后从断点恢复而不是从头重跑。
 - **验收标准**：向 `agent_tasks` 队列手工写入一条测试任务，Worker 能完整跑完图并在 Pub/Sub 频道观察到预期事件序列；杀掉 Worker 进程重启后，未完成的任务能续跑而不是丢失或重复产生工单。
 
 ### 阶段 5：应用服务
-> 已提前完成：app-service 自己的库与迁移、供 Tool Gateway 调用的内部接口 `POST /internal/v1/tickets`（服务令牌鉴权、幂等键去重、RLS 防跨租户）。
+> 工单数据与接口已在 ticket-service（阶段 2.5）。本阶段的员工"我的工单"和 IT 处理页面由应用服务调用 ticket-service 实现，`start`/`resolve` 的 IT 角色校验在应用服务做。
 - 实现 `POST /conversations/{id}/messages`：写入用户消息，把任务推入 `agent_tasks` 队列，立即返回 202。
 - 实现 `GET /conversations/{id}/stream`（SSE）：订阅对应 Pub/Sub 频道，把事件转发给客户端，`done`/`ticket_created` 后关闭连接。
-- 实现工单查询接口：`GET /tickets/{id}`、`GET /tickets?tenant_id=`。
+- 面向员工/IT 的工单接口：`GET /tickets/{id}`、`GET /tickets`（员工只看自己的）、状态流转，均转调 ticket-service，租户和用户取自 JWT 而不是请求参数。
 - 简单的用户/租户模型 + JWT 鉴权中间件（v1 自建账号体系，登录接口签发 JWT，`tenant_id` 编码进 token）。
 - **验收标准**：用 curl/httpie 完整跑通一次"提问 → SSE 收到检索中事件 → 收到回答 → 未解决时收到 ticket_created 事件 → 查询该工单"的闭环。
 
 ### 阶段 6：端到端联调与本地部署
-- 补齐 `deploy/k8s` 下四个服务的最小 Deployment/Service manifest（不要求 HPA/KEDA 配置齐全，占位注明"生产环境需按架构文档 5 节补充自动扩缩容配置"）。
+- 补齐 `deploy/k8s` 下各服务的最小 Deployment/Service manifest（不要求 HPA/KEDA 配置齐全，占位注明"生产环境需按架构文档 5 节补充自动扩缩容配置"）。
 - 编写一份 `README.md`，说明本地启动步骤、如何跑通 3 个测试场景、如何查看审计日志和用量记录。
 - **验收标准**：一个未接触过项目的人，跟着 README 从 0 到能在本地跑通端到端闭环。
 
