@@ -97,9 +97,11 @@ ai-work-order/
 - **验收标准**：`tests/unit` 与 `tests/integration`（真 Postgres、Redis、ticket-service）全部通过，覆盖登录失败不可区分、会话私有、并发发消息 409、结果重复投递只存一次、晚到结果覆盖失败提示、SSE 过滤与续读、补偿重投与放弃、工单可见性与角色规则；用 curl 完整跑通"登录 → 提问 → SSE 收到检索中和回答 → 反馈未解决 → 收到 ticket_created → 查询工单 → IT 处理 → 员工关闭"的闭环。
 
 ### 阶段 6：端到端联调与本地部署
-- 补齐 `deploy/k8s` 下各服务的最小 Deployment/Service manifest（不要求 HPA/KEDA 配置齐全，占位注明"生产环境需按架构文档 5 节补充自动扩缩容配置"）。
-- 编写一份 `README.md`，说明本地启动步骤、如何跑通 3 个测试场景、如何查看审计日志和用量记录。
-- **验收标准**：一个未接触过项目的人，跟着 README 从 0 到能在本地跑通端到端闭环。
+- `docker compose up -d --build` 一条命令完成建库、迁移、写入演示数据（`*-seed` 一次性服务）和启动；`.env.example` 说明所有配置项。
+- 所有服务镜像以 uid 10001 运行，运行时不写文件（可只读根文件系统）。
+- `deploy/k8s`：Kustomize。`base`（各服务 Deployment/Service、迁移 Job、ConfigMap）、`overlays/dev`（单实例 Postgres/Redis、db-init、seed、开发凭据）、`components/autoscaling`（HPA + agent-runtime 的 KEDA ScaledObject，默认不启用）、`apply-dev.sh`（按依赖顺序部署）。
+- `README.md`：本地启动、4 个演示场景（`scripts/demo.sh`，含场景外直接建单）、curl 完整闭环（含 IT 处理）、审计与用量查询、运行测试（`scripts/test-all.sh`）、排障。
+- **验收标准**：在不含 `.venv`/`.env` 的干净副本里严格按 README 操作：一条命令启动、演示脚本和 README 中的 curl 代码块原样执行跑通闭环（真实 DeepSeek）、审计与用量查询有输出、`scripts/test-all.sh` 从零建环境全部通过；K8s 清单做静态校验（本地渲染，检查 Secret/ConfigMap 引用、Service 选择器与端口、环境变量与 compose 一致），未在真实集群部署。
 
 ## 工作方式要求
 

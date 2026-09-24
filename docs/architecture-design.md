@@ -209,6 +209,7 @@
 - 有状态依赖（PostgreSQL、Redis、向量库）优先使用云无关 Operator（如 CloudNativePG、Redis Operator）或直接对接任意云厂商的托管兼容服务，业务代码只依赖标准协议（Postgres wire protocol / Redis protocol），不绑定专有 SDK。
 - 可观测性：OpenTelemetry 统一埋点（Trace 贯穿 API Gateway → 应用服务 → Agent Runtime → Tool/AI Gateway），Prometheus + Grafana 做指标，日志集中到 Loki/ELK，按 `tenant_id` 打标签便于按租户排查问题和统计用量。
 - CI/CD：镜像构建 + Helm Chart 管理各组件的多环境（dev/staging/prod）部署配置，租户级配置（如启用的工具、模型档位）通过 ConfigMap/数据库配置表管理，不重新部署即可生效。
+- V1 的清单用 Kustomize（`deploy/k8s`：base + overlays + 可选的扩缩容组件），kubectl 自带、没有模板语法；多环境发布和"迁移完成后再更新服务"的顺序以后用 Helm hook 或 Argo CD sync wave 表达。服务容器一律非 root、只读根文件系统。
 
 ## 6. 安全与合规要点
 
@@ -243,4 +244,5 @@
 - Tool Gateway：REST 策略网关；HITL 审批与 Redis 限流 V1 暂不做（见 3.4 节）。
 - 队列服务：Redis Streams（复用会话缓存的同一 Redis 实例）。对比过 RabbitMQ/RocketMQ：规模用不上、事件回传仍需 Redis，V1 不引入；Redis 可能丢消息的问题由应用服务记录任务状态并重新入队弥补（阶段 5）。
 - AI Gateway：服务令牌鉴权，只有 Agent Runtime 可调用。
+- 部署：V1 用 Kustomize 清单，dev overlay 自带单实例 Postgres/Redis；生产换 Operator 或托管服务（见第 5 节）。
 - **AI Gateway 模型接入：v1 通过 OpenAI-compatible 协议适配器接入，首个供应商为 DeepSeek；`ModelProvider` 抽象支持后续接入非 OpenAI-compatible 供应商。**
