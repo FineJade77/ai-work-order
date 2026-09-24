@@ -6,12 +6,12 @@ from app.db.session import session_factory, tenant_scope
 logger = logging.getLogger("ai_gateway.usage")
 
 
-def record_usage(
+async def record_usage(
     *, tenant_id: str, model: str, prompt_tokens: int, completion_tokens: int, duration_ms: int, status: str
 ) -> None:
     try:
         Session = session_factory()
-        with Session() as session, tenant_scope(session, tenant_id):
+        async with Session() as session, tenant_scope(session, tenant_id):
             session.add(
                 ModelCallLog(
                     tenant_id=tenant_id,
@@ -22,6 +22,6 @@ def record_usage(
                     status=status,
                 )
             )
-            session.commit()
+            await session.commit()
     except Exception:
         logger.exception("failed to write model_call_logs row tenant_id=%s model=%s", tenant_id, model)
