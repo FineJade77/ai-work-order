@@ -114,6 +114,7 @@ services:
       MODEL_BASE_URL: https://api.deepseek.com
       MODEL_NAME: deepseek-chat
       MODEL_API_KEY: ${DEEPSEEK_API_KEY}
+      AI_GATEWAY_SERVICE_TOKEN: ${AI_GATEWAY_SERVICE_TOKEN:-dev-ai-gateway-token}
     depends_on:
       ai-gateway-migrate:
         condition: service_completed_successfully

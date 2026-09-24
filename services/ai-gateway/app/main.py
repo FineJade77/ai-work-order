@@ -1,11 +1,12 @@
 import json
 from contextlib import aclosing
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.providers import provider
 from app.schemas import GenerateRequest
+from app.security import require_service_token
 from app.tenancy import parse_tenant_id
 
 app = FastAPI(title="ai-gateway")
@@ -16,7 +17,7 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/v1/generate")
+@app.post("/v1/generate", dependencies=[Depends(require_service_token)])
 async def generate(req: GenerateRequest) -> StreamingResponse:
     # Validated here (not just inside the provider) so a bad tenant_id gets a clean 400
     # instead of aborting an already-started text/event-stream response mid-flight.
