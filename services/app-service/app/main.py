@@ -3,7 +3,6 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api.internal.router import internal_router
 from app.core.config import get_settings
 
 
@@ -20,7 +19,6 @@ def create_app() -> FastAPI:
     def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
-    app.include_router(internal_router)
     return app
 
 

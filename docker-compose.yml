@@ -56,7 +56,6 @@ services:
       - "8001:8001"
     environment:
       DATABASE_URL: postgresql+psycopg://app_service_app:app_service_app_dev@postgres:5432/app_service
-      APP_SERVICE_INTERNAL_TOKEN: ${APP_SERVICE_INTERNAL_TOKEN:-dev-app-service-token}
     depends_on:
       app-service-migrate:
         condition: service_completed_successfully
