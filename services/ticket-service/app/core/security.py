@@ -6,7 +6,7 @@ from fastapi import Depends, Header, HTTPException
 from app.core.config import Settings, get_settings
 
 
-def require_service_token(
+async def require_service_token(
     settings: Annotated[Settings, Depends(get_settings)],
     authorization: Annotated[str | None, Header()] = None,
 ) -> None:

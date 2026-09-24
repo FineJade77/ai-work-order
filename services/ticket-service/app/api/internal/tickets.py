@@ -20,12 +20,12 @@ router = APIRouter(prefix="/tickets", tags=["tickets"], dependencies=[Depends(re
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
-def create_ticket(
+async def create_ticket(
     req: CreateTicketRequest,
     response: Response,
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1)],
 ) -> CreateTicketResponse:
-    ticket, created = ticket_service.create_ticket(
+    ticket, created = await ticket_service.create_ticket(
         tenant_id=req.tenant_id,
         requester_id=str(req.requester_id),
         conversation_id=str(req.conversation_id) if req.conversation_id else None,
@@ -39,8 +39,8 @@ def create_ticket(
 
 
 @router.get("/{ticket_id}")
-def get_ticket(ticket_id: uuid.UUID, tenant_id: str) -> TicketDetail:
-    ticket, events = ticket_service.get_ticket(tenant_id, str(ticket_id))
+async def get_ticket(ticket_id: uuid.UUID, tenant_id: str) -> TicketDetail:
+    ticket, events = await ticket_service.get_ticket(tenant_id, str(ticket_id))
     return TicketDetail(
         ticket=TicketView.model_validate(ticket),
         events=[TicketEventView.model_validate(e) for e in events],
@@ -48,7 +48,7 @@ def get_ticket(ticket_id: uuid.UUID, tenant_id: str) -> TicketDetail:
 
 
 @router.get("")
-def list_tickets(
+async def list_tickets(
     tenant_id: str,
     requester_id: uuid.UUID | None = None,
     assignee_id: uuid.UUID | None = None,
@@ -56,7 +56,7 @@ def list_tickets(
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
     cursor: str | None = None,
 ) -> TicketPage:
-    items, next_cursor = ticket_service.list_tickets(
+    items, next_cursor = await ticket_service.list_tickets(
         tenant_id=tenant_id,
         requester_id=str(requester_id) if requester_id else None,
         assignee_id=str(assignee_id) if assignee_id else None,
@@ -68,8 +68,8 @@ def list_tickets(
 
 
 @router.post("/{ticket_id}/transitions")
-def transition(ticket_id: uuid.UUID, req: TransitionRequest) -> TicketView:
-    ticket = ticket_service.transition(
+async def transition(ticket_id: uuid.UUID, req: TransitionRequest) -> TicketView:
+    ticket = await ticket_service.transition(
         tenant_id=req.tenant_id,
         ticket_id=str(ticket_id),
         action=req.action,

@@ -24,7 +24,7 @@ def create_app() -> FastAPI:
     app.add_exception_handler(ApiError, api_error_handler)
 
     @app.get("/healthz")
-    def healthz() -> dict[str, str]:
+    async def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
     app.include_router(internal_router)

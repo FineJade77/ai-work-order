@@ -30,11 +30,11 @@ def decode_cursor(cursor: str) -> tuple[datetime, uuid.UUID]:
         raise ApiError(400, "INVALID_CURSOR", "cursor is malformed") from exc
 
 
-def create_ticket(
+async def create_ticket(
     *, tenant_id: str, requester_id: str, conversation_id: str | None, category: str, summary: str, idempotency_key: str
 ) -> tuple[Ticket, bool]:
     require_tenant(tenant_id)
-    return repo.create_idempotent(
+    return await repo.create_idempotent(
         tenant_id=tenant_id,
         requester_id=requester_id,
         conversation_id=conversation_id,
@@ -44,15 +44,15 @@ def create_ticket(
     )
 
 
-def get_ticket(tenant_id: str, ticket_id: str) -> tuple[Ticket, list[TicketEvent]]:
+async def get_ticket(tenant_id: str, ticket_id: str) -> tuple[Ticket, list[TicketEvent]]:
     require_tenant(tenant_id)
-    ticket = repo.get(tenant_id, ticket_id)
+    ticket = await repo.get(tenant_id, ticket_id)
     if ticket is None:  # also the answer for another tenant's ticket: RLS hides it
         raise ApiError(404, "TICKET_NOT_FOUND", "ticket not found")
-    return ticket, repo.events(tenant_id, ticket_id)
+    return ticket, await repo.events(tenant_id, ticket_id)
 
 
-def list_tickets(
+async def list_tickets(
     *,
     tenant_id: str,
     requester_id: str | None,
@@ -63,7 +63,7 @@ def list_tickets(
 ) -> tuple[list[Ticket], str | None]:
     require_tenant(tenant_id)
     # Fetch one extra row to learn whether another page exists without a COUNT query.
-    rows = repo.list_page(
+    rows = await repo.list_page(
         tenant_id=tenant_id,
         requester_id=requester_id,
         assignee_id=assignee_id,
@@ -76,7 +76,7 @@ def list_tickets(
     return page, next_cursor
 
 
-def transition(
+async def transition(
     *,
     tenant_id: str,
     ticket_id: str,
@@ -87,7 +87,7 @@ def transition(
     note: str | None,
 ) -> Ticket:
     require_tenant(tenant_id)
-    ticket = repo.get(tenant_id, ticket_id)
+    ticket = await repo.get(tenant_id, ticket_id)
     if ticket is None:
         raise ApiError(404, "TICKET_NOT_FOUND", "ticket not found")
     if ticket.version != expected_version:
@@ -106,7 +106,7 @@ def transition(
     except state_machine.TransitionError as exc:
         raise ApiError(exc.http_status, exc.code, exc.message) from exc
 
-    updated = repo.apply_transition(
+    updated = await repo.apply_transition(
         tenant_id=tenant_id,
         ticket_id=ticket_id,
         expected_version=expected_version,
