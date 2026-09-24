@@ -82,13 +82,13 @@ def request_hash(
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
-def list_tools(tenant_id: str, agent_role: str) -> list[dict[str, Any]]:
+async def list_tools(tenant_id: str, agent_role: str) -> list[dict[str, Any]]:
     require_tenant(tenant_id)
-    allowed = bindings.bound_tool_names(tenant_id, agent_role) & REGISTRY.keys()
+    allowed = await bindings.bound_tool_names(tenant_id, agent_role) & REGISTRY.keys()
     return [REGISTRY[name].to_openai_tool() for name in sorted(allowed)]
 
 
-def call_tool(
+async def call_tool(
     *,
     tenant_id: str,
     session_id: str,
@@ -107,7 +107,7 @@ def call_tool(
     start = time.monotonic()
     audit_status, error_code, call_id = "error", "INTERNAL", None
     try:
-        outcome = _call_tool(
+        outcome = await _call_tool(
             tenant_id=tenant_id,
             session_id=session_id,
             user_id=user_id,
@@ -122,7 +122,7 @@ def call_tool(
         audit_status, error_code = "rejected", exc.code
         raise
     finally:
-        audit.write(
+        await audit.write(
             tenant_id=tenant_id,
             session_id=session_id,
             user_id=user_id,
@@ -136,7 +136,7 @@ def call_tool(
         )
 
 
-def _call_tool(
+async def _call_tool(
     *,
     tenant_id: str,
     session_id: str,
@@ -152,7 +152,7 @@ def _call_tool(
     if spec is None:
         return _error("UNKNOWN_TOOL", f"unknown tool: {tool_name}")
 
-    if tool_name not in bindings.bound_tool_names(tenant_id, agent_role):
+    if tool_name not in await bindings.bound_tool_names(tenant_id, agent_role):
         return _error("TOOL_NOT_ALLOWED", f"role {agent_role!r} is not allowed to call {tool_name}")
 
     violation = validate_arguments(tool_name, arguments)
@@ -170,7 +170,7 @@ def _call_tool(
     # Read-only tools have nothing to deduplicate; skip the two extra transactions.
     if not spec.side_effect:
         try:
-            return CallOutcome(status="success", result=_invoke(spec, ctx, arguments))
+            return CallOutcome(status="success", result=await _invoke(spec, ctx, arguments))
         except ToolError as exc:
             return _error(exc.code, exc.message)
 
@@ -180,11 +180,11 @@ def _call_tool(
         )
 
     fingerprint = request_hash(session_id, user_id, agent_role, tool_name, arguments)
-    existing = tool_calls.find_by_idempotency_key(tenant_id, idempotency_key)
+    existing = await tool_calls.find_by_idempotency_key(tenant_id, idempotency_key)
     if existing is not None:
-        return _resume(existing, fingerprint, spec, ctx)
+        return await _resume(existing, fingerprint, spec, ctx)
 
-    call_id = tool_calls.claim(
+    call_id = await tool_calls.claim(
         tenant_id=tenant_id,
         session_id=session_id,
         user_id=user_id,
@@ -196,11 +196,12 @@ def _call_tool(
     )
     if call_id is None:
         # A concurrent request with the same key won the insert; answer from its record.
-        return _resume(tool_calls.find_by_idempotency_key(tenant_id, idempotency_key), fingerprint, spec, ctx)
-    return _execute_recorded(call_id, spec, ctx, arguments)
+        winner = await tool_calls.find_by_idempotency_key(tenant_id, idempotency_key)
+        return await _resume(winner, fingerprint, spec, ctx)
+    return await _execute_recorded(call_id, spec, ctx, arguments)
 
 
-def _resume(existing: tool_calls.CallRecord, fingerprint: str, spec: ToolSpec, ctx: ToolContext) -> CallOutcome:
+async def _resume(existing: tool_calls.CallRecord, fingerprint: str, spec: ToolSpec, ctx: ToolContext) -> CallOutcome:
     if existing.request_hash != fingerprint:
         raise CallerError(409, "IDEMPOTENCY_CONFLICT", "Idempotency-Key was already used for a different request")
     if existing.status == "success":
@@ -208,26 +209,26 @@ def _resume(existing: tool_calls.CallRecord, fingerprint: str, spec: ToolSpec, c
 
     # 'error' is retryable; 'running' may be orphaned by a crashed replica. reclaim() lets
     # exactly one retrier through, and only once a 'running' row has gone stale.
-    if tool_calls.reclaim(ctx.tenant_id, existing.id):
-        return _execute_recorded(existing.id, spec, ctx, existing.arguments)
+    if await tool_calls.reclaim(ctx.tenant_id, existing.id):
+        return await _execute_recorded(existing.id, spec, ctx, existing.arguments)
     raise CallerError(409, "IN_PROGRESS", "a call with this Idempotency-Key is still executing; retry later")
 
 
-def _execute_recorded(call_id: str, spec: ToolSpec, ctx: ToolContext, arguments: dict[str, Any]) -> CallOutcome:
+async def _execute_recorded(call_id: str, spec: ToolSpec, ctx: ToolContext, arguments: dict[str, Any]) -> CallOutcome:
     try:
-        result = _invoke(spec, ctx, arguments)
+        result = await _invoke(spec, ctx, arguments)
     except ToolError as exc:
-        tool_calls.fail(ctx.tenant_id, call_id, exc.code, exc.message)
+        await tool_calls.fail(ctx.tenant_id, call_id, exc.code, exc.message)
         return _error(exc.code, exc.message, call_id=call_id)
-    tool_calls.complete(ctx.tenant_id, call_id, result)
+    await tool_calls.complete(ctx.tenant_id, call_id, result)
     return CallOutcome(status="success", call_id=call_id, result=result)
 
 
-def _invoke(spec: ToolSpec, ctx: ToolContext, arguments: dict[str, Any]) -> Any:
+async def _invoke(spec: ToolSpec, ctx: ToolContext, arguments: dict[str, Any]) -> Any:
     """Runs the handler. Internal failures surface only as a generic TOOL_ERROR, so SQL,
     stack traces and hostnames never reach the model or the caller."""
     try:
-        raw = spec.handler(ctx, arguments)
+        raw = await spec.handler(ctx, arguments)
     except ToolError:
         raise
     except Exception as exc:

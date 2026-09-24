@@ -12,7 +12,7 @@ TICKET_CATEGORIES = ["vpn", "account", "email", "other"]
 
 class TicketProvider(ABC):
     @abstractmethod
-    def create(
+    async def create(
         self, *, tenant_id: str, requester_id: str, summary: str, category: str, conversation_ref: str,
         idempotency_key: str,
     ) -> str: ...
@@ -27,15 +27,15 @@ class InternalTicketProvider(TicketProvider):
     """
 
     def __init__(self, base_url: str, token: str):
-        self._client = httpx.Client(
+        self._client = httpx.AsyncClient(
             base_url=base_url, headers={"Authorization": f"Bearer {token}"}, timeout=5.0
         )
 
-    def create(
+    async def create(
         self, *, tenant_id: str, requester_id: str, summary: str, category: str, conversation_ref: str,
         idempotency_key: str,
     ) -> str:
-        resp = self._client.post(
+        resp = await self._client.post(
             "/internal/v1/tickets",
             json={
                 "tenant_id": tenant_id,
@@ -56,8 +56,8 @@ def get_ticket_provider() -> TicketProvider:
     return InternalTicketProvider(settings.ticket_service_url, settings.ticket_service_token)
 
 
-def _handle(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
-    ticket_id = get_ticket_provider().create(
+async def _handle(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
+    ticket_id = await get_ticket_provider().create(
         tenant_id=ctx.tenant_id,
         requester_id=ctx.user_id,
         summary=args["summary"],

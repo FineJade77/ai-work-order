@@ -10,17 +10,17 @@ RESULT_LIMIT = 5
 
 
 @lru_cache
-def _client() -> httpx.Client:
+def _client() -> httpx.AsyncClient:
     settings = get_settings()
-    return httpx.Client(
+    return httpx.AsyncClient(
         base_url=settings.knowledge_service_url,
         headers={"Authorization": f"Bearer {settings.knowledge_service_token}"},
         timeout=5.0,
     )
 
 
-def _handle(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
-    resp = _client().get(
+async def _handle(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
+    resp = await _client().get(
         "/internal/v1/knowledge/search",
         params={"tenant_id": ctx.tenant_id, "q": args["query"], "limit": RESULT_LIMIT},
     )

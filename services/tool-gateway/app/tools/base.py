@@ -1,4 +1,4 @@
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,7 +28,7 @@ class ToolSpec:
     name: str
     description: str
     parameters: dict[str, Any]
-    handler: Callable[[ToolContext, dict[str, Any]], Any]
+    handler: Callable[[ToolContext, dict[str, Any]], Awaitable[Any]]
     # Side-effecting tools must be called with an Idempotency-Key and are recorded in tool_calls.
     side_effect: bool
 

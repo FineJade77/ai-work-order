@@ -12,7 +12,7 @@ logger = logging.getLogger("tool_gateway.audit")
 PARAMS_SUMMARY_MAX_CHARS = 2000
 
 
-def write(
+async def write(
     *,
     tenant_id: str,
     session_id: str,
@@ -30,7 +30,7 @@ def write(
     params_summary = json.dumps(redact_for_audit(arguments), ensure_ascii=False)[:PARAMS_SUMMARY_MAX_CHARS]
     try:
         Session = session_factory()
-        with Session() as session, tenant_scope(session, tenant_id):
+        async with Session() as session, tenant_scope(session, tenant_id):
             session.add(
                 ToolCallLog(
                     tenant_id=tenant_id,
@@ -45,7 +45,7 @@ def write(
                     duration_ms=duration_ms,
                 )
             )
-            session.commit()
+            await session.commit()
     except Exception:
         logger.exception("failed to write tool_call_logs row tool=%s tenant_id=%s", tool_name, tenant_id)
 

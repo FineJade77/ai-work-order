@@ -11,16 +11,16 @@ router = APIRouter(prefix="/tools", tags=["tools"], dependencies=[Depends(requir
 
 
 @router.get("/list")
-def list_tools(tenant_id: str, agent_role: str) -> ToolListResponse:
-    return ToolListResponse(tools=tool_call_service.list_tools(tenant_id, agent_role))
+async def list_tools(tenant_id: str, agent_role: str) -> ToolListResponse:
+    return ToolListResponse(tools=await tool_call_service.list_tools(tenant_id, agent_role))
 
 
 @router.post("/call")
-def call_tool(
+async def call_tool(
     req: ToolCallRequest,
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> ToolCallResponse:
-    outcome = tool_call_service.call_tool(
+    outcome = await tool_call_service.call_tool(
         tenant_id=req.tenant_id,
         session_id=req.session_id,
         user_id=req.user_id,
