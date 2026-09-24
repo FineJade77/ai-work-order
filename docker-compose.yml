@@ -115,5 +115,25 @@ services:
       ai-gateway-migrate:
         condition: service_completed_successfully
 
+  ticket-service-migrate:
+    build: ./services/ticket-service
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      MIGRATION_DATABASE_URL: postgresql+psycopg://ticket_service_owner:ticket_service_owner_dev@postgres:5432/ticket_service
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+
+  ticket-service:
+    build: ./services/ticket-service
+    ports:
+      - "8006:8006"
+    environment:
+      DATABASE_URL: postgresql+psycopg://ticket_service_app:ticket_service_app_dev@postgres:5432/ticket_service
+      TICKET_SERVICE_TOKEN: ${TICKET_SERVICE_TOKEN:-dev-ticket-service-token}
+    depends_on:
+      ticket-service-migrate:
+        condition: service_completed_successfully
+
 volumes:
   postgres-data:
