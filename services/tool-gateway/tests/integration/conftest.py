@@ -21,12 +21,17 @@ from tests.integration.env import (
 TOOLS = ("search_knowledge", "create_ticket")
 
 
-@pytest.fixture(scope="session")
-def gateway():
+@pytest.fixture(scope="session", autouse=True)
+def gateway_reachable():
+    """Autouse, so tests that open their own clients instead of using `gateway` are skipped too."""
     try:
         httpx.get(f"{GATEWAY_URL}/healthz", timeout=2).raise_for_status()
     except httpx.HTTPError as exc:
         pytest.skip(f"tool-gateway not reachable at {GATEWAY_URL}: {exc}")
+
+
+@pytest.fixture(scope="session")
+def gateway():
     with httpx.Client(base_url=GATEWAY_URL, headers={"Authorization": f"Bearer {SERVICE_TOKEN}"}, timeout=10) as c:
         yield c
 
