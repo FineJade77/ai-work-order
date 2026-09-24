@@ -67,7 +67,7 @@ def test_retry_replays_and_reused_key_with_new_payload_conflicts(call):
     assert conflict.status_code == 409 and conflict.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
 
 
-def test_concurrent_requests_with_one_key_create_one_ticket(call, db, tenant):
+def test_concurrent_requests_with_one_key_create_one_ticket(call, app_db, tenant):
     key = str(uuid.uuid4())
 
     def attempt(_):
@@ -81,22 +81,23 @@ def test_concurrent_requests_with_one_key_create_one_ticket(call, db, tenant):
     ticket_ids = {r.json()["result"]["ticket_id"] for r in responses if r.status_code == 200}
     assert len(ticket_ids) == 1
     assert all(r.status_code == 200 or r.json()["error"]["code"] == "IN_PROGRESS" for r in responses)
-    rows = db.execute("SELECT count(*) FROM tickets WHERE idempotency_key = %s", (key,)).fetchone()[0]
+    rows = app_db.execute("SELECT count(*) FROM tickets WHERE idempotency_key = %s", (key,)).fetchone()[0]
     assert rows == 1
 
 
-def test_orphaned_running_call_recovers_without_duplicate_ticket(call, db):
+def test_orphaned_running_call_recovers_without_duplicate_ticket(call, db, app_db):
     key = str(uuid.uuid4())
     first = call("create_ticket", TICKET_ARGS, key=key).json()
 
-    # Simulate a replica that crashed after executing but before recording success.
+    # Simulate a replica that crashed after app-service created the ticket but before the
+    # gateway recorded success. The retry re-sends the same key to app-service.
     db.execute("UPDATE tool_calls SET status = 'running' WHERE idempotency_key = %s", (key,))
     assert call("create_ticket", TICKET_ARGS, key=key).json()["error"]["code"] == "IN_PROGRESS"
 
     db.execute("UPDATE tool_calls SET updated_at = now() - interval '2 minutes' WHERE idempotency_key = %s", (key,))
     recovered = call("create_ticket", TICKET_ARGS, key=key).json()
     assert recovered["status"] == "success" and recovered["result"] == first["result"]
-    assert db.execute("SELECT count(*) FROM tickets WHERE idempotency_key = %s", (key,)).fetchone()[0] == 1
+    assert app_db.execute("SELECT count(*) FROM tickets WHERE idempotency_key = %s", (key,)).fetchone()[0] == 1
 
 
 def test_audit_masks_pii_in_arguments(call, db, tenant):

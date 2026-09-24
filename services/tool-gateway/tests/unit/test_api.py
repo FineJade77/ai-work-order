@@ -13,7 +13,12 @@ AUTH = {"Authorization": f"Bearer {TOKEN}"}
 @pytest.fixture
 def client():
     app = create_app()
-    app.dependency_overrides[get_settings] = lambda: Settings(tool_gateway_service_token=TOKEN)
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        tool_gateway_service_token=TOKEN,
+        database_url="postgresql+psycopg://unused",
+        app_service_url="http://unused",
+        app_service_token="unused",
+    )
     return TestClient(app)
 
 

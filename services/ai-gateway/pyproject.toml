@@ -8,6 +8,7 @@ dependencies = [
     "openai>=1.30,<2",
     "sqlalchemy>=2.0",
     "psycopg[binary]>=3.1",
+    "alembic>=1.13",
 ]
 
 [tool.hatch.build.targets.wheel]

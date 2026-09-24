@@ -1,9 +1,9 @@
 from typing import Any
 
-from shared.db.models import KnowledgeItem
-from shared.db.session import app_session_factory, tenant_scope
 from sqlalchemy import func, or_
 
+from app.db.models import KnowledgeItem
+from app.db.session import session_factory, tenant_scope
 from app.tools.base import ToolContext, ToolSpec
 
 RESULT_LIMIT = 5
@@ -11,7 +11,7 @@ RESULT_LIMIT = 5
 
 def search_knowledge(query: str, tenant_id: str) -> list[dict[str, Any]]:
     """v1 search: ILIKE substring match, ranked by pg_trgm similarity. No vectorization yet."""
-    Session = app_session_factory()
+    Session = session_factory()
     with Session() as session, tenant_scope(session, tenant_id):
         pattern = f"%{query}%"
         score = func.greatest(

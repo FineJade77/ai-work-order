@@ -1,5 +1,5 @@
-"""Integration tests against a running stack: `docker compose up -d postgres tool-gateway`
-plus migrations applied. Skipped automatically when the gateway isn't reachable."""
+"""Integration tests against a running stack (`docker compose up -d tool-gateway`, which
+also starts app-service). Skipped automatically when the gateway isn't reachable."""
 
 import uuid
 from types import SimpleNamespace
@@ -8,7 +8,16 @@ import httpx
 import psycopg
 import pytest
 
-from tests.integration.env import ADMIN_DB_URL, GATEWAY_URL, ONCALL_ANSWER, ROLE, SERVICE_TOKEN
+from tests.integration.env import (
+    APP_SERVICE_ADMIN_DB_URL,
+    GATEWAY_ADMIN_DB_URL,
+    GATEWAY_URL,
+    ONCALL_ANSWER,
+    ROLE,
+    SERVICE_TOKEN,
+)
+
+GATEWAY_TABLES = ("knowledge_items", "role_tool_bindings", "tool_calls", "tool_call_logs")
 
 
 @pytest.fixture(scope="session")
@@ -24,24 +33,33 @@ def gateway():
 
 @pytest.fixture(scope="session")
 def db():
-    # Superuser connection: bypasses RLS, used only for fixtures and assertions.
-    with psycopg.connect(ADMIN_DB_URL, autocommit=True) as conn:
+    """tool-gateway's own database."""
+    with psycopg.connect(GATEWAY_ADMIN_DB_URL, autocommit=True) as conn:
         yield conn
 
 
 @pytest.fixture(scope="session")
-def tenant(db):
+def app_db():
+    """app-service's database, where create_ticket's tickets end up."""
+    with psycopg.connect(APP_SERVICE_ADMIN_DB_URL, autocommit=True) as conn:
+        yield conn
+
+
+@pytest.fixture(scope="session")
+def tenant(db, app_db):
+    """One isolated tenant per run, spread across both databases, removed afterwards."""
     tenant_id = str(uuid.uuid4())
-    db.execute("INSERT INTO tenants (id, name) VALUES (%s, %s)", (tenant_id, f"it-{tenant_id[:8]}"))
-    user_id = db.execute(
+    app_db.execute("INSERT INTO tenants (id, name) VALUES (%s, %s)", (tenant_id, f"it-{tenant_id[:8]}"))
+    user_id = app_db.execute(
         "INSERT INTO users (tenant_id, name, email) VALUES (%s, 'Test', 'test@example.com') RETURNING id",
         (tenant_id,),
     ).fetchone()[0]
     session_id = str(
-        db.execute(
+        app_db.execute(
             "INSERT INTO conversations (tenant_id, user_id) VALUES (%s, %s) RETURNING id", (tenant_id, user_id)
         ).fetchone()[0]
     )
+
     for tool in ("search_knowledge", "create_ticket"):
         db.execute(
             "INSERT INTO role_tool_bindings (tenant_id, agent_role, tool_name) VALUES (%s, %s, %s)",
@@ -51,8 +69,12 @@ def tenant(db):
         "INSERT INTO knowledge_items (tenant_id, question, answer) VALUES (%s, %s, %s), (%s, %s, %s)",
         (tenant_id, "VPN 连不上怎么办？", "请重启 VPN 客户端后重试。", tenant_id, "夜间 IT 值班联系方式", ONCALL_ANSWER),
     )
+
     yield SimpleNamespace(id=tenant_id, session_id=session_id)
-    db.execute("DELETE FROM tenants WHERE id = %s", (tenant_id,))  # cascades to every row created by the tests
+
+    for table in GATEWAY_TABLES:
+        db.execute(f"DELETE FROM {table} WHERE tenant_id = %s", (tenant_id,))
+    app_db.execute("DELETE FROM tenants WHERE id = %s", (tenant_id,))  # cascades within app-service
 
 
 @pytest.fixture

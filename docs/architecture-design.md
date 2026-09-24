@@ -121,7 +121,8 @@
 - 错误分两类：**模型可处理的**（未知工具、无权限、参数不合法、执行失败）走 200 信封回给模型；**调用方违约的**（非法 tenant、缺幂等键、幂等键冲突、并发执行中）走 HTTP 4xx，只给 Agent Runtime 看。
 - 调用管线：租户校验 → 工具存在 → 角色绑定 → JSON Schema → 只读工具直接执行；副作用工具走幂等重放 / 原子占位 → 执行 → 记录结果 → 审计。
 - 上下文注入：`session_id`（即会话 ID）和幂等键由网关注入给 handler，不出现在给模型看的参数 schema 里，模型没法伪造或写错。
-- 幂等分两层：网关 `tool_calls` 表覆盖普通重试；执行完成但结果未落盘就崩溃的窗口，靠卡住的 `running` 记录超时后可被重新占位、再执行，因此有副作用的 handler 自身也必须幂等（`create_ticket` 把同一个键传到工单表）。只读工具不写 `tool_calls`。
+- 幂等分两层：网关 `tool_calls` 表覆盖普通重试；执行完成但结果未落盘就崩溃的窗口，靠卡住的 `running` 记录超时后可被重新占位、再执行，因此下游也必须幂等（`create_ticket` 把同一个键透传给 app-service 的内部建单接口）。只读工具不写 `tool_calls`。
+- 下游：`search_knowledge` 查 Tool Gateway 自己库里的 `knowledge_items`（v1），后续换成调用独立知识库服务；`create_ticket` 调 app-service 内部接口，`TicketProvider` 的内部实现和未来的 Jira 实现都是"调用工单系统的 HTTP 接口"，形态一致。
 - 脱敏：返回体只屏蔽 password/token 等凭据字段（知识库内容里的 IT 值班电话是员工需要的）；审计记录额外对手机号/邮箱/身份证做正则脱敏。
 - 核心工具（v1）：`search_knowledge(query)`、`create_ticket(summary, category)`。
 - **V1 暂不做、已有设计可恢复**（实现见提交 `f36530d`）：
@@ -136,16 +137,22 @@
   - 后续如需接入 Anthropic Claude 等非 OpenAI-compatible 供应商，在 `ModelProvider` 抽象下新增一个专用实现（如 `AnthropicProvider`）即可，路由层按租户/模型名分发，不影响已接入的 OpenAI-compatible 供应商。
 - 记录每次调用的 `tenant_id + 模型 + token 数 + 耗时`，为后续按租户计费/限额做准备。
 
-## 4. 数据模型（核心表，简化版）
+## 4. 数据模型与数据归属
 
-- `tenants(id, name, plan, created_at)`
-- `users(id, tenant_id, name, email, role)`
-- `conversations(id, tenant_id, user_id, status, created_at)`
-- `messages(id, conversation_id, role, content, created_at)`
-- `tickets(id, tenant_id, conversation_id, category, summary, status, assignee, created_at, updated_at)`
-- `knowledge_items(id, tenant_id, question, answer, tags, source, updated_at)`（v1 简单 QA 表；v2 增加 `embedding` 字段或迁移到独立向量库）
+**每个服务一个数据库，同一个 Postgres 实例**（本地一个容器，云上初期一个托管实例；单个服务要独立扩容时只改它的 `DATABASE_URL`）。服务之间不共享表、不共享模型代码，只通过 API 交互：
 
-多租户隔离方案【假设，可调整，推荐】：**共享库 + `tenant_id` 行级隔离**，配合 PostgreSQL Row-Level Security（RLS）策略强制每次查询带租户过滤，成本低、运维简单；预留向"独立 schema"迁移的路径供大客户合规诉求使用。
+| 数据库 | 归属服务 | 表 |
+|---|---|---|
+| `app_service` | 应用服务 | `tenants`、`users`、`conversations`、`messages`、`tickets`（含幂等键局部唯一索引） |
+| `tool_gateway` | Tool Gateway | `knowledge_items`（v1 知识库，后续由独立知识库服务替代）、`role_tool_bindings`、`tool_calls`、`tool_call_logs` |
+| `ai_gateway` | AI Gateway | `model_call_logs` |
+
+- 每个服务有两个数据库账号：`<svc>_owner`（建表、迁移、种子数据）和 `<svc>_app`（运行时账号，不是表的所有者，RLS 对它强制生效），且只能连自己的库。本地由 `deploy/postgres/init-databases.sql` 创建，云上由基础设施创建、密码来自密钥管理。
+- 每个服务自带 Alembic 迁移，部署时以独立任务先跑迁移再起服务（compose 用 `<svc>-migrate` 服务，K8s 用 Job/initContainer）。
+- 不做跨库外键：非 app-service 的 `tenant_id` 是普通 UUID 列，租户合法性由 API Gateway 校验 JWT 保证。
+- 多租户隔离：库内仍然用 `tenant_id` + PostgreSQL RLS，每次查询都在租户作用域内执行。
+- 跨服务写数据走 API：Tool Gateway 的 `create_ticket` 调 app-service 的内部接口 `POST /internal/v1/tickets`（透传幂等键），不直接写工单表。
+- 代价：跨服务报表（比如把工具调用和工单关联起来）不能再直接写 SQL join，需要时再做数据同步。
 
 ## 5. 部署与云原生方案
 
@@ -174,8 +181,7 @@
 ## 8. 需求方需二次确认的假设清单
 
 1. 入口渠道：默认先做 Web，IM 机器人作为二期扩展点。
-2. 多租户隔离级别：默认"共享库 + tenant_id 行级隔离"。
-3. 身份认证：默认 v1 自建 JWT 账号体系，预留 OIDC 接入点。
+2. 身份认证：默认 v1 自建 JWT 账号体系，预留 OIDC 接入点。
 
 以上假设如与实际需求不符，请指出对应条目，架构将做相应调整。
 
@@ -184,6 +190,8 @@
 - 部署：云无关，基于标准 Kubernetes。
 - Agent Runtime：LangGraph，异步 Worker + Redis Streams 队列 + Pub/Sub 流式回传（见 3.3 节）。
 - 工单系统：自建工单模块，`TicketProvider` 抽象预留外部系统扩展点。
-- 知识库：v1 简单 QA 表，v2 平滑升级为向量检索。
+- 知识库：v1 是 Tool Gateway 库内的简单 QA 表，后续替换为独立知识库服务（向量检索）。
+- 数据：同一 Postgres 实例、每服务独立 database，库内 `tenant_id` + RLS 隔离；服务间不共享表和模型代码，没有 `libs/shared`（见第 4 节）。
+- Tool Gateway：REST 策略网关；HITL 审批与 Redis 限流 V1 暂不做（见 3.4 节）。
 - 队列服务：Redis Streams（复用会话缓存的同一 Redis 实例）。
 - **AI Gateway 模型接入：v1 通过 OpenAI-compatible 协议适配器接入，首个供应商为 DeepSeek；`ModelProvider` 抽象支持后续接入非 OpenAI-compatible 供应商。**

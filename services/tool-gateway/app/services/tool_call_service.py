@@ -5,10 +5,9 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from shared.tenancy import parse_tenant_id
-
 from app.core.errors import CallerError
 from app.core.redaction import mask_secret_fields
+from app.core.tenancy import parse_tenant_id
 from app.repositories import audit, bindings, tool_calls
 from app.tools.base import ToolContext, ToolError, ToolSpec
 from app.tools.registry import REGISTRY, validate_arguments

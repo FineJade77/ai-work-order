@@ -9,10 +9,11 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
-from shared.db.models import ToolCall
-from shared.db.session import app_session_factory, tenant_scope
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+from app.db.models import ToolCall
+from app.db.session import session_factory, tenant_scope
 
 # A 'running' row older than this is presumed orphaned by a crashed gateway replica and
 # may be reclaimed by a retry. Must exceed the slowest tool's expected execution time.
@@ -45,7 +46,7 @@ def _record(call: ToolCall) -> CallRecord:
 
 
 def find_by_idempotency_key(tenant_id: str, idempotency_key: str) -> CallRecord | None:
-    Session = app_session_factory()
+    Session = session_factory()
     with Session() as session, tenant_scope(session, tenant_id):
         call = session.execute(
             select(ToolCall).where(ToolCall.idempotency_key == idempotency_key)
@@ -64,7 +65,7 @@ def claim(
     idempotency_key: str,
 ) -> str | None:
     """Records a new 'running' call. Returns its id, or None if another request already holds the key."""
-    Session = app_session_factory()
+    Session = session_factory()
     with Session() as session, tenant_scope(session, tenant_id):
         call_id = session.execute(
             pg_insert(ToolCall)
@@ -90,7 +91,7 @@ def claim(
 
 def reclaim(tenant_id: str, call_id: str) -> bool:
     """Moves a failed or orphaned call back to 'running'. Only one concurrent retrier can win."""
-    Session = app_session_factory()
+    Session = session_factory()
     with Session() as session, tenant_scope(session, tenant_id):
         claimed = session.execute(
             update(ToolCall)
@@ -117,7 +118,7 @@ def fail(tenant_id: str, call_id: str, code: str, message: str) -> None:
 
 
 def _update(tenant_id: str, call_id: str, **values: Any) -> None:
-    Session = app_session_factory()
+    Session = session_factory()
     with Session() as session, tenant_scope(session, tenant_id):
         session.execute(update(ToolCall).where(ToolCall.id == call_id).values(updated_at=func.now(), **values))
         session.commit()

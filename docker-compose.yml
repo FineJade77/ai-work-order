@@ -1,3 +1,7 @@
+# One Postgres instance, one database per service (deploy/postgres/init-databases.sql).
+# Startup order: postgres -> db-init -> <service>-migrate -> <service>.
+# The work_order superuser is for db-init and test fixtures only; services never use it.
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -25,64 +29,90 @@ services:
       timeout: 5s
       retries: 10
 
+  db-init:
+    image: postgres:16-alpine
+    environment:
+      PGPASSWORD: work_order
+    volumes:
+      - ./deploy/postgres/init-databases.sql:/init-databases.sql:ro
+    command: ["psql", "-h", "postgres", "-U", "work_order", "-d", "work_order", "-v", "ON_ERROR_STOP=1", "-f", "/init-databases.sql"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  app-service-migrate:
+    build: ./services/app-service
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      MIGRATION_DATABASE_URL: postgresql+psycopg://app_service_owner:app_service_owner_dev@postgres:5432/app_service
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+
   app-service:
     build: ./services/app-service
     ports:
       - "8001:8001"
+    environment:
+      DATABASE_URL: postgresql+psycopg://app_service_app:app_service_app_dev@postgres:5432/app_service
+      APP_SERVICE_INTERNAL_TOKEN: ${APP_SERVICE_INTERNAL_TOKEN:-dev-app-service-token}
     depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      app-service-migrate:
+        condition: service_completed_successfully
 
   agent-runtime:
     build: ./services/agent-runtime
     ports:
       - "8002:8002"
     depends_on:
-      postgres:
-        condition: service_healthy
       redis:
         condition: service_healthy
 
+  tool-gateway-migrate:
+    build: ./services/tool-gateway
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      MIGRATION_DATABASE_URL: postgresql+psycopg://tool_gateway_owner:tool_gateway_owner_dev@postgres:5432/tool_gateway
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+
   tool-gateway:
-    build:
-      context: .
-      dockerfile: services/tool-gateway/Dockerfile
+    build: ./services/tool-gateway
     ports:
       - "8003:8003"
     environment:
-      APP_DATABASE_URL: postgresql+psycopg://app_runtime:app_runtime_dev_password@postgres:5432/work_order
+      DATABASE_URL: postgresql+psycopg://tool_gateway_app:tool_gateway_app_dev@postgres:5432/tool_gateway
       TOOL_GATEWAY_SERVICE_TOKEN: ${TOOL_GATEWAY_SERVICE_TOKEN:-dev-tool-gateway-token}
+      APP_SERVICE_URL: http://app-service:8001
+      APP_SERVICE_TOKEN: ${APP_SERVICE_INTERNAL_TOKEN:-dev-app-service-token}
     depends_on:
-      postgres:
-        condition: service_healthy
+      tool-gateway-migrate:
+        condition: service_completed_successfully
+      app-service:
+        condition: service_started
+
+  ai-gateway-migrate:
+    build: ./services/ai-gateway
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      MIGRATION_DATABASE_URL: postgresql+psycopg://ai_gateway_owner:ai_gateway_owner_dev@postgres:5432/ai_gateway
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
 
   ai-gateway:
-    build:
-      context: .
-      dockerfile: services/ai-gateway/Dockerfile
+    build: ./services/ai-gateway
     ports:
       - "8004:8004"
     environment:
-      APP_DATABASE_URL: postgresql+psycopg://app_runtime:app_runtime_dev_password@postgres:5432/work_order
+      DATABASE_URL: postgresql+psycopg://ai_gateway_app:ai_gateway_app_dev@postgres:5432/ai_gateway
       MODEL_BASE_URL: https://api.deepseek.com
       MODEL_NAME: deepseek-chat
       MODEL_API_KEY: ${DEEPSEEK_API_KEY}
     depends_on:
-      postgres:
-        condition: service_healthy
-
-  migrate:
-    build: ./libs/shared
-    environment:
-      DATABASE_URL: postgresql+psycopg://work_order:work_order@postgres:5432/work_order
-      APP_DATABASE_URL: postgresql+psycopg://app_runtime:app_runtime_dev_password@postgres:5432/work_order
-      APP_DB_PASSWORD: app_runtime_dev_password
-    depends_on:
-      postgres:
-        condition: service_healthy
-    profiles: ["tools"]
+      ai-gateway-migrate:
+        condition: service_completed_successfully
 
 volumes:
   postgres-data:

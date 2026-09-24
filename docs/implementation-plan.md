@@ -14,7 +14,7 @@
 - 应用服务框架：FastAPI。
 - Agent 编排：LangGraph。
 - 队列 + 流式回传：Redis Streams（任务队列）+ Redis Pub/Sub（执行中事件回传），复用同一个 Redis 实例。
-- 数据库：PostgreSQL，共享库 + `tenant_id` 行级隔离（RLS）。
+- 数据库：PostgreSQL，同一实例、每服务独立 database，库内 `tenant_id` 行级隔离（RLS）。
 - 工具协议：Tool Gateway 对 Agent Runtime 暴露 REST 接口（`/v1/tools/list` 返回 OpenAI function 元数据，`/v1/tools/call` 执行），详见架构文档 3.4 节。
 - 模型供应商：AI Gateway v1 通过 OpenAI-compatible 协议接入，具体供应商为 **DeepSeek**（`base_url=https://api.deepseek.com`），用 `ModelProvider` 抽象 + 通用 `OpenAICompatibleProvider` 实现，不要为 DeepSeek 单独写一套适配代码。
 - 容器化：每个服务独立 Dockerfile，提供 `docker-compose.yml` 用于本地一键起环境（Postgres、Redis、四个服务）。
@@ -26,17 +26,16 @@ ai-work-order/
 ├── docs/
 ├── docker-compose.yml
 ├── services/
-│   ├── app-service/         # FastAPI，会话/工单/租户/用户
+│   ├── app-service/         # FastAPI，会话/工单/租户/用户；库 app_service
 │   ├── agent-runtime/        # LangGraph worker，消费 Redis Streams
-│   ├── tool-gateway/         # 工具策略网关：权限/校验/幂等/限流/审批/审计/脱敏
-│   └── ai-gateway/           # 模型调用统一出口
-├── libs/
-│   └── shared/               # 跨服务共享的类型定义、tenant 上下文、Redis/PG 客户端封装
+│   ├── tool-gateway/         # 工具策略网关：权限/校验/幂等/审计/脱敏；库 tool_gateway（含 v1 知识库）
+│   └── ai-gateway/           # 模型调用统一出口；库 ai_gateway
 └── deploy/
+    ├── postgres/             # init-databases.sql：本地创建各服务的库和账号
     └── k8s/                  # 每个服务的 Deployment/Service manifest（V1 先给基础版本，不要求生产级 HPA/KEDA 调优）
 ```
 
-每个服务内部保持标准分层（`api`/`domain`/`infra` 或等价约定即可），不需要引入额外的架构框架。
+每个服务自包含：自己的 `app/db` 模型、`migrations/`（Alembic）、`scripts/seed.py`、`tests/`，服务之间不共享代码和表（架构文档第 4 节）。服务内部分层参照 tool-gateway：`api` → `services` → `repositories` / 领域模块，`core` 放配置、鉴权、错误。
 
 ## 分阶段任务清单
 
@@ -48,9 +47,9 @@ ai-work-order/
 - **验收标准**：`docker compose up` 后四个服务健康检查均返回 200。
 
 ### 阶段 1：数据模型与迁移
-- 按架构文档第 4 节建表：`tenants`、`users`、`conversations`、`messages`、`tickets`、`knowledge_items`。
-- 用 Alembic（或等价迁移工具）管理 schema，对涉及租户数据的表启用 PostgreSQL RLS 策略（按 `tenant_id` 过滤）。
-- 写一个 seed 脚本，插入 1 个测试租户 + 3 个场景（VPN、账号密码、邮箱）对应的 `knowledge_items`（每个场景至少 3 条 QA）。
+> 最初是一个共享库 + 一套迁移（`libs/shared`），后改为每服务独立 database、各自迁移（架构文档第 4 节）。以下为当前版本。
+- 按架构文档第 4 节的归属建表，每个服务在自己的库里用 Alembic 管理 schema，对含租户数据的表启用 `FORCE ROW LEVEL SECURITY`（按 `tenant_id` 过滤）。
+- 各服务的 seed 脚本用固定的 demo 租户 ID 插入数据：app-service 插租户/用户/会话，tool-gateway 插 3 个场景（VPN、账号密码、邮箱）各 3 条 QA 和角色工具绑定。
 - **验收标准**：迁移可重复执行（up/down 幂等），seed 脚本跑完后能查到预置数据，且用非本租户 `tenant_id` 查询取不到数据（验证 RLS 生效）。
 
 ### 阶段 2：Tool Gateway（工具策略网关）
@@ -58,9 +57,9 @@ ai-work-order/
 - `GET /v1/tools/list?tenant_id&agent_role`：返回角色可用工具的 OpenAI function 元数据，不含密钥/下游地址。
 - `POST /v1/tools/call`：`tenant_id, session_id, agent_role, tool_name, arguments`，返回 `success / error`；副作用工具必须带 `Idempotency-Key` 头。
 - 能力：多租户（RLS）、`role_tool_bindings` 角色工具绑定、JSON Schema 参数校验、副作用工具的 `tool_calls` 幂等记录、`tool_call_logs` 审计（参数脱敏）、返回体凭据字段屏蔽、服务间 Bearer 令牌鉴权。HITL 审批与 Redis 限流 V1 暂不做（见架构文档 3.4 节）。
-- 工具：`search_knowledge(query)`（v1 `ILIKE` + `pg_trgm` 排序）、`create_ticket(summary, category)`（会话 ID 与幂等键由网关注入，工单表层面也按幂等键去重）。`TicketProvider` 抽象，v1 只有 `InternalTicketProvider`。
+- 工具：`search_knowledge(query)`（v1 `ILIKE` + `pg_trgm` 排序）、`create_ticket(summary, category)`（会话 ID 与幂等键由网关注入；调用 app-service 的 `POST /internal/v1/tickets`，幂等键透传，工单表层面也按幂等键去重）。`TicketProvider` 抽象，v1 只有 `InternalTicketProvider`。
 - 代码分层：`api/v1`（路由）→ `services`（调用管线，不依赖 FastAPI）→ `repositories`（网关自身的表）/ `tools`（工具定义与 handler）；`core` 放配置、鉴权、错误、脱敏。
-- **验收标准**：`tests/unit`（无外部依赖）与 `tests/integration`（需起 postgres + tool-gateway）全部通过；覆盖权限、校验、幂等重放与冲突、脱敏、审计；同一幂等键的并发请求只产生一张工单；`running` 状态孤儿记录超时后可恢复且不重复执行副作用。
+- **验收标准**：`tests/unit`（无外部依赖）与 `tests/integration`（需起 tool-gateway 及其依赖的 app-service）全部通过；覆盖权限、校验、幂等重放与冲突、脱敏、审计；同一幂等键的并发请求只产生一张工单；`running` 状态孤儿记录超时后可恢复且不重复执行副作用。
 
 ### 阶段 3：AI Gateway
 - 实现 `ModelProvider` 抽象 + 通用 `OpenAICompatibleProvider` 实现（用 OpenAI SDK 即可，只需把 `base_url` 指向配置项，不要绑定 OpenAI 官方域名），暴露统一的 `generate(messages, tenant_id, system_prompt) -> stream[chunk]` 接口（支持流式）。
@@ -78,6 +77,7 @@ ai-work-order/
 - **验收标准**：向 `agent_tasks` 队列手工写入一条测试任务，Worker 能完整跑完图并在 Pub/Sub 频道观察到预期事件序列；杀掉 Worker 进程重启后，未完成的任务能续跑而不是丢失或重复产生工单。
 
 ### 阶段 5：应用服务
+> 已提前完成：app-service 自己的库与迁移、供 Tool Gateway 调用的内部接口 `POST /internal/v1/tickets`（服务令牌鉴权、幂等键去重、RLS 防跨租户）。
 - 实现 `POST /conversations/{id}/messages`：写入用户消息，把任务推入 `agent_tasks` 队列，立即返回 202。
 - 实现 `GET /conversations/{id}/stream`（SSE）：订阅对应 Pub/Sub 频道，把事件转发给客户端，`done`/`ticket_created` 后关闭连接。
 - 实现工单查询接口：`GET /tickets/{id}`、`GET /tickets?tenant_id=`。
@@ -92,6 +92,6 @@ ai-work-order/
 ## 工作方式要求
 
 - 每个阶段先给出接口/数据结构定义（可以是简短的代码骨架或类型声明），确认结构合理后再补全实现逻辑，不要一次性输出整个阶段的完整代码而不做中间检查点。
-- 涉及架构文档中标注为「【假设，可调整】」的决策（入口渠道、租户隔离级别、身份认证方式）：按文档默认值实现，不要自行更改这些决策。
+- 涉及架构文档中标注为「【假设，可调整】」的决策（入口渠道、身份认证方式）：按文档默认值实现，不要自行更改这些决策。
 - 如果在某一阶段发现需要偏离本提示词（例如某个库不可用、某个设计在实现层面走不通），停下来说明原因和替代方案，等待确认，不要静默改变范围。
 - 每个阶段完成后运行对应的验收标准自测，并在回复中明确说明测试结果，而不是仅声明"已完成"。

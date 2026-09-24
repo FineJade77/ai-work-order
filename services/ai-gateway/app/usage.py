@@ -1,7 +1,7 @@
 import logging
 
-from shared.db.models import ModelCallLog
-from shared.db.session import app_session_factory, tenant_scope
+from app.db.models import ModelCallLog
+from app.db.session import session_factory, tenant_scope
 
 logger = logging.getLogger("ai_gateway.usage")
 
@@ -10,7 +10,7 @@ def record_usage(
     *, tenant_id: str, model: str, prompt_tokens: int, completion_tokens: int, duration_ms: int, status: str
 ) -> None:
     try:
-        Session = app_session_factory()
+        Session = session_factory()
         with Session() as session, tenant_scope(session, tenant_id):
             session.add(
                 ModelCallLog(

@@ -2,10 +2,9 @@ import json
 import logging
 from typing import Any
 
-from shared.db.models import ToolCallLog
-from shared.db.session import app_session_factory, tenant_scope
-
 from app.core.redaction import redact_for_audit
+from app.db.models import ToolCallLog
+from app.db.session import session_factory, tenant_scope
 
 logger = logging.getLogger("tool_gateway.audit")
 
@@ -28,7 +27,7 @@ def write(
     caller can store raw arguments by accident."""
     params_summary = json.dumps(redact_for_audit(arguments), ensure_ascii=False)[:PARAMS_SUMMARY_MAX_CHARS]
     try:
-        Session = app_session_factory()
+        Session = session_factory()
         with Session() as session, tenant_scope(session, tenant_id):
             session.add(
                 ToolCallLog(
