@@ -7,5 +7,10 @@ COPY app ./app
 RUN pip install --no-cache-dir .
 
 # /healthz on this port serves liveness probes only; the service itself is a queue worker.
+# Unprivileged, numeric so Kubernetes can enforce runAsNonRoot. Nothing is written at runtime,
+# so the root filesystem can also be mounted read-only.
+RUN useradd --system --uid 10001 --no-create-home app
+USER 10001
+
 EXPOSE 8002
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8002"]
