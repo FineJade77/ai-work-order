@@ -2,9 +2,10 @@ import logging
 from datetime import timedelta
 
 import anyio
+from opentelemetry.instrumentation.utils import suppress_instrumentation
 from sqlalchemy import func, select
 
-from app.clients.agent_bus import AgentBus
+from app.clients.agent_bus import AgentBus, context_from
 from app.core.config import Settings
 from app.db.models import Conversation, Message, Tenant, Turn
 from app.db.session import session_factory, tenant_scope
@@ -36,6 +37,13 @@ class Requeuer:
             await anyio.sleep(self._settings.requeue_interval_seconds)
 
     async def sweep(self) -> None:
+        # Untraced: the sweep's queries run every requeue_interval_seconds whether or not there is
+        # work, and each would be a trace of its own. A requeue itself is traced, in the turn's
+        # own trace (see AgentBus.enqueue's parent).
+        with suppress_instrumentation():
+            await self._sweep()
+
+    async def _sweep(self) -> None:
         stale_before = func.now() - timedelta(seconds=self._settings.requeue_after_seconds)
         gave_up: list[Turn] = []
         Session = session_factory()
@@ -63,7 +71,8 @@ class Requeuer:
                         # again, and a duplicate task is harmless.
                         await self._bus.enqueue(
                             task_id=turn.id, seq=turn.seq, conversation_id=turn.conversation_id, tenant_id=tenant_id,
-                            user_id=user_id, content=content,
+                            user_id=user_id, content=content, parent=context_from(turn.traceparent),
+                            requeue=turn.enqueue_count,
                         )
                         turn.enqueue_count += 1
                         turn.updated_at = func.now()

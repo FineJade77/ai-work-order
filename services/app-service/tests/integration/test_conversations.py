@@ -3,6 +3,7 @@ import uuid
 
 import anyio
 import pytest
+from opentelemetry.trace import SpanKind
 
 from app.clients.agent_bus import RESULT_STREAM, TASK_STREAM, AgentBus, event_stream_key, floor_key
 from app.core.config import get_settings
@@ -70,6 +71,7 @@ async def test_send_enqueues_a_task_and_refuses_a_second_while_one_is_in_flight(
     task_id = resp.json()["task_id"]
 
     [(_, task)] = await redis.xrange(TASK_STREAM)
+    assert task.pop("traceparent").startswith("00-")  # trace context; see the tracing tests below
     assert task == {
         "task_id": task_id, "seq": "1", "conversation_id": conversation, "tenant_id": str(tenant.id),
         "user_id": str(tenant.alice.id), "content": "VPN 连不上",
@@ -216,3 +218,55 @@ async def test_requeuer_handles_stale_turns_in_several_tenants(client, redis, te
         assert sorted(rows) == sorted([(str(turn), 2), (mine, 2)])
     finally:
         admin_db.execute("DELETE FROM tenants WHERE id = %s", (other,))
+
+
+def _trace_id(traceparent: str) -> str:
+    return traceparent.split("-")[1]
+
+
+async def test_a_turn_and_its_task_carry_the_senders_trace(client, redis, tenant, login, admin_db, spans):
+    alice = await login(tenant.alice)
+    conversation = await start_conversation(client, alice)
+    task_id = (await send(client, alice, conversation)).json()["task_id"]
+
+    finished = spans.get_finished_spans()
+    [request] = [s for s in finished if s.name == "POST /v1/conversations/{conversation_id}/messages"]
+    [producer] = [s for s in finished if s.name == "send agent_tasks"]
+    assert producer.kind == SpanKind.PRODUCER and producer.parent.span_id == request.context.span_id
+    assert producer.attributes["app.task_id"] == task_id
+    # agent-runtime's consumer span will be a child of the producer span.
+    [(message_id, task)] = await redis.xrange(TASK_STREAM)
+    assert task["traceparent"].split("-")[2] == format(producer.context.span_id, "016x")
+    assert producer.attributes["messaging.message.id"] == message_id
+    # Stored with the turn, so a requeue can continue the same trace.
+    [stored] = admin_db.execute("SELECT traceparent FROM turns WHERE id = %s", (task_id,)).fetchone()
+    assert _trace_id(stored) == format(request.context.trace_id, "032x")
+
+
+async def test_a_requeued_task_stays_in_the_turns_trace(client, redis, tenant, login, admin_db, spans):
+    alice = await login(tenant.alice)
+    conversation = await start_conversation(client, alice)
+    task_id = (await send(client, alice, conversation)).json()["task_id"]
+    admin_db.execute("UPDATE turns SET updated_at = now() - interval '1 hour' WHERE id = %s", (task_id,))
+    spans.clear()
+
+    await Requeuer(AgentBus(redis), get_settings()).sweep()
+    first, requeued = [fields for _, fields in await redis.xrange(TASK_STREAM)]
+    assert _trace_id(requeued["traceparent"]) == _trace_id(first["traceparent"])
+    # The sweep's own queries are not traced; the requeue is, and says so.
+    [producer] = spans.get_finished_spans()
+    assert (producer.name, producer.attributes["app.requeue"]) == ("send agent_tasks", "1")
+
+
+async def test_storing_a_result_is_linked_to_the_run_that_sent_it(client, redis, tenant, login, spans):
+    alice = await login(tenant.alice)
+    conversation = await start_conversation(client, alice)
+    task_id = (await send(client, alice, conversation)).json()["task_id"]
+    run = "00-" + "ab" * 16 + "-" + "cd" * 8 + "-01"  # as agent-runtime's run would send it
+    await report(redis, tenant, conversation, task_id, status="done", outcome="replied", content="你好",
+                 ticket_id="", traceparent=run)
+    await wait_for(lambda: _history_when(client, alice, conversation, lambda h: h["active_task_id"] is None))
+    [stored] = [s for s in spans.get_finished_spans() if s.name == "process agent_results"]
+    [link] = stored.links
+    assert (format(link.context.trace_id, "032x"), format(link.context.span_id, "016x")) == ("ab" * 16, "cd" * 8)
+    assert stored.context.trace_id != link.context.trace_id  # its own trace, linked, not a child

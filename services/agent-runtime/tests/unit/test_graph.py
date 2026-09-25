@@ -2,6 +2,7 @@ import uuid
 
 import httpx
 import pytest
+from opentelemetry.trace import StatusCode
 from langgraph.checkpoint.memory import InMemorySaver
 
 from app.clients.tool_gateway import ToolCallFailed
@@ -286,3 +287,39 @@ async def test_budget_refused_while_checking_feedback(env):
     env.models.over_budget = {"resolution"}
     assert await env.runner.run(env.task("还是不行")) == BUDGET_EXCEEDED
     assert "create_ticket" not in env.tools.names()
+
+
+def _finished(spans) -> dict:
+    return {s.name: s for s in spans.get_finished_spans()}
+
+
+async def test_each_node_runs_in_a_span_recording_its_decision(env, spans):
+    await env.runner.run(env.task("VPN 连不上"))
+    done = _finished(spans)
+    expected = {"node classify_intent", "node retrieve_knowledge", "node generate_answer", "node await_feedback"}
+    assert expected <= set(done)
+    assert done["node classify_intent"].attributes["app.intent"] == "question"
+    retrieve = done["node retrieve_knowledge"].attributes
+    assert (retrieve["app.knowledge_hits"], retrieve["app.category"]) == (1, "vpn")
+    # Pausing for the employee's reply is how the graph waits, not a failure.
+    pause = done["node await_feedback"]
+    assert [e.name for e in pause.events] == ["interrupt"]
+    assert pause.status.status_code == StatusCode.UNSET
+
+
+async def test_search_retries_and_degradation_are_events_on_the_node_span(env, spans, no_retry_pause):
+    env.tools.search_failures = [ToolCallFailed("TOOL_ERROR", "down")] * 3
+    await env.runner.run(env.task("VPN 连不上"))
+    retrieve = _finished(spans)["node retrieve_knowledge"]
+    assert [e.name for e in retrieve.events] == ["search_failed"] * 3 + ["knowledge_unavailable"]
+    assert retrieve.attributes["app.knowledge_error"] == "TOOL_ERROR"
+
+
+async def test_a_failing_node_is_an_error_span(spans):
+    env = Env(hits=[])
+    env.tools.crash_on_create = 1
+    with pytest.raises(RuntimeError):
+        await env.runner.run(env.task("VPN 证书报错"))
+    create = _finished(spans)["node create_ticket"]
+    assert create.status.status_code == StatusCode.ERROR
+    assert [e.name for e in create.events] == ["exception"]

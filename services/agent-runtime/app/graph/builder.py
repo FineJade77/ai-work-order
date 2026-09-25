@@ -4,6 +4,7 @@ from langgraph.graph.state import CompiledStateGraph
 
 from app.graph import nodes
 from app.graph.state import AgentState, Deps
+from app.tracing import traced_node
 
 
 def build_graph(checkpointer: BaseCheckpointSaver) -> CompiledStateGraph:
@@ -29,7 +30,7 @@ def build_graph(checkpointer: BaseCheckpointSaver) -> CompiledStateGraph:
         nodes.summarize_ticket,
         nodes.create_ticket,
     ):
-        graph.add_node(node.__name__, node)
+        graph.add_node(node.__name__, traced_node(node))
 
     graph.add_edge(START, "classify_intent")
     graph.add_conditional_edges(

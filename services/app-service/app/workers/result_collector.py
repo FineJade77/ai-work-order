@@ -3,15 +3,18 @@ import time
 import uuid
 
 import anyio
+from opentelemetry import trace
+from opentelemetry.trace import SpanKind, StatusCode
 from redis.asyncio import Redis
 from redis.exceptions import RedisError, ResponseError
 from sqlalchemy import func
 
-from app.clients.agent_bus import RESULT_GROUP, RESULT_STREAM
+from app.clients.agent_bus import RESULT_GROUP, RESULT_STREAM, link_to, messaging_attributes
 from app.db.session import session_factory, tenant_scope
 from app.repositories import conversations as repo
 
 logger = logging.getLogger("app_service.results")
+_tracer = trace.get_tracer("app_service.results")
 
 READ_BLOCK_MS = 5000
 # A result a crashed replica took but never acknowledged is taken over after this long.
@@ -63,12 +66,26 @@ class ResultCollector:
         return next(iter(response.values())) if isinstance(response, dict) else response[0][1]
 
     async def _process(self, entry_id: str, fields: dict) -> None:
+        # A trace of its own, linked to the agent run that sent the result: storing it is separate
+        # work, possibly by another replica, possibly much later (redelivery).
+        attributes = messaging_attributes(
+            RESULT_STREAM, "process", task_id=fields.get("task_id"), status=fields.get("status")
+        )
+        attributes["messaging.message.id"] = entry_id
+        with _tracer.start_as_current_span(
+            f"process {RESULT_STREAM}", kind=SpanKind.CONSUMER, links=link_to(fields), attributes=attributes
+        ):
+            await self._process_traced(entry_id, fields)
+
+    async def _process_traced(self, entry_id: str, fields: dict) -> None:
         try:
             await self.handle(fields)
-        except (KeyError, ValueError):
+        except (KeyError, ValueError) as exc:
             logger.error("malformed agent_results entry %s: %r; dropping it", entry_id, fields)
-        except Exception:
+            _mark_failed(exc)
+        except Exception as exc:
             logger.exception("storing result %s failed; it stays pending for redelivery", entry_id)
+            _mark_failed(exc)
             return
         await self._redis.xack(RESULT_STREAM, RESULT_GROUP, entry_id)
 
@@ -99,3 +116,10 @@ class ResultCollector:
                 turn.error_code = fields.get("error_code") or "TASK_FAILED"
             turn.completed_at = turn.updated_at = func.now()
             await session.commit()
+
+
+def _mark_failed(exc: Exception) -> None:
+    """Handled here rather than raised, so the span would otherwise look like a success."""
+    span = trace.get_current_span()
+    span.record_exception(exc)
+    span.set_status(StatusCode.ERROR, str(exc))

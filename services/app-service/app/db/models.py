@@ -90,6 +90,8 @@ class Turn(Base):
     ticket_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
     enqueue_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+    # The creating request's W3C trace context; a requeue continues that trace (migration 0006).
+    traceparent: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _created_at()
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

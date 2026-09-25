@@ -3,9 +3,12 @@ import uuid
 
 import anyio
 import pytest
+from opentelemetry import trace
+from opentelemetry.trace import SpanKind
 
 from app.core.errors import RetryLater
-from app.events import RESULT_STREAM, event_stream_key
+from app.events import RESULT_STREAM, EventPublisher, event_stream_key
+from app.tracing import inject_into
 from app.worker.consumer import TaskConsumer
 from app.worker.locks import ConversationLock
 from app.worker.queue import CONSUMER_GROUP, DEAD_LETTER_STREAM, TASK_STREAM, RedisStreamTaskQueue, floor_key
@@ -140,3 +143,46 @@ async def test_task_below_the_conversation_floor_is_acked_without_running(redis,
     assert await pending_count(redis) == 0
     assert await redis.xlen(event_stream_key(task.conversation_id)) == 0  # nothing reported for the stale copy
     assert await redis.xlen(RESULT_STREAM) == 0
+
+
+async def test_a_task_continues_the_trace_it_was_sent_from(redis, settings, spans):
+    q = queue(redis)
+    await q.setup()
+    task = make_task(uuid.uuid4(), "hi")
+    with trace.get_tracer("test").start_as_current_span("send agent_tasks") as producer:
+        fields = inject_into(task_fields(task))  # what app-service does when it enqueues
+    await redis.xadd(TASK_STREAM, fields)
+    [delivery] = await q.receive(1, block_ms=100)
+
+    await TaskConsumer(q, FakeRunner(), redis, settings).handle(delivery)
+    [consumer] = [s for s in spans.get_finished_spans() if s.name == "process agent_tasks"]
+    assert consumer.kind == SpanKind.CONSUMER
+    assert consumer.context.trace_id == producer.get_span_context().trace_id
+    assert consumer.parent.span_id == producer.get_span_context().span_id
+    attrs = consumer.attributes
+    assert (attrs["app.task_id"], attrs["app.delivery_attempt"], attrs["messaging.message.id"]) == (
+        str(task.task_id), 1, delivery.id,
+    )
+    assert attrs["app.queue_wait_ms"] >= 0
+
+
+async def test_skipping_a_stale_copy_is_visible_on_the_span(redis, settings, spans):
+    q = queue(redis)
+    await q.setup()
+    task = make_task(uuid.uuid4(), "hi", seq=1)
+    await redis.set(floor_key(task.conversation_id), 2)
+    await redis.xadd(TASK_STREAM, task_fields(task))
+    [delivery] = await q.receive(1, block_ms=100)
+    await TaskConsumer(q, FakeRunner(), redis, settings).handle(delivery)
+    [consumer] = [s for s in spans.get_finished_spans() if s.name == "process agent_tasks"]
+    assert [(e.name, e.attributes["check"]) for e in consumer.events] == [("skipped_stale", "redis floor")]
+
+
+async def test_a_result_carries_the_trace_of_the_run_that_sent_it(redis):
+    task = make_task(uuid.uuid4(), "hi")
+    with trace.get_tracer("test").start_as_current_span("process agent_tasks") as run:
+        await EventPublisher(redis, task).finish(outcome="replied", content="你好", ticket_id=None)
+    [(_, result)] = await redis.xrange(RESULT_STREAM)
+    _, trace_id, span_id, _ = result["traceparent"].split("-")
+    context = run.get_span_context()
+    assert (trace_id, span_id) == (format(context.trace_id, "032x"), format(context.span_id, "016x"))

@@ -203,12 +203,26 @@ docker compose exec postgres psql -U work_order -d app_service -c \
 `docker compose up` 会一起启动 `observability`（`grafana/otel-lgtm`：OTel Collector + Tempo + Prometheus + Loki + Grafana），六个服务把 trace、指标、日志经 OTLP 发给它。数据存在容器里，重建容器就清空。
 
 - Grafana：http://localhost:23000（本地匿名访问），在 Explore 里选数据源：
-  - **Tempo**：按服务查 `{resource.service.name="tool-gateway"}`，打开一条 trace 能看到跨服务调用和每条 SQL；
+  - **Tempo**：一轮对话是一条 trace，从发消息的请求开始，经 Redis 队列到 agent-runtime 的每个图节点、每次模型调用（token 数、首 token 延迟，开发环境还有提示词和回复）、工具调用和每条 SQL。常用 TraceQL：`{name="process agent_tasks"}`（所有轮次）、`{span."app.conversation_id"="<会话 id>"}`、`{name=~"chat .*"}`（模型调用）、`{status=error}`；
   - **Loki**：`{service_name="app-service"}` 看日志，每行是 JSON，带 `trace_id`，可以跳到对应的 trace；
   - **Prometheus**：各服务的 HTTP 指标（自动插桩提供）。
 - 直接查询的端口：Tempo `23200`、Loki `23100`、Prometheus `29090`；OTLP 接收 `24317`（gRPC）/`24318`（HTTP），本地直接跑服务时可以把 `OTEL_EXPORTER_OTLP_ENDPOINT` 指向 `http://localhost:24318`。
+- 不开 Grafana 也能看：`scripts/show-trace.py` 把最近一轮对话打印成调用树（`scripts/show-trace.py <trace_id>` 看指定的一条）：
+
+  ```
+  trace b7c8202f920c5c43549ff8337d0bd6dd
+         0ms app-service: POST /v1/conversations/{conversation_id}/messages (52ms) sql×6
+        48ms   app-service: send agent_tasks (2ms)
+        51ms     agent-runtime: process agent_tasks (1896ms) sql×14 delivery_attempt=1 queue_wait_ms=2
+        96ms       agent-runtime: node check_resolution (842ms) resolution=unresolved
+       107ms           ai-gateway: POST /v1/generate (830ms) sql×7
+       148ms             ai-gateway: chat deepseek-chat (774ms) gen_ai.usage.input_tokens=161 ... !gen_ai.first_token
+      1741ms       agent-runtime: node create_ticket (174ms) outcome=ticket_created ticket_id=…
+      1831ms               ticket-service: POST /internal/v1/tickets (37ms) sql×5
+  ```
+- 结果落库是另一条 trace（`process agent_results`），用 link 指回 Agent 的那次运行。
 - 服务的标准输出也是一行一个 JSON：`docker compose logs app-service`。
-- 现阶段的缺口：Redis 队列两端还没有串成一条 trace（agent-runtime 的处理各自是独立的 trace），指标看板和告警也还没有，见 `docs/implementation-plan.md` 阶段 7。
+- 现阶段的缺口：还没有业务指标看板和告警，见 `docs/implementation-plan.md` 阶段 7。
 
 ## 运行测试
 

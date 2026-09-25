@@ -4,7 +4,7 @@ import uuid
 from redis.exceptions import RedisError
 from sqlalchemy.exc import IntegrityError
 
-from app.clients.agent_bus import AgentBus
+from app.clients.agent_bus import AgentBus, current_traceparent
 from app.core.errors import ApiError
 from app.core.security import CurrentUser
 from app.db.models import Conversation, Message, Turn
@@ -53,7 +53,10 @@ async def send_message(user: CurrentUser, conversation_id: uuid.UUID, content: s
         session.add(Message(id=message_id, conversation_id=conversation_id, role="user", content=content, task_id=turn_id))
         await session.flush()
         session.add(
-            Turn(id=turn_id, tenant_id=user.tenant_id, conversation_id=conversation_id, user_message_id=message_id, seq=seq)
+            Turn(
+                id=turn_id, tenant_id=user.tenant_id, conversation_id=conversation_id, user_message_id=message_id,
+                seq=seq, traceparent=current_traceparent(),
+            )
         )
         try:
             await session.commit()

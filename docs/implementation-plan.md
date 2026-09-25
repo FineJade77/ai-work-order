@@ -115,8 +115,8 @@ ai-work-order/
 > 设计见架构文档第 5 节。分三步，每步单独提交。
 - **7.1 追踪与日志（已完成）**：六个服务加 OTel 依赖（distro、OTLP HTTP exporter，以及各自用到的 fastapi/httpx/psycopg/logging 插桩），用 `opentelemetry-instrument` 启动，镜像默认关闭 SDK；FastAPI 在代码里插桩（去掉 send/receive 子 span，跳过 `/healthz`）；日志改为带 `trace_id` 的 JSON；compose 新增 `observability`（`grafana/otel-lgtm:0.33.1`），各服务共用 `x-otel-env`。
   - **验收标准**：每个服务的 `tests/unit/test_telemetry.py`（JSON 字段、span 内带 id、重复配置幂等、一次请求只有一个服务端 span 且不记探针）全部通过；跑一次演示后 Tempo 里六个服务都有 trace，agent-runtime → tool-gateway → knowledge-service / ticket-service 在同一条 trace 里且带数据库 span；Loki 能按 `trace_id` 查到这条 trace 的日志。
-- **7.2 跨队列与 Agent/LLM（待做）**：任务和结果消息携带 `traceparent`，一轮对话一条 trace；LangGraph 节点 span；ai-gateway 的 GenAI span（内容记录有开关）；锁冲突、跳过旧副本、降级、预算拒绝、死信记为 span 事件。
-  - **验收标准**：内存 exporter 单测覆盖上下文注入与恢复、节点 span 名称与属性；集成测试跑一轮对话后经 Tempo 查询接口断言同一条 trace 覆盖至少 5 个服务且含队列生产/消费 span。
+- **7.2 跨队列与 Agent/LLM（已完成）**：任务和结果消息携带 `traceparent`，一轮对话一条 trace（`turns.traceparent`，app-service 迁移 0006，让补偿重投接回原 trace；扫描本身不追踪）；结果落库用 link；LangGraph 节点 span；ai-gateway 的 GenAI span（内容记录由 `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` 控制，compose 打开）；锁冲突、跳过旧副本、续跑、降级、预算拒绝、死信记为 span 事件；`scripts/show-trace.py`。
+  - **验收标准**：内存 exporter 测试覆盖——agent-runtime：消费端 span 是生产端的子 span、跳过旧副本的事件、结果带运行的 `traceparent`、节点 span 的名字与决定属性、`interrupt` 不算错误、检索失败事件、失败节点为错误；app-service：生产端 span 挂在请求下且消息和 `turns` 带同一条 trace、重投留在原 trace、结果落库 span 有 link；ai-gateway：GenAI 属性、内容只在开关打开时记录且已脱敏、失败为错误。真实环境（真实模型）跑一次演示后，用 `scripts/show-trace.py` 确认一轮对话是一条 trace，覆盖 app-service、agent-runtime、ai-gateway、tool-gateway 以及 knowledge-service 或 ticket-service，含队列生产/消费、节点和 GenAI span。
 - **7.3 指标、看板、告警（待做）**：OTel metrics 覆盖队列、任务、Agent、LLM、入口；Grafana 看板与告警规则放进仓库（provisioning）；示例 SLO；k8s 可选组件 `components/observability`。
   - **验收标准**：看板在演示流量下有数据；人为制造死信和降级时对应告警触发。
 

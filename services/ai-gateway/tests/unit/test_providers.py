@@ -1,7 +1,9 @@
+import json
 from types import SimpleNamespace
 
 import anyio
 import pytest
+from opentelemetry.trace import SpanKind, StatusCode
 
 from app import providers
 from app.providers import OpenAICompatibleProvider
@@ -47,8 +49,10 @@ def recorded(monkeypatch):
     return rows
 
 
-def make_provider(completions):
-    provider = OpenAICompatibleProvider(base_url="http://unused", api_key="unused", model="test-model")
+def make_provider(completions, *, capture_content=False):
+    provider = OpenAICompatibleProvider(
+        base_url="http://unused", api_key="unused", model="test-model", capture_content=capture_content
+    )
     provider._client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
     return provider
 
@@ -96,3 +100,44 @@ async def test_upstream_failure_is_recorded_as_error(recorded):
             pass
 
     assert [r["status"] for r in recorded] == ["error"]
+
+
+def _chat_span(spans):
+    [span] = [s for s in spans.get_finished_spans() if s.name == "chat test-model"]
+    return span
+
+
+async def test_a_model_call_is_a_genai_span_without_content_by_default(recorded, spans):
+    usage = SimpleNamespace(prompt_tokens=7, completion_tokens=2)
+    chunks = [_chunk("he"), _chunk("llo"), _chunk(usage=usage)]
+    [e async for e in generate(make_provider(FakeCompletions(chunks)))]
+
+    span = _chat_span(spans)
+    assert span.kind == SpanKind.CLIENT
+    attrs = span.attributes
+    assert (attrs["gen_ai.operation.name"], attrs["gen_ai.request.model"], attrs["app.tenant_id"]) == (
+        "chat", "test-model", TENANT,
+    )
+    assert (attrs["gen_ai.usage.input_tokens"], attrs["gen_ai.usage.output_tokens"]) == (7, 2)
+    assert "app.time_to_first_token_ms" in attrs and [e.name for e in span.events] == ["gen_ai.first_token"]
+    content_keys = ("gen_ai.input.messages", "gen_ai.output.messages", "gen_ai.system_instructions")
+    assert not any(k in attrs for k in content_keys)
+
+
+async def test_content_is_recorded_masked_only_when_switched_on(recorded, spans):
+    provider = make_provider(FakeCompletions([_chunk("已记下 13812345678")]), capture_content=True)
+    messages = [{"role": "user", "content": "我的手机 13812345678"}]
+    [e async for e in provider.generate(messages=messages, system_prompt="你是助手", tenant_id=TENANT)]
+
+    attrs = _chat_span(spans).attributes
+    assert json.loads(attrs["gen_ai.input.messages"]) == [
+        {"role": "user", "parts": [{"type": "text", "content": "我的手机 138****5678"}]}
+    ]
+    assert json.loads(attrs["gen_ai.output.messages"])[0]["parts"][0]["content"] == "已记下 138****5678"
+    assert json.loads(attrs["gen_ai.system_instructions"]) == [{"type": "text", "content": "你是助手"}]
+
+
+async def test_a_failed_model_call_is_an_error_span(recorded, spans):
+    with pytest.raises(RuntimeError):
+        [e async for e in generate(make_provider(FakeCompletions([_chunk("partial")], then_fail=True)))]
+    assert _chat_span(spans).status.status_code == StatusCode.ERROR

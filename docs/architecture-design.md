@@ -63,7 +63,7 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
   - `Tenant`：租户，带唯一的 `slug`（登录时用来确定租户）
   - `User`：用户（属于某租户），角色 `employee` / `handler`（处理人：处理本租户工单的人，不限于 IT；V1 可以处理本租户所有工单，按类别分组待做；由 `it_staff` 改名，迁移 0005，改名前签发的 JWT 带旧角色，会被拒绝，需重新登录），scrypt 密码哈希
   - `Conversation` / `Message`：问答会话
-  - `Turn`：一条用户消息及其处理状态（`queued/done/failed`），`id` 就是投递给 Agent Runtime 的 `task_id`，`seq` 是它在会话内的序号（1、2、3…，唯一约束）；部分唯一索引保证同一会话同时只有一轮在处理
+  - `Turn`：一条用户消息及其处理状态（`queued/done/failed`），`id` 就是投递给 Agent Runtime 的 `task_id`，`seq` 是它在会话内的序号（1、2、3…，唯一约束），`traceparent` 是创建它的请求的追踪上下文（补偿重投时接回同一条 trace）；部分唯一索引保证同一会话同时只有一轮在处理
   - 工单不在这里：归 ticket-service 所有（见 3.7 节）。员工"我的工单"、处理人处理工单的页面由应用服务调用 ticket-service 的内部接口实现，`start`/`resolve` 这类处理人操作的角色权限也在应用服务里判断。
 - 核心业务流程（问答与建单的判断都在 Agent Runtime，应用服务不调用 Tool Gateway）：
   1. 员工发消息 → 在同一事务里写用户消息和 `Turn`，把任务投递到 `agent_tasks` → 返回 202。
@@ -101,7 +101,7 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
   - 能自助解答的范围由租户的知识库决定，没有"场景内/场景外"清单：知识库没有的问题检索不到，就转人工。
   - 工单类别：来自命中条目的 `category`（租户自己的标签，如 `vpn`、`leave`、`expense`）；没检索过（直接要求提单）、没命中、或条目的类别为空/超过 50 字时用 `other`。检索过却没命中的工单，描述前加 `[知识库未命中]`。
 - 状态持久化：LangGraph checkpoint 存 **Postgres**（独立的 `agent_runtime` 库，`AsyncPostgresSaver`），`thread_id = conversation_id`，多轮历史就在图状态里，任务里只带最新一条消息。表结构由 langgraph-checkpoint-postgres 管理（迁移任务里跑 `setup()`，不走 Alembic）；表里没有 `tenant_id`，不做 RLS，只有 Agent Runtime 能连这个库。
-- 任务契约：`agent_tasks` 消息字段 `task_id, seq, conversation_id, tenant_id, user_id, content`，由应用服务写入；投递时在同一个 Redis 事务里把会话下限 `agent:floor:{conversation_id}` 提高到这个 `seq`（只升不降，24 小时过期）。调用 Tool Gateway 时 `session_id = conversation_id`，`user_id` 原样透传，`agent_role` 取配置（`service_agent`）。
+- 任务契约：`agent_tasks` 消息字段 `task_id, seq, conversation_id, tenant_id, user_id, content`，外加 W3C 追踪上下文 `traceparent`（有时还有 `tracestate`），由应用服务写入；`agent_results` 同样带上 Agent 运行的 `traceparent`；投递时在同一个 Redis 事务里把会话下限 `agent:floor:{conversation_id}` 提高到这个 `seq`（只升不降，24 小时过期）。调用 Tool Gateway 时 `session_id = conversation_id`，`user_id` 原样透传，`agent_role` 取配置（`service_agent`）。
 - 崩溃恢复与不重复建单：
   - 每个任务结束时，在写 `done`/`error` 事件的同一个 Redis 事务里，向全局 `agent_results` Stream 写一条结果（状态、outcome、这一轮唯一的助手消息、ticket_id），应用服务用消费组消费并落库，不依赖浏览器是否还连着。
   - 图跑到结束或 interrupt、并写出 `done` 事件后才 XACK；未确认的消息空闲超过阈值后由任一 Worker 用 XAUTOCLAIM 接管，投递超过 3 次进死信 `agent_tasks:dead` 并写 `error` 事件。
@@ -203,8 +203,15 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
     - FastAPI 在代码里插桩（`app/core/telemetry.py: instrument_app`，镜像里关闭了自动的 FastAPI 插桩）：只有这里能去掉 ASGI send/receive 子 span（对 SSE 是每个事件一个 span），`/healthz` 不记。
     - 不自动插桩 Redis：阻塞轮询和 SSE 读会让每条命令各成一条根 trace；队列的 span 在阶段 2 手工埋。
     - 日志：每行一个 JSON 对象（`time/level/service/logger/message` + `extra` 字段），在 span 内时带 `trace_id`/`span_id`；同时经 OTLP 进 Loki（`service_name` 等为标签，`trace_id` 为结构化元数据），日志与 trace 可互查。
-    - 已知缺口：队列两端还没串起来（agent-runtime 的工作各自成 trace），SQLAlchemy 连接池预检是名为 `;` 的 span。
-  - **阶段 2（待做）跨队列与 Agent/LLM**：`traceparent` 写进 `agent_tasks`/`agent_results`，一轮对话一条 trace（消费端 span 挂在生产端下，补偿重投和结果落库用 link）；LangGraph 每个节点一个 span；ai-gateway 按 OTel GenAI 约定记录模型调用（提示词和回复内容由开关控制，compose 默认开、k8s 默认关）；锁冲突、跳过旧副本、降级、预算拒绝、死信记为 span 事件。
+    - SQLAlchemy 连接池预检（`pool_pre_ping`）是名为 `;` 的 span。
+  - **阶段 2（已完成）跨队列与 Agent/LLM**——员工发一条消息就是一条 trace：
+    - 队列按 OTel messaging 约定埋点（`messaging.system=redis`，生产端 `send agent_tasks`、消费端 `process agent_tasks`），消息里带 `traceparent`，消费端 span 是生产端 span 的子 span；每次投递（含重投）都是一个消费端 span，带 `app.delivery_attempt`、`app.queue_wait_ms`（由 Stream id 的毫秒时间戳算出）。
+    - 补偿重投：发消息时把请求的 `traceparent` 存进 `turns`（迁移 0006），重投的生产端 span 挂回原来的 trace 并标 `app.requeue`；每 30 秒的扫描本身在 `suppress_instrumentation()` 里执行，不产生 trace。
+    - 结果落库：每条结果一个 `process agent_results` 根 span，用 link 指向发出它的 Agent 运行（落库是另一段工作，可能在别的副本、可能很久以后）；处理失败标记为错误。
+    - LangGraph：每个节点一个 `node <名字>` span（包装在 `app/tracing.py: traced_node`），记录节点的决定（`app.intent`、`app.category`、`app.knowledge_hits`、`app.outcome`……）；`interrupt()` 记为事件、不算错误。
+    - 事件：会话锁冲突、跳过旧副本（Redis 下限或 checkpoint）、续跑、检索失败与降级、预算拒绝、死信、RetryLater 都记在对应 span 上。
+    - ai-gateway：每次模型调用一个 `chat <模型>` span（CLIENT），按 GenAI 约定记录 `gen_ai.provider.name`、`gen_ai.request/response.model`、`gen_ai.usage.input/output_tokens`、`gen_ai.response.finish_reasons`、首个 token 事件和 `app.time_to_first_token_ms`；SDK 发出的 HTTP 请求是它的子 span。提示词和回复由 `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` 控制（compose 开、默认关），记录时截断并对手机号/邮箱/身份证号脱敏。span 是手动开始和结束的：调用在异步生成器里跨 yield，用上下文管理器会在别处恢复上下文。
+    - `scripts/show-trace.py` 把一条 trace 打印成缩进的调用树，方便不开 Grafana 时查看。
   - **阶段 3（待做）指标、看板、告警**：队列、任务、Agent、LLM、入口的指标（`tenant_id` 可做标签，`user_id`/`task_id` 不做），Grafana 看板和告警规则放进仓库，示例 SLO"95% 的轮次 30 秒内完成"。
   - 生产环境：Collector 用 OTel Operator 或独立 Deployment，后端各自部署（Tempo、Loki、Prometheus/Mimir、Grafana），在 Collector 做尾部采样（错误和慢请求全留）；k8s 的可选组件 `components/observability` 在阶段 3 加。
 - 部署清单：V1 用 Kustomize（`deploy/k8s`：base + overlays + 可选的扩缩容组件），kubectl 自带、没有模板语法；"迁移完成后再更新服务"的顺序由 `apply-dev.sh` 保证，以后用 Helm hook 或 Argo CD sync wave 表达。服务容器一律非 root、只读根文件系统。

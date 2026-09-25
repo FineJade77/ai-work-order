@@ -198,6 +198,8 @@ services:
     environment:
       <<: *otel-env
       OTEL_SERVICE_NAME: ai-gateway
+      # Prompts and replies on model-call spans (masked, truncated): on for local development only.
+      OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: "true"
       DATABASE_URL: postgresql+psycopg://ai_gateway_app:ai_gateway_app_dev@postgres:5432/ai_gateway
       MODEL_BASE_URL: https://api.deepseek.com
       MODEL_NAME: deepseek-chat

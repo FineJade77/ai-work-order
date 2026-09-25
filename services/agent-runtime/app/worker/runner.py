@@ -9,6 +9,7 @@ from app.clients.tool_gateway import ToolGatewayClient
 from app.graph import prompts
 from app.graph.state import RUN_FIELDS_RESET, Deps, Events
 from app.schemas.tasks import AgentTask
+from app.tracing import event
 
 logger = logging.getLogger("agent_runtime.runner")
 
@@ -49,13 +50,16 @@ class TaskRunner:
             # A copy of a turn the thread has moved past. Run it and, if the thread is waiting for
             # feedback, its old question would be taken as the answer to a newer one. Its turn was
             # closed in app-service long ago, so there is nothing to report either.
+            event("skipped_stale", check="checkpoint seq", thread_seq=values["seq"])
             logger.warning("skipping stale task_id=%s seq=%d: thread is at seq %d", task_id, task.seq, values["seq"])
             return SUPERSEDED
 
         if values.get("task_id") == task_id:
             if snapshot.interrupts or not snapshot.next:
                 # This task's run had already finished; only the acknowledgement was lost.
+                event("already_finished")
                 return await self._finish(config, events)
+            event("resumed", at=",".join(snapshot.next))
             logger.info("resuming task_id=%s at %s", task_id, snapshot.next)
             await events.publish("resumed")
             graph_input = None
@@ -88,6 +92,7 @@ class TaskRunner:
         new graph input, which discards that pending node, so nothing resumes it by accident.
         The reply is therefore not in the thread's history, only in app-service's."""
         # Fixed format, so log-based alerting can match on the leading keyword.
+        event("budget_exceeded")
         logger.error("budget_exceeded tenant_id=%s task_id=%s", task.tenant_id, task.task_id)
         await events.publish("reply", content=prompts.BUDGET_EXCEEDED_REPLY)
         await events.finish(outcome=BUDGET_EXCEEDED, content=prompts.BUDGET_EXCEEDED_REPLY, ticket_id=None)

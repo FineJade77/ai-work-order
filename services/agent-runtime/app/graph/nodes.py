@@ -14,6 +14,7 @@ from langgraph.types import interrupt
 from app.clients.tool_gateway import classify_failure
 from app.graph import prompts
 from app.graph.state import AgentState, Deps
+from app.tracing import event
 
 logger = logging.getLogger("agent_runtime.graph")
 
@@ -82,12 +83,14 @@ async def retrieve_knowledge(state: AgentState, runtime: Runtime[Deps]) -> dict:
             failure = classify_failure(exc)
             if failure is None:
                 raise
+        event("search_failed", code=failure.code, attempt=attempt, transient=failure.transient)
         if not failure.transient or delay is None:
             break
         logger.warning(
             "search_knowledge attempt %d failed task_id=%s code=%s; retrying", attempt, deps.task.task_id, failure.code
         )
         await anyio.sleep(delay)
+    event("knowledge_unavailable", code=failure.code, attempts=attempt)
     # Fixed format, so log-based alerting can match on the leading keyword.
     logger.error(
         "knowledge_unavailable tenant_id=%s task_id=%s code=%s attempts=%d",

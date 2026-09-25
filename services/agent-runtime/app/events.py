@@ -28,6 +28,7 @@ from redis.asyncio import Redis
 from redis.asyncio.client import Pipeline
 
 from app.schemas.tasks import AgentTask
+from app.tracing import inject_into
 
 EVENT_STREAM_MAXLEN = 1000
 EVENT_STREAM_TTL_SECONDS = 24 * 3600
@@ -75,9 +76,6 @@ class EventPublisher:
     def _result(self, pipe: Pipeline, **fields: str) -> None:
         task = self._task
         identity = {"task_id": task.task_id, "conversation_id": task.conversation_id, "tenant_id": task.tenant_id}
-        pipe.xadd(
-            RESULT_STREAM,
-            {**{k: str(v) for k, v in identity.items()}, **fields},
-            maxlen=RESULT_STREAM_MAXLEN,
-            approximate=True,
-        )
+        # With the run's trace context, so app-service's handling of it links back to this run.
+        message = inject_into({**{k: str(v) for k, v in identity.items()}, **fields})
+        pipe.xadd(RESULT_STREAM, message, maxlen=RESULT_STREAM_MAXLEN, approximate=True)
