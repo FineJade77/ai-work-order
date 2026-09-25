@@ -24,7 +24,7 @@ async def list_tickets(
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
     cursor: str | None = None,
 ) -> dict:
-    """Employees get their own tickets whatever the filters say; IT staff can filter the whole tenant."""
+    """Employees get their own tickets whatever the filters say; handlers can filter the whole tenant."""
     return await access.list(
         user, status=status, assignee_id=assignee_id, requester_id=requester_id, limit=limit, cursor=cursor
     )

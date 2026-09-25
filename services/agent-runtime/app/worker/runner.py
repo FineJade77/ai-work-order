@@ -82,7 +82,7 @@ class TaskRunner:
     async def _refuse_over_budget(self, task: AgentTask, events: Events) -> str:
         """Ends the turn with a fixed reply instead of retrying: until the budget day rolls over,
         every model call would be refused again. No ticket either: that needs the model for its
-        summary, and filing tickets on a budget outage would flood the IT queue.
+        summary, and filing tickets on a budget outage would flood the handlers' queue.
 
         The thread is left at the node that was refused. The conversation's next message is a
         new graph input, which discards that pending node, so nothing resumes it by accident.

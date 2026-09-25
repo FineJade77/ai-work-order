@@ -5,12 +5,18 @@
 #   scripts/demo.sh vpn        answer, "still broken" -> ticket
 #   scripts/demo.sh account    answer, "fixed, thanks" -> resolved, no ticket
 #   scripts/demo.sh email      answer, "still broken" -> ticket
-#   scripts/demo.sh printer    outside the three scenarios -> ticket straight away
+#   scripts/demo.sh printer    nothing in the knowledge base -> ticket straight away
+#   scripts/demo.sh leave      the northwind tenant, an HR/admin desk: answer, "still rejected" -> ticket
+#                              filed under northwind's own category (leave), not an IT one
 #
 # The model decides the replies, so wording (and occasionally the path) varies between runs.
 set -euo pipefail
 
 BASE="${BASE:-http://localhost:8001/v1}"
+if [ "${1:-}" = leave ]; then  # northwind's knowledge base is HR/admin, not IT
+  TENANT="${TENANT:-northwind}"
+  EMAIL="${EMAIL:-demo.user@northwind.example}"
+fi
 TENANT="${TENANT:-demo}"
 EMAIL="${EMAIL:-demo.user@example.com}"
 PASSWORD="${PASSWORD:-demo-password}"
@@ -20,7 +26,8 @@ case "${1:-}" in
   account) MESSAGES=("账号被锁定了，登录不了" "好了，可以登录了，谢谢") ;;
   email)   MESSAGES=("邮箱收不到邮件" "照着做了，还是收不到") ;;
   printer) MESSAGES=("打印机无法打印") ;;
-  *) echo "usage: $0 vpn|account|email|printer" >&2; exit 2 ;;
+  leave)   MESSAGES=("年假怎么申请" "按流程提交了，还是没通过") ;;
+  *) echo "usage: $0 vpn|account|email|printer|leave" >&2; exit 2 ;;
 esac
 
 TOKEN="$(curl -sf "$BASE/auth/login" -H 'content-type: application/json' \

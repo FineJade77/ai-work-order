@@ -50,7 +50,7 @@ async def test_tool_call_carries_runtime_context_and_idempotency_key():
         seen["body"], seen["key"] = json.loads(request.content), request.headers.get("Idempotency-Key")
         return httpx.Response(200, json={"status": "success", "result": {"ticket_id": "T"}})
 
-    tools = ToolGatewayClient(client(handler), "it_support_agent")
+    tools = ToolGatewayClient(client(handler), "service_agent")
     result = await tools.call(TASK, "create_ticket", {"summary": "s", "category": "vpn"}, idempotency_key="k")
     assert result == {"ticket_id": "T"}
     assert seen["key"] == "k"
@@ -58,7 +58,7 @@ async def test_tool_call_carries_runtime_context_and_idempotency_key():
         "tenant_id": str(TASK.tenant_id),
         "session_id": str(TASK.conversation_id),
         "user_id": str(TASK.user_id),
-        "agent_role": "it_support_agent",
+        "agent_role": "service_agent",
         "tool_name": "create_ticket",
         "arguments": {"summary": "s", "category": "vpn"},
     }

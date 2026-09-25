@@ -17,15 +17,17 @@ from app.graph.state import AgentState, Deps
 
 logger = logging.getLogger("agent_runtime.graph")
 
-HISTORY_WINDOW = 12  # messages sent to the model; older turns rarely matter for an IT question
+HISTORY_WINDOW = 12  # messages sent to the model; older turns rarely matter for the current question
 QUERY_MAX_CHARS = 200  # search_knowledge's schema limit
 SUMMARY_MAX_CHARS = 500  # create_ticket's schema limit
 # Pauses between up to three search attempts. Worst case, 3 x the 10s tool-gateway timeout plus
 # these, stays well inside task_timeout_seconds (60s) together with classify_intent.
 SEARCH_RETRY_DELAYS = (0.5, 1.0)
 
-INTENTS = {"in_scope", "out_of_scope", "ticket_request", "chitchat"}
-CATEGORIES = {"vpn", "account", "email", "other"}
+INTENTS = {"question", "ticket_request", "chitchat"}
+# A ticket's category when no knowledge entry was used (tool-gateway caps categories at 50 chars).
+FALLBACK_CATEGORY = "other"
+CATEGORY_MAX_CHARS = 50
 RESOLUTIONS = {"resolved", "unresolved", "new_question"}
 
 _JSON_OBJECT = re.compile(r"\{.*\}", re.DOTALL)
@@ -54,17 +56,14 @@ def _parse_json(text: str) -> dict:
 async def classify_intent(state: AgentState, runtime: Runtime[Deps]) -> dict:
     deps = runtime.context
     raw = await deps.models.complete(deps.task, system_prompt=prompts.CLASSIFY, messages=_history(state))
-    parsed = _parse_json(raw)
-    intent, category = parsed.get("intent"), parsed.get("category")
+    intent = _parse_json(raw).get("intent")
     if intent not in INTENTS:
         # Unreadable output: ask the employee to describe the problem rather than guess.
         logger.warning("unparseable classification task_id=%s output=%r", deps.task.task_id, raw[:200])
         intent = "chitchat"
-    if category not in CATEGORIES:
-        category = "other"
-    if intent == "in_scope" and category == "other":
-        intent = "out_of_scope"
-    return {"intent": intent, "category": category}
+    # A new question within the same run (check_resolution -> new_question) must not inherit the
+    # previous question's search results or the category taken from them.
+    return {"intent": intent, "category": None, "knowledge": None, "knowledge_error": None}
 
 
 async def retrieve_knowledge(state: AgentState, runtime: Runtime[Deps]) -> dict:
@@ -77,7 +76,8 @@ async def retrieve_knowledge(state: AgentState, runtime: Runtime[Deps]) -> dict:
     for attempt, delay in enumerate((*SEARCH_RETRY_DELAYS, None), start=1):
         try:
             result = await deps.tools.call(deps.task, "search_knowledge", {"query": query})
-            return {"knowledge": result["results"], "knowledge_error": None}
+            hits = result["results"]
+            return {"knowledge": hits, "knowledge_error": None, "category": _category_of(hits)}
         except Exception as exc:
             failure = classify_failure(exc)
             if failure is None:
@@ -93,7 +93,17 @@ async def retrieve_knowledge(state: AgentState, runtime: Runtime[Deps]) -> dict:
         "knowledge_unavailable tenant_id=%s task_id=%s code=%s attempts=%d",
         deps.task.tenant_id, deps.task.task_id, failure.code, attempt,
     )
-    return {"knowledge": None, "knowledge_error": failure.code}
+    return {"knowledge": None, "knowledge_error": failure.code, "category": None}
+
+
+def _category_of(hits: list[dict]) -> str | None:
+    """The ticket category, should this question end in one: that of the best-matching entry.
+    Categories are the tenant's own labels (vpn, leave, expense...), so nothing is checked
+    against a list; a missing or oversized one falls back rather than fail the ticket later."""
+    category = hits[0].get("category") if hits else None
+    if isinstance(category, str) and 0 < len(category) <= CATEGORY_MAX_CHARS:
+        return category
+    return None
 
 
 async def generate_answer(state: AgentState, runtime: Runtime[Deps]) -> dict:
@@ -156,8 +166,8 @@ async def summarize_ticket(state: AgentState, runtime: Runtime[Deps]) -> dict:
     summary = (await deps.models.complete(deps.task, system_prompt=prompts.SUMMARY, messages=_history(state))).strip()
     if not summary:
         summary = _last_user_message(state)
-    if state.get("intent") == "out_of_scope":
-        summary = prompts.OUT_OF_SCOPE_MARKER + summary
+    if state.get("knowledge") == []:  # searched, nothing found (not: never searched, or search down)
+        summary = prompts.NO_KNOWLEDGE_MARKER + summary
     return {"ticket_summary": summary[:SUMMARY_MAX_CHARS]}
 
 
@@ -169,7 +179,7 @@ async def create_ticket(state: AgentState, runtime: Runtime[Deps]) -> dict:
     result = await deps.tools.call(
         deps.task,
         "create_ticket",
-        {"summary": state["ticket_summary"], "category": state.get("category") or "other"},
+        {"summary": state["ticket_summary"], "category": state.get("category") or FALLBACK_CATEGORY},
         idempotency_key=key,
     )
     ticket_id = result["ticket_id"]
@@ -180,9 +190,9 @@ async def create_ticket(state: AgentState, runtime: Runtime[Deps]) -> dict:
 
 def route_after_classify(state: AgentState) -> str:
     return {
-        "in_scope": "retrieve_knowledge",
+        "question": "retrieve_knowledge",
         "chitchat": "reply",
-    }.get(state["intent"], "summarize_ticket")  # out_of_scope, ticket_request
+    }.get(state["intent"], "summarize_ticket")  # ticket_request
 
 
 def route_after_retrieve(state: AgentState) -> str:

@@ -91,7 +91,7 @@ async def worker(redis, settings):
     http = httpx.AsyncClient(
         base_url=TOOL_GATEWAY_URL, headers={"Authorization": f"Bearer {TOOL_GATEWAY_TOKEN}"}, timeout=10
     )
-    w = Worker(redis, settings, CrashingTools(ToolGatewayClient(http, "it_support_agent")), FakeModels())
+    w = Worker(redis, settings, CrashingTools(ToolGatewayClient(http, "service_agent")), FakeModels())
     try:
         await w.start()
     except PoolTimeout as exc:
@@ -113,7 +113,8 @@ def _cleanup(conversation, user):
         for table in ("tool_calls", "tool_call_logs"):
             db.execute(f"DELETE FROM {table} WHERE session_id = %s", (thread,))
     with psycopg.connect(TICKET_ADMIN_DB_URL, autocommit=True) as db:
-        db.execute("DELETE FROM tickets WHERE tenant_id = %s AND requester_id = %s", (str(TENANT), str(user)))
+        # By conversation, not tenant: a test may run as another tenant (see the HR test below).
+        db.execute("DELETE FROM tickets WHERE conversation_id = %s", (thread,))
 
 
 def _tickets(conversation):
@@ -170,7 +171,7 @@ async def test_answer_then_unresolved_feedback_files_one_ticket_across_a_restart
 
 
 async def test_crash_after_the_ticket_was_created_does_not_file_a_second_one(worker):
-    worker.models.intent, worker.models.category = "ticket_request", "account"
+    worker.models.intent = "ticket_request"
     worker.tools.crash_after_create = 1
 
     events = await send(worker, "账号被锁了，直接帮我提工单")
@@ -192,7 +193,7 @@ async def test_stale_copy_of_an_older_turn_is_skipped(worker, floor):
     feedback. With the floor lost (Redis failover), the checkpointed seq still refuses it."""
     await send(worker, "VPN 连不上")
     first = worker.last_task
-    worker.models.resolution, worker.models.category = "new_question", "email"
+    worker.models.resolution = "new_question"
     events = await send(worker, "邮箱无法收发邮件")
     assert events[-1][1] == {"outcome": "awaiting_feedback"}
     events_before = await worker.redis.xlen(event_stream_key(worker.conversation))
@@ -238,3 +239,18 @@ async def test_budget_refusal_is_acknowledged_not_retried(worker):
     ]
     assert (await worker.redis.xpending(TASK_STREAM, CONSUMER_GROUP))["pending"] == 0
     assert worker.models.calls == ["classify"]  # refused once, not retried
+
+
+NORTHWIND = uuid.UUID("9b2d6c1a-4e7f-4a3b-8c5d-2f1e0a9b8c7d")  # demo data: an HR/admin knowledge base
+
+
+async def test_an_hr_tenant_files_tickets_under_its_own_categories(worker):
+    """Nothing IT-specific is built in: the category comes from the tenant's knowledge data."""
+    events = await send(worker, "年假怎么申请", tenant_id=NORTHWIND)
+    assert events[0] == ("retrieving", {}) and events[-1] == ("done", {"outcome": "awaiting_feedback"})
+
+    worker.models.resolution = "unresolved"
+    events = await send(worker, "按流程提交了还是没通过", tenant_id=NORTHWIND)
+    assert [t for t, _ in events] == ["ticket_created", "done"]
+    [(_, _, category, _)] = _tickets(worker.conversation)
+    assert category == "leave"

@@ -21,10 +21,12 @@ def test_valid_arguments_pass():
     assert validate_arguments("create_ticket", {"summary": "VPN 连不上", "category": "vpn"}) is None
 
 
-def test_enum_violation_names_the_field_and_allowed_values():
-    message = validate_arguments("create_ticket", {"summary": "打印机坏了", "category": "printer"})
-    assert message.startswith("category:")
-    assert "'vpn'" in message
+def test_category_is_any_tenants_own_label_within_bounds():
+    # Not a fixed list: an HR tenant's categories are as valid as an IT tenant's.
+    for category in ("vpn", "leave", "expense", "other"):
+        assert validate_arguments("create_ticket", {"summary": "s", "category": category}) is None
+    for category in ("", "x" * 51):
+        assert validate_arguments("create_ticket", {"summary": "s", "category": category}).startswith("category:")
 
 
 def test_unexpected_property_is_rejected():

@@ -39,7 +39,7 @@ class User(Base):
     tenant_id: Mapped[uuid.UUID] = _tenant_fk()
     name: Mapped[str] = mapped_column(Text, nullable=False)
     email: Mapped[str] = mapped_column(Text, nullable=False)
-    role: Mapped[str] = mapped_column(Text, nullable=False, server_default="employee")  # employee | it_staff
+    role: Mapped[str] = mapped_column(Text, nullable=False, server_default="employee")  # employee | handler
     password_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = _created_at()
 

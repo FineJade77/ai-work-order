@@ -31,7 +31,7 @@ def test_policy_errors_are_returned_to_the_model(call):
     cases = [
         (call("drop_database", {}), "UNKNOWN_TOOL"),
         (call("create_ticket", TICKET_ARGS, key=str(uuid.uuid4()), role="guest"), "TOOL_NOT_ALLOWED"),
-        (call("create_ticket", {"summary": "x", "category": "printer"}, key=str(uuid.uuid4())), "INVALID_ARGUMENTS"),
+        (call("create_ticket", {"summary": "x", "category": ""}, key=str(uuid.uuid4())), "INVALID_ARGUMENTS"),
     ]
     for resp, code in cases:
         assert resp.status_code == 200
@@ -47,7 +47,7 @@ def test_caller_contract_violations_are_http_errors(call):
 
 def test_search_goes_to_knowledge_service_for_the_callers_tenant(demo_call, call):
     results = demo_call("search_knowledge", {"query": "VPN 连不上"}).json()["result"]["results"]
-    assert results[0]["question"] == "VPN 连不上怎么办？"
+    assert (results[0]["question"], results[0]["category"]) == ("VPN 连不上怎么办？", "vpn")
     # The throwaway tenant has no knowledge data: same query, nothing found.
     assert call("search_knowledge", {"query": "VPN 连不上"}).json()["result"]["results"] == []
 

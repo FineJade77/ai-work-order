@@ -42,7 +42,7 @@ async def wait_for(predicate, timeout=10):
 async def test_login_and_profile(client, tenant, login):
     headers = await login(tenant.ivan)
     me = (await client.get("/v1/me", headers=headers)).json()
-    assert (me["email"], me["role"], me["tenant_id"]) == (tenant.ivan.email, "it_staff", str(tenant.id))
+    assert (me["email"], me["role"], me["tenant_id"]) == (tenant.ivan.email, "handler", str(tenant.id))
 
 
 @pytest.mark.parametrize("field", ["tenant", "email", "password"])
@@ -107,9 +107,9 @@ async def test_late_answer_replaces_a_failure_notice(client, redis, tenant, logi
     await report(redis, tenant, conversation, task_id, status="failed", error_code="TASK_FAILED", content="处理失败")
     await wait_for(lambda: _history_when(client, alice, conversation, lambda h: len(h["messages"]) == 2))
     await report(redis, tenant, conversation, task_id, status="done", outcome="ticket_created",
-                 content="已为你创建 IT 工单", ticket_id=ticket_id)
+                 content="已为你创建工单", ticket_id=ticket_id)
     final = await wait_for(
-        lambda: _history_when(client, alice, conversation, lambda h: h["messages"][-1]["content"] == "已为你创建 IT 工单")
+        lambda: _history_when(client, alice, conversation, lambda h: h["messages"][-1]["content"] == "已为你创建工单")
     )
     assert len(final["messages"]) == 2
     row = admin_db.execute("SELECT status, outcome, ticket_id::text FROM turns WHERE id = %s", (task_id,)).fetchone()

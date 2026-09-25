@@ -53,7 +53,7 @@ async def test_lifecycle_through_the_bff(client, tenant, login, file_ticket):
     ticket = file_ticket(tenant.alice)
 
     refused = await act(client, alice, ticket, "start")
-    assert (refused.status_code, refused.json()["error"]["code"]) == (403, "NOT_IT_STAFF")
+    assert (refused.status_code, refused.json()["error"]["code"]) == (403, "NOT_HANDLER")
 
     ticket = (await act(client, ivan, ticket, "start")).json()
     assert (ticket["status"], ticket["assignee_id"]) == ("in_progress", str(tenant.ivan.id))  # start = take it yourself
@@ -76,7 +76,7 @@ async def test_lifecycle_through_the_bff(client, tenant, login, file_ticket):
     ]
 
 
-async def test_it_staff_cannot_close_on_the_requesters_behalf(client, tenant, login, file_ticket):
+async def test_a_handler_cannot_close_on_the_requesters_behalf(client, tenant, login, file_ticket):
     ivan = await login(tenant.ivan)
     ticket = file_ticket(tenant.alice)
     resp = await act(client, ivan, ticket, "cancel")

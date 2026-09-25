@@ -15,7 +15,7 @@ from app.db.session import tenant_scope
 
 # Fixed IDs shared with the other services' demo data; no cross-database FK enforces them.
 DEMO_TENANTS = ["e0e112f3-5afb-4229-869b-c0bd012324bb", "9b2d6c1a-4e7f-4a3b-8c5d-2f1e0a9b8c7d"]
-AGENT_ROLE = "it_support_agent"
+AGENT_ROLE = "service_agent"
 ROLE_TOOLS = ["search_knowledge", "create_ticket"]
 
 

@@ -16,8 +16,9 @@ class AgentState(TypedDict, total=False):
     seq: int
     # {"role": "user" | "assistant", "content": str}
     messages: Annotated[list[dict], operator.add]
-    intent: str | None  # in_scope | out_of_scope | ticket_request | chitchat
-    category: str | None  # vpn | account | email | other (create_ticket's category enum)
+    intent: str | None  # question | ticket_request | chitchat
+    # The tenant's own label (vpn, leave...) from the best knowledge hit; the ticket's category.
+    category: str | None
     knowledge: list[dict] | None
     # Set when the search itself failed (vs. succeeding with no hits); the code of the last failure.
     knowledge_error: str | None

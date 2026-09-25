@@ -37,11 +37,11 @@ def admin_db():
 
 @pytest.fixture
 def tenant(admin_db):
-    """A throwaway tenant with two employees and one IT staff member, removed afterwards."""
+    """A throwaway tenant with two employees and one handler, removed afterwards."""
     t = SimpleNamespace(id=uuid.uuid4(), slug=f"it-{uuid.uuid4().hex[:12]}")
     admin_db.execute("INSERT INTO tenants (id, name, slug) VALUES (%s, %s, %s)", (t.id, "Integration", t.slug))
     password_hash = hash_password(PASSWORD, n=2**14)  # cheap: the stored hash carries its own cost
-    for name, role in (("alice", "employee"), ("bob", "employee"), ("ivan", "it_staff")):
+    for name, role in (("alice", "employee"), ("bob", "employee"), ("ivan", "handler")):
         user = SimpleNamespace(id=uuid.uuid4(), email=f"{name}@{t.slug}.example", role=role)
         admin_db.execute(
             "INSERT INTO users (id, tenant_id, name, email, role, password_hash) VALUES (%s, %s, %s, %s, %s, %s)",

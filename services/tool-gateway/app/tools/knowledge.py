@@ -25,16 +25,18 @@ async def _handle(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
         params={"tenant_id": ctx.tenant_id, "q": args["query"], "limit": RESULT_LIMIT},
     )
     resp.raise_for_status()
+    # category is passed on because a ticket filed after this answer is categorised by it.
     return {
         "results": [
-            {"question": r["question"], "answer": r["answer"], "score": r["score"]} for r in resp.json()["results"]
+            {"category": r["category"], "question": r["question"], "answer": r["answer"], "score": r["score"]}
+            for r in resp.json()["results"]
         ]
     }
 
 
 SEARCH_KNOWLEDGE = ToolSpec(
     name="search_knowledge",
-    description="在企业 IT 知识库中检索与员工问题相关的问答条目。回答员工 IT 问题前应先调用。",
+    description="在企业知识库中检索与员工问题相关的问答条目。回答员工的问题前应先调用。",
     parameters={
         "type": "object",
         "properties": {

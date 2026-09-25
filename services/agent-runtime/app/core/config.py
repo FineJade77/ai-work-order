@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     ai_gateway_service_token: str
 
     # Must match the role bound to the tools in tool-gateway's role_tool_bindings.
-    agent_role: str = "it_support_agent"
+    agent_role: str = "service_agent"
     # Tasks run concurrently within one process; they spend nearly all their time waiting on I/O.
     worker_concurrency: int = 8
     # Must be task_timeout < conversation_lock < claim_idle (checked below):

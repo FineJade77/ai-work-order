@@ -7,8 +7,8 @@
 构建一个面向企业内部员工的**智能工单系统**：
 
 1. 员工提出问题（如"VPN 连不上"），系统优先通过企业知识库检索并生成回答（RAG 问答）。
-2. 若知识库回答无法解决问题，系统引导/自动将问题转化为 IT 工单，进入人工处理流程。
-3. 第一期只需覆盖部分场景（如 VPN、账号、邮箱等常见 IT 问题），后续逐步扩展知识库覆盖面和自动化能力。
+2. 若知识库回答无法解决问题，系统引导/自动将问题转化为工单，进入人工处理流程。
+3. 不限于 IT：每个租户（企业/部门）的知识库决定它能自助解答哪些问题（IT、人事、行政……），代码里不写死任何领域或类别。V1 的演示数据是 `demo` 租户的 IT 服务台（VPN、账号、邮箱）和 `northwind` 租户的 HR/行政（请假、报销、门禁……），后续逐步扩展知识库覆盖面和自动化能力。
 4. 系统需部署到云端，具备**弹性扩缩容**和**多租户**能力，支撑多个企业/多个部门作为独立租户使用同一套系统。
 
 ## 2. 总体架构
@@ -21,7 +21,7 @@ API Gateway【V1 未部署：JWT 校验和发消息限流由 app-service 自己�
   │
   ▼
 app-service
-  ├─ HTTP：员工"我的工单"、IT 处理（查询 / 状态流转）──────────▶ ticket-service
+  ├─ HTTP：员工"我的工单"、处理人处理（查询 / 状态流转）────────▶ ticket-service
   ├─ XADD agent_tasks（同一事务提高会话下限）─────────────────▶ Redis
   ├─ 消费 agent_results：回复落库、关闭轮次 ◀───────────────── Redis
   └─ 读 conversation:{id}:events，经 SSE 推给浏览器 ◀───────── Redis
@@ -60,20 +60,20 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
 - 技术选型建议：Node.js(NestJS) 或 Python(FastAPI)，与 Agent Runtime（Python/LangGraph）同语言时集成成本最低，**推荐 FastAPI**。
 - 核心领域模型：
   - `Tenant`：租户，带唯一的 `slug`（登录时用来确定租户）
-  - `User`：用户（属于某租户），角色 `employee` / `it_staff`，scrypt 密码哈希
+  - `User`：用户（属于某租户），角色 `employee` / `handler`（处理人：处理本租户工单的人，不限于 IT；V1 可以处理本租户所有工单，按类别分组待做；由 `it_staff` 改名，迁移 0005，改名前签发的 JWT 带旧角色，会被拒绝，需重新登录），scrypt 密码哈希
   - `Conversation` / `Message`：问答会话
   - `Turn`：一条用户消息及其处理状态（`queued/done/failed`），`id` 就是投递给 Agent Runtime 的 `task_id`，`seq` 是它在会话内的序号（1、2、3…，唯一约束）；部分唯一索引保证同一会话同时只有一轮在处理
-  - 工单不在这里：归 ticket-service 所有（见 3.7 节）。员工"我的工单"、IT 人员处理工单的页面由应用服务调用 ticket-service 的内部接口实现，`start`/`resolve` 这类 IT 操作的角色权限也在应用服务里判断。
+  - 工单不在这里：归 ticket-service 所有（见 3.7 节）。员工"我的工单"、处理人处理工单的页面由应用服务调用 ticket-service 的内部接口实现，`start`/`resolve` 这类处理人操作的角色权限也在应用服务里判断。
 - 核心业务流程（问答与建单的判断都在 Agent Runtime，应用服务不调用 Tool Gateway）：
   1. 员工发消息 → 在同一事务里写用户消息和 `Turn`，把任务投递到 `agent_tasks` → 返回 202。
-  2. Agent Runtime 执行状态图：检索知识库并回答、等员工反馈；场景外、要求提单、检索无命中或反馈没解决时，由 Agent 经 Tool Gateway 建单（3.3 节）。
+  2. Agent Runtime 执行状态图：检索知识库并回答、等员工反馈；要求提单、检索无命中或反馈没解决时，由 Agent 经 Tool Gateway 建单（3.3 节）。
   3. 应用服务把执行事件经 SSE 转给前端，并从 `agent_results` 把这一轮的回复（回答、固定回复或建单通知）落库、关闭轮次。
 - 登录与鉴权：`POST /v1/auth/login {tenant, email, password}`，先按 slug 查租户（`tenants` 无 RLS），再在租户作用域内查用户；三种失败统一 401，账号不存在时也做一次假校验，耗时一致。签发 HS256 JWT（`sub/tid/role`，8 小时，无刷新），之后所有接口的租户和用户只取自 JWT。scrypt 在线程里执行，并限制同时最多 4 个（每个约 128 MiB）。以后上 API Gateway 时改 RS256。
 - 发消息限流：每个员工每分钟 6 条、每天 200 条（可配置），Redis 固定窗口计数，在写库之前检查，超出返回 429 `RATE_LIMITED` 带 `Retry-After`；只限发消息（每条消息要调 2–3 次模型），建会话不限。Redis 不可用时放行。
 - 会话接口：`POST/GET /v1/conversations`、`GET /v1/conversations/{id}/messages`（含进行中的 `active_task_id`，页面刷新后可重新接上 SSE）、`POST .../messages`（202 `{task_id}`；上一轮未结束返回 409 `TURN_IN_PROGRESS`）、`GET .../stream?task_id=`（SSE）。会话只有本人可见，其他人一律 404。
 - 回复落库：后台消费 `agent_results`（消费组 `app_service`），按轮次 upsert 唯一的助手消息并关闭轮次，可重复投递；不依赖 SSE 连接。晚到的结果只在该轮仍是会话最新一轮时覆盖此前的失败提示；员工已经发了新消息的，丢弃并记日志，免得旧回答插到新消息后面。
 - 补偿：每 30 秒一次（advisory lock 保证只有一个副本在扫），把 `queued` 超过 10 分钟的轮次用同一个 `task_id` 和 `seq` 重新入队，最多 2 次，之后标记失败并写 `error` 事件。阈值必须大于 Agent Runtime 自身重试的最长时间：3 次 ×（接管空闲 90 秒 + 扫描间隔 10 秒 + 任务超时 60 秒）= 480 秒，配置里强制校验；否则只是慢的任务会被复制一份，与原任务赛跑。
-- 工单页面（BFF）：员工的列表固定按本人过滤，看别人的工单返回 404；`start`/`resolve` 只允许 `it_staff`，`start` 固定指派给自己；`actor_id` 总是当前用户。ticket-service 的业务错误（400/403/404/409）原样透传。
+- 工单页面（BFF）：员工的列表固定按本人过滤，看别人的工单返回 404；`start`/`resolve` 只允许 `handler`（否则 403 `NOT_HANDLER`），`start` 固定指派给自己；`actor_id` 总是当前用户。ticket-service 的业务错误（400/403/404/409）原样透传。
 - 对 Agent Runtime 是**异步任务分发**：应用服务不直接同步调用 Agent Runtime，而是把任务（`task_id`、`seq`、`conversation_id`、`tenant_id`、`user_id` 和这条消息的内容；历史在 Agent 的 checkpoint 里，不随任务传）写入 Redis Streams 队列即返回；随后从该会话的事件 Stream（`conversation:{conversation_id}:events`）读取 Agent Runtime 陆续写入的中间事件（"正在检索知识库…"、增量 token、最终结果）通过 SSE 转发给前端。对前端而言体验仍是"流式返回"，但应用服务与 Agent Runtime 之间是解耦的异步关系，见 3.3 节。
 
 ### 3.3 Agent Runtime（LangGraph）
@@ -89,16 +89,18 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
   3. 队列深度是比 CPU/内存更贴合负载本质的扩缩容信号，可用 **KEDA 的 redis-streams scaler** 按 `agent_tasks` 队列长度精确扩缩容 Worker 副本数。
   4. 代价是多了一跳队列延迟（通常几十毫秒，相对 LLM 秒级延迟可忽略）和一套需要运维的组件；队列、事件流、会话锁都放在同一个 Redis 实例里，不新增基础设施种类。
 - 用 LangGraph 构建一个**固定状态图**（不做 ReAct 自由调工具：AI Gateway 只有文本流接口，V1 流程固定，固定图更可测），节点：
-  1. `classify_intent`：LLM 判断意图（三个场景内 / 场景外 / 明确要求开工单 / 寒暄或描述不清）和类别（`vpn/account/email/other`，即 `create_ticket` 的 category 枚举）。输出解析失败按"描述不清"处理。
-  2. `retrieve_knowledge`：调用 Tool Gateway 的 `search_knowledge`；无命中直接转工单，不让模型硬答。
+  1. `classify_intent`：LLM 只判断意图：`question`（求助/咨询）、`ticket_request`（明确要求提单或转人工）、`chitchat`（寒暄或描述不清）。不判断领域和类别，提示词里不出现任何具体业务。输出解析失败按"描述不清"处理。进入分诊时清空上一个问题的检索结果和类别（同一轮里提出新问题时不继承）。
+  2. `retrieve_knowledge`：调用 Tool Gateway 的 `search_knowledge`；无命中直接转工单，不让模型硬答。命中时把第一条的 `category` 记为这个问题的类别——以后若因此建单，就用它作为工单类别。
      - 检索失败不等于无命中：否则知识库故障、或新租户漏配工具绑定，会把每个问题都静默变成工单。临时性故障（`TOOL_ERROR`、连不上/超时、5xx）在节点内最多试 3 次（间隔 0.5s、1s）；配置类错误（`TOOL_NOT_ALLOWED`/`UNKNOWN_TOOL`/`INVALID_ARGUMENTS`、其他 4xx）不重试。仍失败则进入 `knowledge_unavailable`：固定回复"知识库暂时无法访问，可稍后重问或回复「提工单」"，outcome 为 `knowledge_unavailable`，不建单、不等待反馈（下一条消息重新分类）。每次降级记一条 `knowledge_unavailable tenant_id=… code=… attempts=…` 的 ERROR 日志，供告警匹配。
   3. `generate_answer`：调用 AI Gateway 基于检索结果生成回答，流式写出事件。
   4. `await_feedback`：LangGraph `interrupt()`，本轮结束；同一会话的下一条消息作为 resume 值继续。
   5. `check_resolution`：LLM 根据员工回复判断已解决 / 没解决 / 新问题（新问题回到 `classify_intent`）；解析失败按"没解决"处理。
   6. `summarize_ticket` → `create_ticket`：先由 LLM 写工单描述（问题、现象、已尝试的知识库方案），再调用 Tool Gateway 创建工单。两步分开，是为了崩溃重跑时发出的建单请求完全相同。
-  - 场景外、明确要求开工单、检索无命中、反馈没解决，都**自动建单**；寒暄或描述不清回复固定引导语；检索不可用回复固定说明、不建单。
+  - 明确要求开工单、检索无命中、反馈没解决，都**自动建单**；寒暄或描述不清回复固定引导语；检索不可用回复固定说明、不建单。
+  - 能自助解答的范围由租户的知识库决定，没有"场景内/场景外"清单：知识库没有的问题检索不到，就转人工。
+  - 工单类别：来自命中条目的 `category`（租户自己的标签，如 `vpn`、`leave`、`expense`）；没检索过（直接要求提单）、没命中、或条目的类别为空/超过 50 字时用 `other`。检索过却没命中的工单，描述前加 `[知识库未命中]`。
 - 状态持久化：LangGraph checkpoint 存 **Postgres**（独立的 `agent_runtime` 库，`AsyncPostgresSaver`），`thread_id = conversation_id`，多轮历史就在图状态里，任务里只带最新一条消息。表结构由 langgraph-checkpoint-postgres 管理（迁移任务里跑 `setup()`，不走 Alembic）；表里没有 `tenant_id`，不做 RLS，只有 Agent Runtime 能连这个库。
-- 任务契约：`agent_tasks` 消息字段 `task_id, seq, conversation_id, tenant_id, user_id, content`，由应用服务写入；投递时在同一个 Redis 事务里把会话下限 `agent:floor:{conversation_id}` 提高到这个 `seq`（只升不降，24 小时过期）。调用 Tool Gateway 时 `session_id = conversation_id`，`user_id` 原样透传，`agent_role` 取配置（`it_support_agent`）。
+- 任务契约：`agent_tasks` 消息字段 `task_id, seq, conversation_id, tenant_id, user_id, content`，由应用服务写入；投递时在同一个 Redis 事务里把会话下限 `agent:floor:{conversation_id}` 提高到这个 `seq`（只升不降，24 小时过期）。调用 Tool Gateway 时 `session_id = conversation_id`，`user_id` 原样透传，`agent_role` 取配置（`service_agent`）。
 - 崩溃恢复与不重复建单：
   - 每个任务结束时，在写 `done`/`error` 事件的同一个 Redis 事务里，向全局 `agent_results` Stream 写一条结果（状态、outcome、这一轮唯一的助手消息、ticket_id），应用服务用消费组消费并落库，不依赖浏览器是否还连着。
   - 图跑到结束或 interrupt、并写出 `done` 事件后才 XACK；未确认的消息空闲超过阈值后由任一 Worker 用 XAUTOCLAIM 接管，投递超过 3 次进死信 `agent_tasks:dead` 并写 `error` 事件。
@@ -109,10 +111,10 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
     1. 拿到会话锁后，`seq` 低于 Redis 会话下限的任务跳过——挡住"旧副本先于新任务拿到锁"的情况；
     2. 图状态里记录最近一轮的 `seq`（与 `task_id` 同时写入），`seq` 更小的任务跳过——Redis 丢了下限时的兜底。
   - 时序约束 `任务超时(60s) < 会话锁 TTL(75s) < 接管空闲阈值(90s)`，配置里强制校验：锁要比任何存活的运行更久；被 kill 的 Worker 留下的锁要在任务被接管前过期，否则接管会白白消耗投递次数。接管阈值同时大于 Tool Gateway 的 running 过期时间（60s）。
-- 预算用完：AI Gateway 返回 429 `TOKEN_BUDGET_EXCEEDED` 时，runner 用固定回复结束这一轮（outcome `budget_exceeded`），任务 ACK 不重试——当天再试也会被拒；不建单（写工单描述要用模型，且额度耗尽时自动建单会冲垮 IT 队列）。线程停在被拒的节点上，同一会话的下一条消息作为新输入会丢弃它。每次记 `budget_exceeded tenant_id=…` 的 ERROR 日志供告警。
+- 预算用完：AI Gateway 返回 429 `TOKEN_BUDGET_EXCEEDED` 时，runner 用固定回复结束这一轮（outcome `budget_exceeded`），任务 ACK 不重试——当天再试也会被拒；不建单（写工单描述要用模型，且额度耗尽时自动建单会冲垮处理人的队列）。线程停在被拒的节点上，同一会话的下一条消息作为新输入会丢弃它。每次记 `budget_exceeded tenant_id=…` 的 ERROR 日志供告警。
 - 进程形态：单进程内按信号量并发跑多个任务（默认 8，都是 IO 等待）；`/healthz` 只给探针用，不建 Service。任务队列放在 `TaskQueue` 接口后面，以后换 RabbitMQ 只改这一层。
 - 多租户：图的运行时上下文携带 `tenant_id`，所有工具调用、模型调用都需透传。租户级差异 V1 只有两处：知识库内容（knowledge-service 按租户分组）和工具绑定（Tool Gateway `role_tool_bindings`）；按租户自定义系统提示词、模型档位【V1 未实现】，提示词写死在 `app/graph/prompts.py`。
-- 第一期场景范围：VPN、账号密码、邮箱三个场景，由 `classify_intent` 的提示词判断（不是配置项），场景外的问题直接转人工工单，而非勉强让模型作答。
+- 助手身份和回复文案是通用的（"员工服务助手"、"已转给相关同事"），不提 IT；按租户自定义助手名称和开场白【V1 未实现】。
 
 ### 3.4 Tool Gateway（工具策略网关）
 - 定位：Agent Runtime 与真实世界之间的**唯一策略执行点**。Agent Runtime 是多副本无状态 Worker，权限、幂等如果放在 Worker 里，每个副本各管一份就失效了，所以集中在这里。
@@ -125,8 +127,9 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
 - 幂等分两层：网关 `tool_calls` 表覆盖普通重试；执行完成但结果未落盘就崩溃的窗口，靠卡住的 `running` 记录超时后可被重新占位、再执行，因此下游也必须幂等（`create_ticket` 把同一个键透传给 ticket-service 的内部建单接口）。只读工具不写 `tool_calls`。
 - 下游：`search_knowledge` 调 knowledge-service（3.6 节）；`create_ticket` 调 ticket-service（3.7 节），`TicketProvider` 的内部实现和未来的 Jira 实现都是"调用工单系统的 HTTP 接口"，形态一致。
 - 运行时上下文：`/v1/tools/call` 除 `session_id` 外还要求 `user_id`（当前员工），由 Agent Runtime 提供，模型看不到；`create_ticket` 用它作为提单人 `requester_id`，审计日志也记录它，并参与幂等请求指纹。
-- 脱敏：返回体只屏蔽 password/token 等凭据字段（知识库内容里的 IT 值班电话是员工需要的）；审计记录额外对手机号/邮箱/身份证做正则脱敏。
-- 核心工具（v1）：`search_knowledge(query)`、`create_ticket(summary, category)`。
+- 脱敏：返回体只屏蔽 password/token 等凭据字段（知识库内容里的值班电话这类联系方式是员工需要的）；审计记录额外对手机号/邮箱/身份证做正则脱敏。
+- 核心工具（v1）：`search_knowledge(query)`（结果含每条的 `category`）、`create_ticket(summary, category)`。`category` 是 1–50 字的任意字符串，不是固定枚举：各租户的类别由其知识库决定。
+- Agent 角色：V1 只有一个 `service_agent`（迁移 0003 由 `it_support_agent` 改名；`tool_calls`、`tool_call_logs` 里的历史记录保留当时的角色名）。
 - **V1 暂不做、已有设计可恢复**（实现见提交 `f36530d`）：
   - HITL 审批：`pending_approval` 状态、审批接口、`tool_approvals` 表、Redis Stream 恢复事件。等出现重置密码/解锁账号/开通权限这类高风险工具时再加。
   - Redis 令牌桶限流：V1 工具都是 PG 查询、量小；按用户限流 V1 在应用服务的发消息接口（3.2 节），部署 API Gateway 后可移过去；Agent 死循环靠 LangGraph `recursion_limit`。
@@ -146,17 +149,17 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
 ### 3.6 知识库服务（knowledge-service）
 - 定位：知识检索的唯一出口，V1 **只读、只有检索一个接口**，不做 RAG/向量。
 - 接口：`GET /internal/v1/knowledge/search?tenant_id&q&limit`（服务令牌鉴权）→ `{results: [{id, category, question, answer, score}]}`。
-- 数据：`app/data/knowledge.json`，按租户 ID 分组、随镜像发布，改内容要重新部署。未知租户返回空列表（租户注册表归应用服务）。
+- 数据：`app/data/knowledge.json`，按租户 ID 分组、随镜像发布，改内容要重新部署。未知租户返回空列表（租户注册表归应用服务）。每个条目的 `category` 由租户自己定，也就是它的工单类别；演示数据里 `demo` 是 IT（`vpn/account/email/other`），`northwind` 是 HR/行政（`leave/expense/access/facility/payroll`）。
 - 匹配：查询的字符二元组在条目问题中的覆盖率，与在答案中的覆盖率乘以权重取较大者；问题中包含完整查询词时记 1.0；低于 0.3 的丢弃（没有命中就走建单）。不需要中文分词，结果确定、可测。
 - 扩展点：`KnowledgeRepository` 接口，V1 实现是 `StaticKnowledgeRepository`；换成数据库或向量检索时接口不变，Tool Gateway 无感知。
 - 无状态、无数据库，扩容就是加副本。
 
 ### 3.7 工单服务（ticket-service）
-- 定位：工单数据与生命周期的唯一所有者；Tool Gateway（Agent 建单）和应用服务（员工/IT 页面）都通过它的内部接口操作工单。
+- 定位：工单数据与生命周期的唯一所有者；Tool Gateway（Agent 建单）和应用服务（员工/处理人页面）都通过它的内部接口操作工单。`category` 是自由文本（最长 50 字），不校验取值。
 - 状态机（4 个状态，"重新打开"是动作不是状态）：
   - `open --start(指定处理人)--> in_progress --resolve(必须填写说明)--> resolved --close--> closed`
   - `open --cancel--> closed`、`resolved --reopen--> open`
-  - `cancel`/`close`/`reopen` 只能由提单人本人执行（服务自己校验 `actor_id == requester_id`）；`start`/`resolve` 的 IT 角色权限由应用服务判断。
+  - `cancel`/`close`/`reopen` 只能由提单人本人执行（服务自己校验 `actor_id == requester_id`）；`start`/`resolve` 的处理人权限由应用服务判断。
 - 接口（`/internal/v1`，服务令牌鉴权）：
   - `POST /tickets`（`Idempotency-Key`）：建单，同一幂等键重试返回原工单；201 新建 / 200 重放。
   - `GET /tickets/{id}?tenant_id`：详情 + 完整处理记录。
@@ -208,7 +211,7 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
 
 | 阶段 | 范围 | 关键交付 |
 |---|---|---|
-| V1 | 多租户基础框架跑通；覆盖 VPN、账号密码、邮箱 3 个高频场景；知识库为按租户写死的静态 QA 数据；工单走自建模块 | 端到端可用的问答+转工单闭环 |
+| V1 | 多租户基础框架跑通；领域由各租户知识库决定（演示：IT 与 HR/行政）；知识库为按租户写死的静态 QA 数据；工单走自建模块 | 端到端可用的问答+转工单闭环 |
 | V2 | 知识库升级为向量检索 + RAG；扩大场景覆盖；接入企业 IM 机器人入口 | 检索准确率提升，渠道扩展 |
 | V3 | 多租户强隔离选项（schema级）；AI Gateway 多模型路由与成本优化；对接外部工单系统（Jira/ServiceNow）作为可选 Provider | 面向更大规模企业客户的可售卖能力 |
 
@@ -224,6 +227,7 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
 - 部署：云无关，基于标准 Kubernetes。
 - Agent Runtime：LangGraph 固定状态图，异步 Worker + Redis Streams 任务队列 + 每会话 Redis Stream 事件回传（最初为 Pub/Sub，因会丢未订阅时的事件而改）；checkpoint 存 Postgres `agent_runtime` 库；知识库没解决时自动建单（见 3.3 节）。
 - 工单系统：自建工单模块，`TicketProvider` 抽象预留外部系统扩展点。
+- 领域不写死：系统面向企业内部各类服务，不只 IT。不引入类别目录，由租户的知识库决定能自助解答的范围，工单类别取自命中条目；处理人角色为通用的 `handler`。以后做"按类别分派给处理组"时再引入目录，直接沿用条目里已有的 `category` 作为目录的 key。
 - 知识库：独立的 knowledge-service，V1 只提供检索、数据按租户写死；后续在同一接口后面换成数据库/向量检索。
 - 工单：独立的 ticket-service，4 状态状态机 + 乐观锁 + 处理记录；应用服务不再持有工单表。
 - 数据：同一 Postgres 实例、每服务独立 database，库内 `tenant_id` + RLS 隔离；服务间不共享表和模型代码，没有 `libs/shared`（见第 4 节）。

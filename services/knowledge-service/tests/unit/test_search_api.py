@@ -27,16 +27,17 @@ def test_requires_service_token(client, headers):
     assert resp.status_code == 401
 
 
-def test_same_question_gets_each_tenants_own_answer(client):
-    demo = search(client, DEMO, "VPN 连不上").json()["results"][0]
-    northwind = search(client, NORTHWIND, "VPN 连不上").json()["results"][0]
-    assert demo["id"] == northwind["id"] == "vpn-001"
-    assert "FortiClient" in northwind["answer"] and "FortiClient" not in demo["answer"]
+def test_each_tenant_has_its_own_domain_and_categories(client):
+    """demo is an IT help desk, northwind an HR/admin one: categories are whatever the data says."""
+    it = search(client, DEMO, "VPN 连不上").json()["results"][0]
+    hr = search(client, NORTHWIND, "年假怎么申请").json()["results"][0]
+    assert (it["id"], it["category"]) == ("vpn-001", "vpn")
+    assert (hr["id"], hr["category"]) == ("leave-001", "leave")
 
 
 def test_items_of_one_tenant_never_appear_for_another(client):
-    assert search(client, NORTHWIND, "打印机无法打印").json()["results"][0]["id"] == "printer-001"
-    assert search(client, DEMO, "打印机无法打印").json()["results"] == []
+    assert search(client, NORTHWIND, "VPN 连不上").json()["results"] == []
+    assert search(client, DEMO, "年假怎么申请").json()["results"] == []
 
 
 def test_unknown_tenant_gets_empty_results(client):

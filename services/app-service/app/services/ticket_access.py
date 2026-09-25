@@ -4,7 +4,7 @@ from app.clients.ticket_service import TicketServiceClient
 from app.core.errors import ApiError
 from app.core.security import CurrentUser
 
-IT_ACTIONS = frozenset({"start", "resolve"})
+HANDLER_ACTIONS = frozenset({"start", "resolve"})
 
 
 class TicketAccess:
@@ -24,7 +24,7 @@ class TicketAccess:
         limit: int,
         cursor: str | None,
     ) -> dict:
-        if not user.is_it_staff:
+        if not user.is_handler:
             requester_id, assignee_id = user.id, None  # employees only ever see their own tickets
         return await self._client.list(
             user.tenant_id, status=status, assignee_id=assignee_id, requester_id=requester_id, limit=limit, cursor=cursor
@@ -32,7 +32,7 @@ class TicketAccess:
 
     async def get(self, user: CurrentUser, ticket_id: uuid.UUID) -> dict:
         detail = await self._client.get(user.tenant_id, ticket_id)
-        if not user.is_it_staff and detail["ticket"]["requester_id"] != str(user.id):
+        if not user.is_handler and detail["ticket"]["requester_id"] != str(user.id):
             # Same answer as a ticket that doesn't exist: don't reveal other employees' tickets.
             raise ApiError(404, "TICKET_NOT_FOUND", "ticket not found")
         return detail
@@ -40,9 +40,9 @@ class TicketAccess:
     async def transition(
         self, user: CurrentUser, ticket_id: uuid.UUID, *, action: str, expected_version: int, note: str | None
     ) -> dict:
-        if action in IT_ACTIONS and not user.is_it_staff:
-            raise ApiError(403, "NOT_IT_STAFF", f"only IT staff may {action} a ticket")
-        if not user.is_it_staff:
+        if action in HANDLER_ACTIONS and not user.is_handler:
+            raise ApiError(403, "NOT_HANDLER", f"only a handler may {action} a ticket")
+        if not user.is_handler:
             await self.get(user, ticket_id)
         body = {"action": action, "actor_id": user.id, "expected_version": expected_version, "note": note}
         if action == "start":

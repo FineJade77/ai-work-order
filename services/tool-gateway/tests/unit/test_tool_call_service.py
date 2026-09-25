@@ -11,7 +11,7 @@ from app.tools.registry import REGISTRY
 TENANT = str(uuid.uuid4())
 SESSION = str(uuid.uuid4())
 USER = str(uuid.uuid4())
-ROLE = "it_support_agent"
+ROLE = "service_agent"
 TICKET_ARGS = {"summary": "VPN 连不上", "category": "vpn"}
 
 
@@ -107,7 +107,7 @@ async def test_invalid_tenant_is_a_caller_error_and_not_audited(env):
     [
         ({"tool": "drop_database", "args": {}}, "UNKNOWN_TOOL"),
         ({"role": "guest"}, "TOOL_NOT_ALLOWED"),
-        ({"args": {"summary": "x", "category": "printer"}}, "INVALID_ARGUMENTS"),
+        ({"args": {"summary": "x", "category": ""}}, "INVALID_ARGUMENTS"),
     ],
 )
 async def test_policy_failures_are_model_visible_errors_audited_as_rejected(env, kwargs, code):

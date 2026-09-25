@@ -23,7 +23,8 @@ _SCRYPT_MAXMEM = 256 * 1024 * 1024
 # Each scrypt holds ~128 MiB; without a cap, a burst of logins across the 40-thread pool could take ~5 GiB.
 _SCRYPT_SLOTS = threading.BoundedSemaphore(4)
 JWT_ALGORITHM = "HS256"
-ROLES = ("employee", "it_staff")
+# handler: whoever works the tenant's tickets (IT, HR, admin... whatever the tenant covers).
+ROLES = ("employee", "handler")
 
 
 def hash_password(password: str, *, n: int = SCRYPT_N) -> str:
@@ -67,8 +68,8 @@ class CurrentUser:
     role: str
 
     @property
-    def is_it_staff(self) -> bool:
-        return self.role == "it_staff"
+    def is_handler(self) -> bool:
+        return self.role == "handler"
 
 
 def issue_token(user: CurrentUser, settings: Settings) -> str:

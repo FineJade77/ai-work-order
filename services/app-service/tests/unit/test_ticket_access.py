@@ -10,7 +10,7 @@ pytestmark = pytest.mark.anyio
 
 TENANT = uuid.uuid4()
 EMPLOYEE = CurrentUser(id=uuid.uuid4(), tenant_id=TENANT, role="employee")
-IT = CurrentUser(id=uuid.uuid4(), tenant_id=TENANT, role="it_staff")
+HANDLER = CurrentUser(id=uuid.uuid4(), tenant_id=TENANT, role="handler")
 TICKET = uuid.uuid4()
 
 
@@ -41,10 +41,12 @@ async def test_employee_listing_is_forced_to_their_own_tickets():
     assert (filters["requester_id"], filters["assignee_id"], filters["status"]) == (EMPLOYEE.id, None, "open")
 
 
-async def test_it_staff_filters_pass_through():
+async def test_handler_filters_pass_through():
     fake = FakeTickets(EMPLOYEE.id)
-    await TicketAccess(fake).list(IT, status=None, assignee_id=IT.id, requester_id=None, limit=5, cursor="c")
-    assert fake.calls[0][2] == {"status": None, "assignee_id": IT.id, "requester_id": None, "limit": 5, "cursor": "c"}
+    await TicketAccess(fake).list(HANDLER, status=None, assignee_id=HANDLER.id, requester_id=None, limit=5, cursor="c")
+    assert fake.calls[0][2] == {
+        "status": None, "assignee_id": HANDLER.id, "requester_id": None, "limit": 5, "cursor": "c",
+    }
 
 
 async def test_employee_cannot_see_someone_elses_ticket():
@@ -53,8 +55,8 @@ async def test_employee_cannot_see_someone_elses_ticket():
     assert (exc.value.http_status, exc.value.code) == (404, "TICKET_NOT_FOUND")
 
 
-async def test_it_staff_sees_any_ticket_in_the_tenant():
-    detail = await TicketAccess(FakeTickets(uuid.uuid4())).get(IT, TICKET)
+async def test_handler_sees_any_ticket_in_the_tenant():
+    detail = await TicketAccess(FakeTickets(uuid.uuid4())).get(HANDLER, TICKET)
     assert detail["ticket"]["id"] == str(TICKET)
 
 
@@ -63,7 +65,7 @@ async def test_employee_cannot_take_it_actions(action):
     fake = FakeTickets(EMPLOYEE.id)
     with pytest.raises(ApiError) as exc:
         await TicketAccess(fake).transition(EMPLOYEE, TICKET, action=action, expected_version=1, note="x")
-    assert (exc.value.http_status, exc.value.code) == (403, "NOT_IT_STAFF")
+    assert (exc.value.http_status, exc.value.code) == (403, "NOT_HANDLER")
     assert fake.calls == []
 
 
@@ -77,6 +79,8 @@ async def test_employee_action_on_someone_elses_ticket_is_404_before_any_change(
 
 async def test_start_assigns_the_caller_and_the_actor_is_always_the_caller():
     fake = FakeTickets(EMPLOYEE.id)
-    await TicketAccess(fake).transition(IT, TICKET, action="start", expected_version=3, note=None)
+    await TicketAccess(fake).transition(HANDLER, TICKET, action="start", expected_version=3, note=None)
     body = fake.calls[-1][2]
-    assert body == {"action": "start", "actor_id": IT.id, "expected_version": 3, "note": None, "assignee_id": IT.id}
+    assert body == {
+        "action": "start", "actor_id": HANDLER.id, "expected_version": 3, "note": None, "assignee_id": HANDLER.id,
+    }

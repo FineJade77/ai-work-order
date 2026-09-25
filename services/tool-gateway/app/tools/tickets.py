@@ -7,7 +7,9 @@ import httpx
 from app.core.config import get_settings
 from app.tools.base import ToolContext, ToolSpec
 
-TICKET_CATEGORIES = ["vpn", "account", "email", "other"]
+# Categories are not a fixed list: each tenant's knowledge base defines its own (IT, HR, admin...),
+# and the agent passes the category of the entry it answered from. Bounded like ticket-service's column.
+CATEGORY_MAX_CHARS = 50
 
 
 class TicketProvider(ABC):
@@ -70,7 +72,7 @@ async def _handle(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
 
 CREATE_TICKET = ToolSpec(
     name="create_ticket",
-    description="知识库方案无法解决员工问题时，为其创建一张 IT 工单。",
+    description="知识库方案无法解决员工问题，或员工要求转人工时，为其创建一张工单，交给相关同事处理。",
     parameters={
         "type": "object",
         "properties": {
@@ -80,7 +82,12 @@ CREATE_TICKET = ToolSpec(
                 "maxLength": 500,
                 "description": "问题描述，包含已尝试过的知识库方案",
             },
-            "category": {"type": "string", "enum": TICKET_CATEGORIES, "description": "问题类别"},
+            "category": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": CATEGORY_MAX_CHARS,
+                "description": "问题类别：取自命中的知识条目的类别，无法判断时填 other",
+            },
         },
         "required": ["summary", "category"],
         "additionalProperties": False,

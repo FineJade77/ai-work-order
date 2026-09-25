@@ -15,7 +15,7 @@ logger = logging.getLogger("app_service.requeuer")
 # pg_try_advisory_xact_lock key: one replica sweeps at a time.
 SWEEP_LOCK_KEY = 0x61707071
 NO_RESULT_CODE = "NO_RESULT"
-NO_RESULT_MESSAGE = "抱歉，这条消息处理失败了。请稍后重试，或直接提交 IT 工单。"
+NO_RESULT_MESSAGE = "抱歉，这条消息处理失败了。请稍后重试；如果问题紧急，回复「提工单」转人工处理。"
 
 
 class Requeuer:

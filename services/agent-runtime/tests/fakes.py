@@ -8,7 +8,9 @@ from app.graph import prompts
 from app.schemas.tasks import AgentTask
 
 TENANT = uuid.UUID("e0e112f3-5afb-4229-869b-c0bd012324bb")  # demo tenant: has knowledge data and tool bindings
-VPN_HIT = {"question": "VPN 连不上怎么办？", "answer": "重启 VPN 客户端后重新登录。", "score": 1.0}
+VPN_HIT = {"category": "vpn", "question": "VPN 连不上怎么办？", "answer": "重启 VPN 客户端后重新登录。", "score": 1.0}
+# Another tenant's domain entirely: categories are whatever its knowledge base uses.
+LEAVE_HIT = {"category": "leave", "question": "年假怎么申请？", "answer": "在 OA 提交请假申请，主管审批后生效。", "score": 1.0}
 
 
 def make_task(
@@ -28,9 +30,8 @@ class FakeModels:
     """Answers by prompt kind. Mutate the attributes between turns to script a conversation."""
 
     def __init__(self):
-        self.intent = "in_scope"
-        self.category = "vpn"
-        self.classify_raw: str | None = None  # overrides the JSON built from intent/category
+        self.intent = "question"
+        self.classify_raw: str | None = None  # overrides the JSON built from intent
         self.resolution = "unresolved"
         self.answer = "请先重启 VPN 客户端，再重新登录。问题解决了吗？"
         self.summary = "员工 VPN 无法连接，已按知识库重启客户端，仍然失败。"
@@ -50,7 +51,7 @@ class FakeModels:
         if kind in self.over_budget:
             raise BudgetExceeded("daily token budget used up")
         text = {
-            "classify": self.classify_raw or json.dumps({"intent": self.intent, "category": self.category}),
+            "classify": self.classify_raw or json.dumps({"intent": self.intent}),
             "resolution": f'好的：{{"resolution": "{self.resolution}"}}',
             "summary": self.summary,
             "answer": self.answer,

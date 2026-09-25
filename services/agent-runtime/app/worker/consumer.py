@@ -16,7 +16,7 @@ from app.worker.runner import TaskRunner
 logger = logging.getLogger("agent_runtime.consumer")
 
 POLL_BLOCK_MS = 5000
-FAILED_MESSAGE = "抱歉，这条消息处理失败了。请稍后重试，或直接提交 IT 工单。"
+FAILED_MESSAGE = "抱歉，这条消息处理失败了。请稍后重试；如果问题紧急，回复「提工单」转人工处理。"
 
 
 class TaskConsumer:

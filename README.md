@@ -1,6 +1,6 @@
 # 智能工单系统（ai-work-order）
 
-员工用自然语言描述 IT 问题，系统先检索企业知识库、由大模型给出解决步骤；员工反馈没解决时自动转成 IT 工单，IT 人员在工单里处理。V1 覆盖 VPN、账号密码、邮箱三个场景，多租户：每个租户有自己的知识库和数据，数据库里用 PostgreSQL 行级安全（RLS）隔离。
+员工用自然语言描述问题，系统先检索企业知识库、由大模型给出解决步骤；员工反馈没解决时自动转成工单，由处理人在工单里处理。不限于 IT：每个租户的知识库决定它能自助解答什么（IT、人事、行政……），代码里不写死领域和类别，工单类别取自命中的知识条目。多租户：每个租户有自己的知识库和数据，数据库里用 PostgreSQL 行级安全（RLS）隔离。
 
 设计依据见 [架构设计文档](docs/architecture-design.md) 和 [实现计划](docs/implementation-plan.md)。
 
@@ -19,7 +19,7 @@ agent-runtime ─┬─▶ tool-gateway ─┬─▶ knowledge-service
 
 | 服务 | 端口 | 职责 | 数据库 |
 |---|---|---|---|
-| app-service | 8001 | 登录（JWT）、会话与消息、发消息限流、SSE 推送、回复落库、员工/IT 工单页面的 BFF | `app_service` |
+| app-service | 8001 | 登录（JWT）、会话与消息、发消息限流、SSE 推送、回复落库、员工/处理人工单页面的 BFF | `app_service` |
 | agent-runtime | 无对外端口 | 消费任务队列，跑 LangGraph 状态图：分类 → 检索 → 回答 → 等反馈 → 建单 | `agent_runtime`（checkpoint） |
 | tool-gateway | 8003 | 工具策略网关：角色绑定、参数校验、幂等、审计、脱敏 | `tool_gateway` |
 | ai-gateway | 8004 | 模型调用唯一出口（OpenAI 兼容协议，当前接 DeepSeek），记录用量、每日 token 预算 | `ai_gateway` |
@@ -57,13 +57,13 @@ docker compose ps -a
 | 租户（登录时的 tenant） | 邮箱 | 角色 |
 |---|---|---|
 | `demo` | `demo.user@example.com` | 员工 |
-| `demo` | `it.staff@example.com` | IT 人员 |
+| `demo` | `it.staff@example.com` | 处理人（`handler`） |
 | `northwind` | `demo.user@northwind.example` | 员工 |
-| `northwind` | `it.staff@northwind.example` | IT 人员 |
+| `northwind` | `hr.staff@northwind.example` | 处理人（`handler`） |
 
-两个租户的知识库对同一个问题给出不同答案（比如 VPN 客户端不同），可以用来观察租户隔离。
+两个租户的知识库是不同领域：`demo` 是 IT 服务台（VPN、账号、邮箱），`northwind` 是 HR/行政（请假、报销、门禁、会议室、工资条）。一个租户的问题在另一个租户查不到，工单类别也各用各的（`vpn`、`leave`……）。
 
-## 跑通三个场景
+## 跑通演示场景
 
 `scripts/demo.sh` 以员工身份登录、新建会话、逐条发消息，并把 agent 推送的事件打印出来：
 
@@ -71,7 +71,8 @@ docker compose ps -a
 scripts/demo.sh vpn       # 回答 → 员工说"还是连不上" → 自动建单
 scripts/demo.sh account   # 回答 → 员工说"好了，谢谢" → 已解决，不建单
 scripts/demo.sh email     # 回答 → 员工说"还是收不到" → 自动建单
-scripts/demo.sh printer   # 不属于三个场景 → 直接建单
+scripts/demo.sh printer   # 知识库里没有 → 直接建单（描述带 [知识库未命中]，类别 other）
+scripts/demo.sh leave     # northwind 租户（HR/行政）：回答 → "还是没通过" → 建单，类别 leave
 ```
 
 VPN 场景的输出大致如下（回答由模型生成，措辞每次不同；极少数情况下分类结果也会不同）：
@@ -83,16 +84,16 @@ VPN 场景的输出大致如下（回答由模型生成，措辞每次不同；�
   [本轮结束: awaiting_feedback]
 
 员工> 按你说的试了，还是连不上
-助手> 已为你创建 IT 工单（编号 dc57b7cf-…），IT 同事会尽快处理，处理进展可以在「我的工单」中查看。
+助手> 已为你创建工单（编号 dc57b7cf-…），相关同事会尽快处理，处理进展可以在「我的工单」中查看。
   [本轮结束: ticket_created]
 
 我的工单：
   dc57b7cf-…  open  vpn  员工反馈 VPN 无法连接。已尝试知识库方案：……均无效。
 ```
 
-换租户或账号：`TENANT=northwind EMAIL=demo.user@northwind.example scripts/demo.sh vpn`。
+`leave` 场景会自动切到 northwind 租户；其他场景换租户或账号用环境变量，例如 `TENANT=northwind EMAIL=demo.user@northwind.example scripts/demo.sh printer`。
 
-### 用 curl 一步步走，包括 IT 处理
+### 用 curl 一步步走，包括处理人处理
 
 ```bash
 BASE=http://localhost:8001/v1
@@ -101,7 +102,7 @@ login() {
     -d "{\"tenant\":\"demo\",\"email\":\"$1\",\"password\":\"demo-password\"}" | jq -r .access_token
 }
 EMP="Authorization: Bearer $(login demo.user@example.com)"
-IT="Authorization: Bearer $(login it.staff@example.com)"
+HANDLER="Authorization: Bearer $(login it.staff@example.com)"
 
 # 1. 新建会话，提问
 CONV=$(curl -s -X POST $BASE/conversations -H "$EMP" | jq -r .id)
@@ -137,12 +138,12 @@ curl -sN "$BASE/conversations/$CONV/stream?task_id=$TASK" -H "$EMP"
 curl -s $BASE/conversations/$CONV/messages -H "$EMP" | jq '.messages[] | {role, content}'
 TICKET=$(curl -s $BASE/tickets -H "$EMP" | jq -r '.items[0].id')
 
-# 5. IT 接单、解决；员工确认关闭。每次流转都要带上当前版本号（乐观锁）
+# 5. 处理人接单、解决；员工确认关闭。每次流转都要带上当前版本号（乐观锁）
 version() { curl -s $BASE/tickets/$TICKET -H "$EMP" | jq .ticket.version; }
 act() { curl -s $BASE/tickets/$TICKET/transitions -H "$1" -H 'content-type: application/json' -d "$2" | jq '{status, assignee_id, version}'; }
-act "$IT"  "{\"action\":\"start\",\"expected_version\":$(version)}"
-act "$IT"  "{\"action\":\"resolve\",\"expected_version\":$(version),\"note\":\"已重置 VPN 证书\"}"
-act "$EMP" "{\"action\":\"close\",\"expected_version\":$(version)}"
+act "$HANDLER" "{\"action\":\"start\",\"expected_version\":$(version)}"
+act "$HANDLER" "{\"action\":\"resolve\",\"expected_version\":$(version),\"note\":\"已重置 VPN 证书\"}"
+act "$EMP"     "{\"action\":\"close\",\"expected_version\":$(version)}"
 
 # 6. 处理记录
 curl -s $BASE/tickets/$TICKET -H "$EMP" | jq '.events[] | {action, to_status, note}'
@@ -158,8 +159,8 @@ curl -s $BASE/tickets/$TICKET -H "$EMP" | jq '.events[] | {action, to_status, no
 | `GET /v1/conversations/{id}/messages` | 历史消息；`active_task_id` 是还在处理的那一轮 |
 | `POST /v1/conversations/{id}/messages` | `{content}` → 202 `{task_id}`；上一轮没结束时 409 `TURN_IN_PROGRESS` |
 | `GET /v1/conversations/{id}/stream?task_id=` | SSE；支持 `Last-Event-ID` 断线续读 |
-| `GET /v1/tickets`、`GET /v1/tickets/{id}` | 员工只看得到自己的工单，IT 看全租户 |
-| `POST /v1/tickets/{id}/transitions` | `{action, expected_version, note?}`；`start`/`resolve` 仅 IT，`start` 指派给自己 |
+| `GET /v1/tickets`、`GET /v1/tickets/{id}` | 员工只看得到自己的工单，处理人看全租户 |
+| `POST /v1/tickets/{id}/transitions` | `{action, expected_version, note?}`；`start`/`resolve` 仅处理人（否则 403 `NOT_HANDLER`），`start` 指派给自己 |
 
 SSE 事件：`retrieving`（检索中）、`answer_chunk`（增量回答）、`answer`（完整回答）、`reply`（固定回复，如问候或确认已解决）、`ticket_created`、`resumed`（Worker 崩溃后续跑，丢弃已显示的半截回答）、`error`、`done`（`outcome`：`awaiting_feedback` / `resolved` / `replied` / `ticket_created`）。
 
@@ -216,6 +217,7 @@ scripts/test-all.sh app-service     # 只跑指定服务
 - **发消息后迟迟没有回复，或收到 `error` 事件**：多半是模型调用失败。检查 `.env` 里的 `DEEPSEEK_API_KEY`，看 `docker compose logs ai-gateway agent-runtime`。Worker 会自动重试，每次间隔约 90 秒，3 次都失败后任务进入死信：
   `docker compose exec redis redis-cli XRANGE agent_tasks:dead - +`
 - **收到"今天 AI 助手的使用额度已经用完"**：租户当天的 token 预算用完了，agent-runtime 日志里有 `budget_exceeded tenant_id=…`。按"调整限额"一节提高预算，不用重启。
+- **升级后原来的令牌返回 401**：处理人角色由 `it_staff` 改名为 `handler`，改名前签发的令牌带旧角色，重新登录即可。
 - **429 `RATE_LIMITED`**：这个员工发消息太频繁，按 `Retry-After` 等待。
 - **409 `TURN_IN_PROGRESS`**：同一会话上一条消息还没处理完。等它的 `done`；如果任务丢了，app-service 最多 10 分钟后会自动重新投递。
 - **改了 `.env` 不生效**：`docker compose up -d` 会用新配置重建相关容器。

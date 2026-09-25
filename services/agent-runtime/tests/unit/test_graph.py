@@ -8,7 +8,7 @@ from app.clients.tool_gateway import ToolCallFailed
 from app.graph import nodes, prompts
 from app.graph.builder import build_graph
 from app.worker.runner import BUDGET_EXCEEDED, SUPERSEDED, TaskRunner
-from tests.fakes import FakeModels, FakeTools, RecordingEvents, make_task
+from tests.fakes import LEAVE_HIT, VPN_HIT, FakeModels, FakeTools, RecordingEvents, make_task
 
 pytestmark = pytest.mark.anyio
 
@@ -66,26 +66,43 @@ async def test_unresolved_feedback_files_a_ticket_under_the_feedback_tasks_key(e
     assert created["ticket_id"] == "T-1" and "T-1" in created["content"]
 
 
-async def test_no_knowledge_hit_goes_straight_to_a_ticket():
+async def test_no_knowledge_hit_files_a_marked_ticket_in_the_fallback_category():
+    """Whatever the knowledge base doesn't cover goes to a person: there is no in/out-of-scope list."""
     env = Env(hits=[])
-    task = env.task("VPN 证书报错 0x80")
+    task = env.task("打印机卡纸")
     assert await env.runner.run(task) == "ticket_created"
     assert env.types(task) == ["retrieving", "ticket_created", "done"]
+    args = env.tools.calls[-1][1]
+    assert args == {"summary": prompts.NO_KNOWLEDGE_MARKER + env.models.summary, "category": "other"}
 
 
-@pytest.mark.parametrize(("intent", "category"), [("out_of_scope", "other"), ("in_scope", "other")])
-async def test_out_of_scope_skips_search_and_marks_the_ticket(env, intent, category):
-    env.models.intent, env.models.category = intent, category
-    assert await env.runner.run(env.task("打印机卡纸")) == "ticket_created"
-    assert env.tools.names() == ["create_ticket"]
-    args = env.tools.calls[0][1]
-    assert args["summary"].startswith(prompts.OUT_OF_SCOPE_MARKER) and args["category"] == "other"
-
-
-async def test_explicit_ticket_request_is_not_marked_out_of_scope(env):
-    env.models.intent, env.models.category = "ticket_request", "account"
+async def test_explicit_ticket_request_skips_search_and_is_not_marked(env):
+    env.models.intent = "ticket_request"
     assert await env.runner.run(env.task("帮我直接提个工单，账号被锁了")) == "ticket_created"
-    assert env.tools.calls[0][1] == {"summary": env.models.summary, "category": "account"}
+    assert env.tools.names() == ["create_ticket"]
+    assert env.tools.calls[0][1] == {"summary": env.models.summary, "category": "other"}
+
+
+async def test_ticket_category_is_the_tenants_own_label_from_the_answer_used():
+    env = Env(hits=[LEAVE_HIT])  # an HR tenant: no IT category anywhere
+    await env.runner.run(env.task("年假怎么申请"))
+    assert await env.runner.run(env.task("提交了还是没通过")) == "ticket_created"
+    assert env.tools.calls[-1][1]["category"] == "leave"
+
+
+@pytest.mark.parametrize("category", [None, "", "x" * 51])
+async def test_a_hit_without_a_usable_category_falls_back(category):
+    env = Env(hits=[{**VPN_HIT, "category": category}])
+    await env.runner.run(env.task("VPN 连不上"))
+    await env.runner.run(env.task("还是不行"))
+    assert env.tools.calls[-1][1]["category"] == "other"
+
+
+async def test_a_new_question_does_not_inherit_the_previous_answers_category(env):
+    await env.runner.run(env.task("VPN 连不上"))
+    env.models.resolution, env.models.intent = "new_question", "ticket_request"
+    assert await env.runner.run(env.task("另外帮我提个工单")) == "ticket_created"
+    assert env.tools.calls[-1][1] == {"summary": env.models.summary, "category": "other"}  # not vpn, not marked
 
 
 @pytest.mark.parametrize("raw", [None, "我不太确定", '{"intent": "delete_everything"}'])
@@ -114,7 +131,7 @@ async def test_new_question_as_feedback_starts_over(env):
 async def test_a_new_run_after_a_ticket_starts_clean_but_keeps_history(env):
     env.models.intent = "ticket_request"
     await env.runner.run(env.task("提工单"))
-    env.models.intent = "in_scope"
+    env.models.intent = "question"
     assert await env.runner.run(env.task("VPN 连不上")) == "awaiting_feedback"
     state = (await env.runner._graph.aget_state({"configurable": {"thread_id": str(env.conversation)}})).values
     assert state["ticket_id"] is None and state["outcome"] is None
@@ -180,7 +197,7 @@ async def test_redelivered_finished_task_only_republishes_done(env):
 async def test_stale_copy_of_an_older_turn_is_not_taken_as_feedback(env):
     first = env.task("VPN 连不上")
     await env.runner.run(first)
-    env.models.resolution, env.models.category = "new_question", "email"
+    env.models.resolution = "new_question"
     second = env.task("邮箱无法收发邮件")
     assert await env.runner.run(second) == "awaiting_feedback"
     config = {"configurable": {"thread_id": str(env.conversation)}}

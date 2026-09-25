@@ -9,8 +9,8 @@ from app.graph.state import AgentState, Deps
 def build_graph(checkpointer: BaseCheckpointSaver) -> CompiledStateGraph:
     """
     classify_intent ─┬─ chitchat ─────────────────────────────→ reply → END
-                     ├─ out_of_scope / ticket_request ────────→ summarize_ticket → create_ticket → END
-                     └─ in_scope → retrieve_knowledge ─┬─ no hits → summarize_ticket
+                     ├─ ticket_request ───────────────────────→ summarize_ticket → create_ticket → END
+                     └─ question → retrieve_knowledge ─┬─ no hits → summarize_ticket
                                                        ├─ search failed → knowledge_unavailable → END
                                                        └─ hits → generate_answer → await_feedback (interrupt)
     await_feedback → check_resolution ─┬─ resolved → END
