@@ -41,6 +41,9 @@ class CrashingTools:
         self._inner = inner
         self.crash_after_create = 0
 
+    async def list_tools(self, task):
+        return await self._inner.list_tools(task)
+
     async def call(self, task, tool_name, arguments, *, idempotency_key=None):
         result = await self._inner.call(task, tool_name, arguments, idempotency_key=idempotency_key)
         if tool_name == "create_ticket" and self.crash_after_create:
@@ -110,7 +113,12 @@ def _cleanup(conversation, user):
         for table in ("checkpoint_writes", "checkpoint_blobs", "checkpoints"):
             db.execute(f"DELETE FROM {table} WHERE thread_id = %s", (thread,))
     with psycopg.connect(GATEWAY_ADMIN_DB_URL, autocommit=True) as db:
-        for table in ("tool_calls", "tool_call_logs"):
+        db.execute(
+            "DELETE FROM approval_outbox WHERE approval_id IN (SELECT id FROM tool_approvals WHERE session_id = %s)",
+            (thread,),
+        )
+        db.execute("DELETE FROM access_grants WHERE idempotency_key LIKE %s", (f"{thread}:%",))
+        for table in ("tool_calls", "tool_call_logs"):  # tool_approvals go with their calls (cascade)
             db.execute(f"DELETE FROM {table} WHERE session_id = %s", (thread,))
     with psycopg.connect(TICKET_ADMIN_DB_URL, autocommit=True) as db:
         # By conversation, not tenant: a test may run as another tenant (see the HR test below).
@@ -125,7 +133,8 @@ def _tickets(conversation):
 
 
 def task_fields(task) -> dict[str, str]:
-    return {k: str(v) for k, v in task.model_dump().items()}
+    """As app-service writes a task: fields a task doesn't use (None) are left out."""
+    return {k: str(v) for k, v in task.model_dump().items() if v is not None}
 
 
 async def send(w: Worker, content: str, *, tenant_id: uuid.UUID | None = None) -> list[tuple[str, dict]]:
@@ -254,3 +263,54 @@ async def test_an_hr_tenant_files_tickets_under_its_own_categories(worker):
     assert [t for t, _ in events] == ["ticket_created", "done"]
     [(_, _, category, _)] = _tickets(worker.conversation)
     assert category == "leave"
+
+
+
+async def send_decision(w: Worker, approval_id: str, decision: str) -> list[tuple[str, dict]]:
+    """What app-service enqueues when tool-gateway announces the decision (an approval turn)."""
+    w.seq += 1
+    task = make_task(w.conversation, "", user_id=w.user, seq=w.seq, kind="approval", approval_id=approval_id,
+                     decision=decision)
+    w.last_task = task
+    await w.redis.xadd(TASK_STREAM, task_fields(task))
+    with anyio.fail_after(20):
+        while True:
+            entries = await w.redis.xrange(event_stream_key(w.conversation))
+            mine = [(e["type"], json.loads(e["data"])) for _, e in entries if e["task_id"] == str(task.task_id)]
+            if any(t == "done" for t, _ in mine):
+                return mine
+            await anyio.sleep(0.1)
+
+
+def _grants(conversation) -> int:
+    with psycopg.connect(GATEWAY_ADMIN_DB_URL) as db:
+        return db.execute(
+            "SELECT count(*) FROM access_grants WHERE idempotency_key LIKE %s", (f"{conversation}:%",)
+        ).fetchone()[0]
+
+
+async def test_an_action_waits_for_a_handler_and_runs_once_approved(worker):
+    """demo's policy makes grant_access wait for approval: the run pauses, a handler approves in
+    tool-gateway, and the approval task resumes the run, which grants access exactly once."""
+    worker.models.intent = "action"
+    events = await send(worker, "帮我开通财务系统的只读权限，月底对账要用")
+    assert events[-2:] == [("reply", {"content": prompts.ACTION_SUBMITTED_REPLY}),
+                           ("done", {"outcome": "awaiting_approval"})]
+    assert _grants(worker.conversation) == 0
+
+    with psycopg.connect(GATEWAY_ADMIN_DB_URL) as db:
+        [(approval_id, arguments)] = db.execute(
+            "SELECT id::text, arguments FROM tool_approvals WHERE session_id = %s AND status = 'pending'",
+            (str(worker.conversation),),
+        ).fetchall()
+    assert arguments == worker.models.plan["arguments"]
+    handler = httpx.post(
+        f"{TOOL_GATEWAY_URL}/v1/approvals/{approval_id}/decision",
+        json={"tenant_id": str(TENANT), "decision": "approve", "approver_id": str(uuid.uuid4())},
+        headers={"Authorization": f"Bearer {TOOL_GATEWAY_TOKEN}"},
+    )
+    assert handler.json()["status"] == "approved"
+
+    events = await send_decision(worker, approval_id, "approved")
+    assert events == [("reply", {"content": prompts.ACTION_APPROVED_REPLY}), ("done", {"outcome": "action_done"})]
+    assert _grants(worker.conversation) == 1

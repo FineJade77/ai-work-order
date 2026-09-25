@@ -21,6 +21,8 @@ from tests.integration.env import (
     REDIS_URL,
     TICKET_ADMIN_DB_URL,
     TICKET_SERVICE_TOKEN,
+    TOOL_GATEWAY_TOKEN,
+    TOOL_GATEWAY_URL,
     TICKET_SERVICE_URL,
 )
 
@@ -76,6 +78,8 @@ async def app(monkeypatch, redis, tenant):
         "JWT_SECRET": "integration-secret-" + "x" * 32,
         "TICKET_SERVICE_URL": TICKET_SERVICE_URL,
         "TICKET_SERVICE_TOKEN": TICKET_SERVICE_TOKEN,
+        "TOOL_GATEWAY_URL": TOOL_GATEWAY_URL,
+        "TOOL_GATEWAY_SERVICE_TOKEN": TOOL_GATEWAY_TOKEN,
         "CONSUMER_NAME": "integration",
         # Only the startup sweep runs; tests that need the requeuer call sweep() themselves.
         "REQUEUE_INTERVAL_SECONDS": "3600",

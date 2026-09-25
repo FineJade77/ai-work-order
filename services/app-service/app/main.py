@@ -11,12 +11,15 @@ from redis.asyncio import Redis
 from app.api.v1.router import api_router
 from app.clients.agent_bus import AgentBus
 from app.clients.ticket_service import TicketServiceClient
+from app.clients.tool_gateway import ToolGatewayClient
 from app.core.config import get_settings
 from app.core.errors import ApiError
 from app.core.telemetry import configure_logging, instrument_app
+from app.services.approval_access import ApprovalAccess
 from app.services.rate_limit import MessageRateLimiter
 from app.services.stream_service import READ_BLOCK_MS
 from app.services.ticket_access import TicketAccess
+from app.workers.approval_events import ApprovalEventConsumer
 from app.workers.requeuer import Requeuer
 from app.workers.result_collector import ResultCollector
 
@@ -37,7 +40,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 timeout=10,
             )
         )
+        tools_http = await stack.enter_async_context(
+            httpx.AsyncClient(
+                base_url=settings.tool_gateway_url,
+                headers={"Authorization": f"Bearer {settings.tool_gateway_service_token}"},
+                timeout=10,
+            )
+        )
         app.state.bus = AgentBus(redis)
+        app.state.approval_access = ApprovalAccess(ToolGatewayClient(tools_http))
         app.state.rate_limiter = MessageRateLimiter(
             redis,
             per_minute=settings.message_rate_per_minute,
@@ -48,6 +59,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.workers = [
             asyncio.create_task(ResultCollector(redis, settings.consumer_name).run(), name="result-collector"),
             asyncio.create_task(Requeuer(app.state.bus, settings).run(), name="requeuer"),
+            asyncio.create_task(
+                ApprovalEventConsumer(redis, app.state.bus, settings.consumer_name).run(), name="approval-events"
+            ),
         ]
         for task in app.state.workers:
             task.add_done_callback(_log_worker_exit)

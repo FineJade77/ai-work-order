@@ -16,7 +16,7 @@ class AgentState(TypedDict, total=False):
     seq: int
     # {"role": "user" | "assistant", "content": str}
     messages: Annotated[list[dict], operator.add]
-    intent: str | None  # question | ticket_request | chitchat
+    intent: str | None  # question | action | ticket_request | chitchat
     # The tenant's own label (vpn, leave...) from the best knowledge hit; the ticket's category.
     category: str | None
     knowledge: list[dict] | None
@@ -25,7 +25,17 @@ class AgentState(TypedDict, total=False):
     resolution: str | None  # resolved | unresolved | new_question
     ticket_summary: str | None
     ticket_id: str | None
-    # resolved | replied | ticket_created | knowledge_unavailable; awaiting_feedback is the interrupt,
+    # The action path (intent "action"): the tool the model picked and its arguments; the
+    # idempotency key, fixed when planned so the call after an approval reuses it; how it went
+    # (pending | done | rejected | expired | failed); the approval, if the tenant's policy needs one.
+    action_tool: str | None
+    action_arguments: dict | None
+    action_key: str | None
+    action_status: str | None
+    approval_id: str | None
+    approval_note: str | None
+    # resolved | replied | ticket_created | knowledge_unavailable | action_done | action_rejected
+    # | action_expired; awaiting_feedback and awaiting_approval are the interrupts,
     # and budget_exceeded is reported by the runner without reaching the graph's state
     outcome: str | None
 
@@ -39,6 +49,12 @@ RUN_FIELDS_RESET: dict = {
     "resolution": None,
     "ticket_summary": None,
     "ticket_id": None,
+    "action_tool": None,
+    "action_arguments": None,
+    "action_key": None,
+    "action_status": None,
+    "approval_id": None,
+    "approval_note": None,
     "outcome": None,
 }
 

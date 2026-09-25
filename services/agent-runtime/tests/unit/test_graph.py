@@ -10,7 +10,7 @@ from app.graph import nodes, prompts
 from app.graph.builder import build_graph
 from app.worker.runner import BUDGET_EXCEEDED, SUPERSEDED, TaskRunner
 from tests.conftest import metric_total
-from tests.fakes import LEAVE_HIT, VPN_HIT, FakeModels, FakeTools, RecordingEvents, make_task
+from tests.fakes import GRANT_ARGS, LEAVE_HIT, VPN_HIT, FakeModels, FakeTools, RecordingEvents, make_task
 
 pytestmark = pytest.mark.anyio
 
@@ -31,6 +31,14 @@ class Env:
         """The conversation's next turn, numbered like app-service numbers them."""
         self.seq += 1
         return make_task(self.conversation, content, user_id=self.user, seq=self.seq)
+
+    def decision(self, approval_id, decision, note=""):
+        """The turn app-service opens for a handler's decision."""
+        self.seq += 1
+        return make_task(
+            self.conversation, "", user_id=self.user, seq=self.seq, kind="approval", approval_id=approval_id,
+            decision=decision, note=note,
+        )
 
     def types(self, task=None):
         return [typ for tid, typ, _ in self.events if task is None or tid == str(task.task_id)]
@@ -340,3 +348,81 @@ async def test_node_durations_intents_and_searches_are_counted(env):
         metric_total("app.knowledge.searches", app__result="hit", app__tenant_id=tenant),
     )
     assert [a - b for a, b in zip(after, before)] == [1, 1, 1]
+
+
+
+def _replies(env, task):
+    return [d["content"] for tid, t, d in env.events if tid == str(task.task_id) and t == "reply"]
+
+
+async def _request_access(env):
+    env.models.intent = "action"
+    request = env.task("帮我开通财务系统的只读权限，月底对账要用")
+    assert await env.runner.run(request) == "awaiting_approval"
+    return request
+
+
+async def test_an_action_needing_approval_pauses_then_runs_once_approved(env):
+    request = await _request_access(env)
+    assert _replies(env, request) == [prompts.ACTION_SUBMITTED_REPLY]
+    assert _result(env, request)["content"] == prompts.ACTION_SUBMITTED_REPLY
+    assert env.tools.granted == []
+
+    decided = env.decision(env.tools.decide("approved"), "approved")
+    assert await env.runner.run(decided) == "action_done"
+    assert _replies(env, decided) == [prompts.ACTION_APPROVED_REPLY]
+    # The same key before and after the pause, fixed when planned: the tool ran exactly once.
+    keys = {key for name, _, key in env.tools.calls if name == "grant_access"}
+    assert keys == {f"{env.conversation}:{request.task_id}:action"} and env.tools.granted == list(keys)
+    assert env.tools.calls[-1][1] == GRANT_ARGS
+
+
+async def test_a_message_while_waiting_gets_a_status_reply_and_does_not_resume(env):
+    await _request_access(env)
+    model_calls = list(env.models.calls)
+    meanwhile = env.task("审批好了吗？")
+    assert await env.runner.run(meanwhile) == "awaiting_approval"
+    assert _replies(env, meanwhile) == [prompts.ACTION_WAITING_REPLY]
+    assert env.models.calls == model_calls and env.tools.granted == []  # not classified, not resumed
+
+    assert await env.runner.run(env.decision(env.tools.decide("approved"), "approved")) == "action_done"
+
+
+@pytest.mark.parametrize(("decision", "outcome"), [("rejected", "action_rejected"), ("expired", "action_expired")])
+async def test_a_refused_action_is_reported_and_never_runs(env, decision, outcome):
+    await _request_access(env)
+    decided = env.decision(env.tools.decide(decision), decision, note="需部门经理申请" if decision == "rejected" else "")
+    assert await env.runner.run(decided) == outcome
+    [reply] = _replies(env, decided)
+    if decision == "rejected":
+        assert reply == prompts.ACTION_REJECTED_REPLY.format(note="审批意见：需部门经理申请。")
+    else:
+        assert reply == prompts.ACTION_EXPIRED_REPLY
+    assert env.tools.granted == [] and "create_ticket" not in env.tools.names()
+
+
+async def test_under_a_direct_policy_the_action_runs_straight_away(env):
+    env.tools.requires_approval = False
+    env.models.intent = "action"
+    request = env.task("帮我开通财务系统的只读权限")
+    assert await env.runner.run(request) == "action_done"
+    assert _replies(env, request) == [prompts.ACTION_DONE_REPLY]
+
+
+@pytest.mark.parametrize("plan", [{"tool": None}, {"tool": "drop_database", "arguments": {}}, {"tool": "grant_access"}])
+async def test_without_a_usable_plan_a_person_takes_over(env, plan):
+    env.models.intent, env.models.plan = "action", plan
+    assert await env.runner.run(env.task("帮我处理一下")) == "ticket_created"
+    assert "grant_access" not in env.tools.names()
+
+
+async def test_a_failed_action_becomes_a_ticket(env):
+    env.models.intent = "action"
+    env.tools.action_failure = ToolCallFailed("TOOL_ERROR", "identity system down")
+    assert await env.runner.run(env.task("帮我开通财务系统的只读权限")) == "ticket_created"
+
+
+async def test_a_decision_nothing_is_waiting_for_is_reported_empty(env):
+    stray = env.decision(str(uuid.uuid4()), "approved")
+    assert await env.runner.run(stray) == "ignored"
+    assert _result(env, stray) == {"outcome": "ignored", "content": "", "ticket_id": None}

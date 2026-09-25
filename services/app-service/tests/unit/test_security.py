@@ -11,6 +11,7 @@ from app.core.security import CurrentUser, decode_token, hash_password, issue_to
 SETTINGS = Settings(
     database_url="unused", redis_url="unused", jwt_secret="s" * 32,
     ticket_service_url="http://unused", ticket_service_token="unused",
+    tool_gateway_url="http://unused", tool_gateway_service_token="unused",
 )
 USER = CurrentUser(id=uuid.uuid4(), tenant_id=uuid.uuid4(), role="employee")
 

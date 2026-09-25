@@ -1,10 +1,13 @@
 import uuid
+from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class AgentTask(BaseModel):
-    """One user message to process. Written to the agent_tasks stream by app-service.
+    """One unit of work for a conversation, written to the agent_tasks stream by app-service:
+    an employee's message (kind "message"), or a handler's decision on an approval the
+    conversation is waiting for (kind "approval", which resumes the paused run).
 
     tenant_id and user_id are trusted runtime context: they go to the gateways as-is and are
     never taken from model output.
@@ -17,4 +20,16 @@ class AgentTask(BaseModel):
     conversation_id: uuid.UUID
     tenant_id: uuid.UUID
     user_id: uuid.UUID
-    content: str = Field(min_length=1, max_length=2000)
+    kind: Literal["message", "approval"] = "message"
+    content: str = Field(default="", max_length=2000)
+    approval_id: uuid.UUID | None = None
+    decision: Literal["approved", "rejected", "expired"] | None = None
+    note: str = Field(default="", max_length=1000)
+
+    @model_validator(mode="after")
+    def _complete_for_its_kind(self) -> "AgentTask":
+        if self.kind == "message" and not self.content:
+            raise ValueError("a message task needs content")
+        if self.kind == "approval" and (self.approval_id is None or self.decision is None):
+            raise ValueError("an approval task needs approval_id and decision")
+        return self

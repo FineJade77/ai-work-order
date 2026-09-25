@@ -22,15 +22,19 @@ API Gateway【V1 未部署：JWT 校验和发消息限流由 app-service 自己�
   ▼
 app-service
   ├─ HTTP：员工"我的工单"、处理人处理（查询 / 状态流转）────────▶ ticket-service
+  ├─ HTTP：处理人审批（列表 / 批准 / 拒绝）───────────────────▶ tool-gateway
   ├─ XADD agent_tasks（同一事务提高会话下限）─────────────────▶ Redis
   ├─ 消费 agent_results：回复落库、关闭轮次 ◀───────────────── Redis
+  ├─ 消费 approval_events：开审批轮次、投递恢复任务 ◀────────── Redis
   └─ 读 conversation:{id}:events，经 SSE 推给浏览器 ◀───────── Redis
 
 agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
   ├─ XREADGROUP / XAUTOCLAIM 取任务；写事件流、结果流 ────────▶ Redis
-  ├─ POST /v1/tools/call ─▶ tool-gateway
+  ├─ GET /v1/tools/list、POST /v1/tools/call ─▶ tool-gateway
   │                           ├─ search_knowledge ──────────▶ knowledge-service
-  │                           └─ create_ticket（透传幂等键）─▶ ticket-service
+  │                           ├─ create_ticket（透传幂等键）─▶ ticket-service
+  │                           ├─ grant_access（按租户策略可能需审批）─▶ 模拟 IAM（access_grants）
+  │                           └─ 审批决定经发件箱 relay ───────▶ Redis approval_events
   └─ POST /v1/generate（SSE）─▶ ai-gateway ─▶ DeepSeek（OpenAI 兼容协议）
 ```
 
@@ -65,7 +69,7 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
   - `Conversation` / `Message`：问答会话
   - `Turn`：一条用户消息及其处理状态（`queued/done/failed`），`id` 就是投递给 Agent Runtime 的 `task_id`，`seq` 是它在会话内的序号（1、2、3…，唯一约束），`traceparent` 是创建它的请求的追踪上下文（补偿重投时接回同一条 trace）；部分唯一索引保证同一会话同时只有一轮在处理
   - 工单不在这里：归 ticket-service 所有（见 3.7 节）。员工"我的工单"、处理人处理工单的页面由应用服务调用 ticket-service 的内部接口实现，`start`/`resolve` 这类处理人操作的角色权限也在应用服务里判断。
-- 核心业务流程（问答与建单的判断都在 Agent Runtime，应用服务不调用 Tool Gateway）：
+- 核心业务流程（问答、建单与办理的判断都在 Agent Runtime；应用服务只为处理人的审批操作调用 Tool Gateway）：
   1. 员工发消息 → 在同一事务里写用户消息和 `Turn`，把任务投递到 `agent_tasks` → 返回 202。
   2. Agent Runtime 执行状态图：检索知识库并回答、等员工反馈；要求提单、检索无命中或反馈没解决时，由 Agent 经 Tool Gateway 建单（3.3 节）。
   3. 应用服务把执行事件经 SSE 转给前端，并从 `agent_results` 把这一轮的回复（回答、固定回复或建单通知）落库、关闭轮次。
@@ -74,6 +78,8 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
 - 会话接口：`POST/GET /v1/conversations`、`GET /v1/conversations/{id}/messages`（含进行中的 `active_task_id`，页面刷新后可重新接上 SSE）、`POST .../messages`（202 `{task_id}`；上一轮未结束返回 409 `TURN_IN_PROGRESS`）、`GET .../stream?task_id=`（SSE）。会话只有本人可见，其他人一律 404。
 - 回复落库：后台消费 `agent_results`（消费组 `app_service`），按轮次 upsert 唯一的助手消息并关闭轮次，可重复投递；不依赖 SSE 连接。晚到的结果只在该轮仍是会话最新一轮时覆盖此前的失败提示；员工已经发了新消息的，丢弃并记日志，免得旧回答插到新消息后面。
 - 补偿：每 30 秒一次（advisory lock 保证只有一个副本在扫），把 `queued` 超过 10 分钟的轮次用同一个 `task_id` 和 `seq` 重新入队，最多 2 次，之后标记失败并写 `error` 事件。阈值必须大于 Agent Runtime 自身重试的最长时间：3 次 ×（接管空闲 90 秒 + 扫描间隔 10 秒 + 任务超时 60 秒）= 480 秒，配置里强制校验；否则只是慢的任务会被复制一份，与原任务赛跑。
+- 审批（HITL，处理人）：`GET /v1/approvals?status`（处理人看本租户的，默认待审批；员工只看到自己的）、`GET /v1/approvals/{id}`（员工看别人的返回 404）、`POST /v1/approvals/{id}/approve|reject {note}`（只允许 `handler`，否则 403 `NOT_HANDLER`；审批人就是当前用户），转调 Tool Gateway，其业务错误（`SELF_APPROVAL`、`APPROVAL_NOT_PENDING`、`APPROVAL_EXPIRED`）原样透传。
+- 审批轮次：后台消费 Tool Gateway 的 `approval_events`（消费组 `app_service`），为发起审批的会话开一个 `kind=approval` 的轮次（没有员工消息；迁移 0007：`turns.kind`、`approval_id`（唯一）、`approval_decision`、`approval_note`，`user_message_id` 可空），按会话顺序分配 `seq`，投递审批任务恢复 Agent。`approval_id` 唯一，事件重复投递只开一个轮次；会话里还有未结束的轮次时，事件留在待处理，30 秒后被重新领取再试。消费 span 是 relay 发布 span 的子 span，并 link 到当初请求审批的那条 trace。结果为空（Agent 回报 `ignored`）时只关闭轮次、不写助手消息。补偿重投也覆盖审批轮次（没有员工消息，任务带审批字段）。
 - 工单页面（BFF）：员工的列表固定按本人过滤，看别人的工单返回 404；`start`/`resolve` 只允许 `handler`（否则 403 `NOT_HANDLER`），`start` 固定指派给自己；`actor_id` 总是当前用户。ticket-service 的业务错误（400/403/404/409）原样透传。
 - 对 Agent Runtime 是**异步任务分发**：应用服务不直接同步调用 Agent Runtime，而是把任务（`task_id`、`seq`、`conversation_id`、`tenant_id`、`user_id` 和这条消息的内容；历史在 Agent 的 checkpoint 里，不随任务传）写入 Redis Streams 队列即返回；随后从该会话的事件 Stream（`conversation:{conversation_id}:events`）读取 Agent Runtime 陆续写入的中间事件（"正在检索知识库…"、增量 token、最终结果）通过 SSE 转发给前端。对前端而言体验仍是"流式返回"，但应用服务与 Agent Runtime 之间是解耦的异步关系，见 3.3 节。
 
@@ -90,7 +96,7 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
   3. 队列深度是比 CPU/内存更贴合负载本质的扩缩容信号，可用 **KEDA 的 redis-streams scaler** 按 `agent_tasks` 队列长度精确扩缩容 Worker 副本数。
   4. 代价是多了一跳队列延迟（通常几十毫秒，相对 LLM 秒级延迟可忽略）和一套需要运维的组件；队列、事件流、会话锁都放在同一个 Redis 实例里，不新增基础设施种类。
 - 用 LangGraph 构建一个**固定状态图**（不做 ReAct 自由调工具：AI Gateway 只有文本流接口，V1 流程固定，固定图更可测），节点：
-  1. `classify_intent`：LLM 只判断意图：`question`（求助/咨询）、`ticket_request`（明确要求提单或转人工）、`chitchat`（寒暄或描述不清）。不判断领域和类别，提示词里不出现任何具体业务。输出解析失败按"描述不清"处理。进入分诊时清空上一个问题的检索结果和类别（同一轮里提出新问题时不继承）。
+  1. `classify_intent`：LLM 只判断意图：`question`（求助/咨询）、`action`（要求直接替他办一件事，走下面的动作路径）、`ticket_request`（明确要求提单或转人工）、`chitchat`（寒暄或描述不清）。不判断领域和类别，提示词里不出现任何具体业务。输出解析失败按"描述不清"处理。进入分诊时清空上一个问题的检索结果和类别（同一轮里提出新问题时不继承）。
   2. `retrieve_knowledge`：调用 Tool Gateway 的 `search_knowledge`；无命中直接转工单，不让模型硬答。命中时把第一条的 `category` 记为这个问题的类别——以后若因此建单，就用它作为工单类别。
      - 检索失败不等于无命中：否则知识库故障、或新租户漏配工具绑定，会把每个问题都静默变成工单。临时性故障（`TOOL_ERROR`、连不上/超时、5xx）在节点内最多试 3 次（间隔 0.5s、1s）；配置类错误（`TOOL_NOT_ALLOWED`/`UNKNOWN_TOOL`/`INVALID_ARGUMENTS`、其他 4xx）不重试。仍失败则进入 `knowledge_unavailable`：固定回复"知识库暂时无法访问，可稍后重问或回复「提工单」"，outcome 为 `knowledge_unavailable`，不建单、不等待反馈（下一条消息重新分类）。每次降级记一条 `knowledge_unavailable tenant_id=… code=… attempts=…` 的 ERROR 日志，供告警匹配。
   3. `generate_answer`：调用 AI Gateway 基于检索结果生成回答，流式写出事件。
@@ -98,10 +104,15 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
   5. `check_resolution`：LLM 根据员工回复判断已解决 / 没解决 / 新问题（新问题回到 `classify_intent`）；解析失败按"没解决"处理。
   6. `summarize_ticket` → `create_ticket`：先由 LLM 写工单描述（问题、现象、已尝试的知识库方案），再调用 Tool Gateway 创建工单。两步分开，是为了崩溃重跑时发出的建单请求完全相同。
   - 明确要求开工单、检索无命中、反馈没解决，都**自动建单**；寒暄或描述不清回复固定引导语；检索不可用回复固定说明、不建单。
+- **动作路径与 HITL 审批**（`action` 意图）：
+  - `plan_action`：调 Tool Gateway 的 `/v1/tools/list`，去掉固定路径用的 `search_knowledge`、`create_ticket`，把剩下的操作类工具的 OpenAI function 定义交给模型，输出 `{"tool", "arguments"}`（JSON，按名字核对，参数由网关按 Schema 校验）。没有合适的工具、缺信息或输出读不懂就转人工建单。这里决定**幂等键**（`会话:任务:action`）并存进图状态：这个节点完成即落盘，所以审批后在另一个任务里再调用时仍是同一个键，工具最多执行一次。
+  - `execute_action`：调用工具。网关返回 `pending_approval` → 回复"已提交审批"并进入 `await_approval`；成功 → `report_action`（有审批时回复"已通过审批并办理完成"，否则"已办理完成"）；`APPROVAL_REJECTED`/`APPROVAL_EXPIRED` → `report_action`（附审批意见，或说明已失效），不建单；其他失败 → 转人工建单。
+  - `await_approval`：`interrupt({"awaiting": "approval", "approval_id"})`，本轮 outcome 为 `awaiting_approval`。恢复值是 `{decision, note}`，节点把审批意见存进状态，然后回到 `execute_action` 用同一个键再调一次，拿到执行结果或拒绝/过期。
+  - runner 按任务类型和中断类型分流：线程在等审批时，员工的消息只回复"还在审批中"（outcome `awaiting_approval`），**不恢复**图——那条消息不是审批决定；审批任务（`kind=approval`）且审批 id 对得上才 `Command(resume={decision, note})`；对不上或没在等审批的审批任务回报一个空结果（outcome `ignored`、内容为空），让应用服务那一轮正常关闭。
   - 能自助解答的范围由租户的知识库决定，没有"场景内/场景外"清单：知识库没有的问题检索不到，就转人工。
   - 工单类别：来自命中条目的 `category`（租户自己的标签，如 `vpn`、`leave`、`expense`）；没检索过（直接要求提单）、没命中、或条目的类别为空/超过 50 字时用 `other`。检索过却没命中的工单，描述前加 `[知识库未命中]`。
 - 状态持久化：LangGraph checkpoint 存 **Postgres**（独立的 `agent_runtime` 库，`AsyncPostgresSaver`），`thread_id = conversation_id`，多轮历史就在图状态里，任务里只带最新一条消息。表结构由 langgraph-checkpoint-postgres 管理（迁移任务里跑 `setup()`，不走 Alembic）；表里没有 `tenant_id`，不做 RLS，只有 Agent Runtime 能连这个库。
-- 任务契约：`agent_tasks` 消息字段 `task_id, seq, conversation_id, tenant_id, user_id, content`，外加 W3C 追踪上下文 `traceparent`（有时还有 `tracestate`），由应用服务写入；`agent_results` 同样带上 Agent 运行的 `traceparent`；投递时在同一个 Redis 事务里把会话下限 `agent:floor:{conversation_id}` 提高到这个 `seq`（只升不降，24 小时过期）。调用 Tool Gateway 时 `session_id = conversation_id`，`user_id` 原样透传，`agent_role` 取配置（`service_agent`）。
+- 任务契约：`agent_tasks` 消息字段 `task_id, seq, conversation_id, tenant_id, user_id, content`；审批任务另有 `kind=approval, approval_id, decision, note`（`content` 为空）；没用到的字段不写；外加 W3C 追踪上下文 `traceparent`（有时还有 `tracestate`），由应用服务写入；`agent_results` 同样带上 Agent 运行的 `traceparent`；投递时在同一个 Redis 事务里把会话下限 `agent:floor:{conversation_id}` 提高到这个 `seq`（只升不降，24 小时过期）。调用 Tool Gateway 时 `session_id = conversation_id`，`user_id` 原样透传，`agent_role` 取配置（`service_agent`）。
 - 崩溃恢复与不重复建单：
   - 每个任务结束时，在写 `done`/`error` 事件的同一个 Redis 事务里，向全局 `agent_results` Stream 写一条结果（状态、outcome、这一轮唯一的助手消息、ticket_id），应用服务用消费组消费并落库，不依赖浏览器是否还连着。
   - 图跑到结束或 interrupt、并写出 `done` 事件后才 XACK；未确认的消息空闲超过阈值后由任一 Worker 用 XAUTOCLAIM 接管，投递超过 3 次进死信 `agent_tasks:dead` 并写 `error` 事件。

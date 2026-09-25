@@ -102,6 +102,8 @@ services:
       JWT_SECRET: ${JWT_SECRET:-dev-jwt-secret-change-me-in-any-real-deployment}
       TICKET_SERVICE_URL: http://ticket-service:8006
       TICKET_SERVICE_TOKEN: ${TICKET_SERVICE_TOKEN:-dev-ticket-service-token}
+      TOOL_GATEWAY_URL: http://tool-gateway:8003  # approvals (HITL)
+      TOOL_GATEWAY_SERVICE_TOKEN: ${TOOL_GATEWAY_SERVICE_TOKEN:-dev-tool-gateway-token}
     depends_on:
       observability:
         condition: service_started

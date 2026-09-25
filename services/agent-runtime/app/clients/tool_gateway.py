@@ -16,6 +16,16 @@ class ToolCallFailed(Exception):
         self.message = message
 
 
+class ApprovalPending(Exception):
+    """The call waits for a handler's approval (tenant policy). Call again with the same
+    idempotency key once it is decided: the tool then runs, or the refusal comes back."""
+
+    def __init__(self, approval_id: str, expires_at: str):
+        super().__init__(f"waiting for approval {approval_id}")
+        self.approval_id = approval_id
+        self.expires_at = expires_at
+
+
 class ToolGatewayClient:
     def __init__(self, http: httpx.AsyncClient, agent_role: str):
         self._http = http
@@ -43,7 +53,17 @@ class ToolGatewayClient:
         body = resp.json()
         if body["status"] == "error":
             raise ToolCallFailed(body["error"]["code"], body["error"]["message"])
+        if body["status"] == "pending_approval":
+            raise ApprovalPending(body["approval"]["id"], body["approval"]["expires_at"])
         return body["result"]
+
+    async def list_tools(self, task: AgentTask) -> list[dict[str, Any]]:
+        """The tools this agent role may call in the task's tenant, as OpenAI function definitions."""
+        resp = await self._http.get(
+            "/v1/tools/list", params={"tenant_id": str(task.tenant_id), "agent_role": self._agent_role}
+        )
+        resp.raise_for_status()
+        return resp.json()["tools"]
 
 
 @dataclass(frozen=True)

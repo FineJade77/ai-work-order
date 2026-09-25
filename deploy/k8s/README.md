@@ -65,4 +65,4 @@ kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/k8s/overlays/dev
   - 数值只是起点，按架构文档第 5 节调优。
 - **入口**：清单只有 ClusterIP Service。对外只应暴露 app-service，经 API Gateway（架构文档 3.1 节）或 Ingress；其余服务都是内部接口。
 - **可观测性**：`components/observability` 只适合开发集群（一体化容器、数据在 Pod 里、不记录提示词内容）。生产环境用 OTel Operator 或独立的 Collector，Tempo/Loki/Prometheus（或 Mimir）/Grafana 各自持久化部署，把 `otel-env` 里的 `OTEL_EXPORTER_OTLP_ENDPOINT` 指向 Collector，在 Collector 做尾部采样，告警接值班系统。访问开发集群里的 Grafana：`kubectl -n ai-work-order port-forward svc/observability 3000:3000`。
-- **NetworkPolicy**：建议只允许既定的调用方向：app-service → ticket-service；agent-runtime → tool-gateway、ai-gateway；tool-gateway → knowledge-service、ticket-service。
+- **NetworkPolicy**：建议只允许既定的调用方向：app-service → ticket-service、tool-gateway（审批）；agent-runtime → tool-gateway、ai-gateway；tool-gateway → knowledge-service、ticket-service。

@@ -55,6 +55,16 @@ spec:
                 secretKeyRef:
                   name: service-tokens
                   key: TICKET_SERVICE_TOKEN
+            - name: TOOL_GATEWAY_URL  # approvals (HITL)
+              valueFrom:
+                configMapKeyRef:
+                  name: service-endpoints
+                  key: TOOL_GATEWAY_URL
+            - name: TOOL_GATEWAY_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: service-tokens
+                  key: TOOL_GATEWAY_SERVICE_TOKEN
           readinessProbe:
             httpGet:
               path: /healthz

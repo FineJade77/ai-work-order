@@ -71,7 +71,9 @@ class Message(Base):
 
 
 class Turn(Base):
-    """One user message handed to agent-runtime; its id is the task_id there."""
+    """One unit of work handed to agent-runtime; its id is the task_id there. Usually an employee's
+    message (kind 'message'); or a handler's decision on an approval the conversation waits for
+    (kind 'approval', no user message), which resumes the paused run."""
 
     __tablename__ = "turns"
 
@@ -80,9 +82,14 @@ class Turn(Base):
     conversation_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False
     )
-    user_message_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("messages.id", ondelete="CASCADE"), nullable=False
+    kind: Mapped[str] = mapped_column(Text, nullable=False, server_default="message")  # message | approval
+    user_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("messages.id", ondelete="CASCADE"), nullable=True
     )
+    # Approval turns only (migration 0007). approval_id is unique: one turn per decision event.
+    approval_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, unique=True)
+    approval_decision: Mapped[str | None] = mapped_column(Text, nullable=True)  # approved | rejected | expired
+    approval_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     # 1, 2, 3... within the conversation; agent-runtime skips a task older than one it has seen.
     seq: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default="queued")  # queued | done | failed

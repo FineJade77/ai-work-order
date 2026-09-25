@@ -11,6 +11,11 @@ def build_graph(checkpointer: BaseCheckpointSaver) -> CompiledStateGraph:
     """
     classify_intent ─┬─ chitchat ─────────────────────────────→ reply → END
                      ├─ ticket_request ───────────────────────→ summarize_ticket → create_ticket → END
+                     ├─ action → plan_action ─┬─ nothing fits → summarize_ticket
+                     │                        └─ execute_action ─┬─ done / rejected / expired → report_action → END
+                     │                                           ├─ failed → summarize_ticket
+                     │                                           └─ pending → await_approval (interrupt)
+                     │                                                        → execute_action (same key)
                      └─ question → retrieve_knowledge ─┬─ no hits → summarize_ticket
                                                        ├─ search failed → knowledge_unavailable → END
                                                        └─ hits → generate_answer → await_feedback (interrupt)
@@ -27,6 +32,10 @@ def build_graph(checkpointer: BaseCheckpointSaver) -> CompiledStateGraph:
         nodes.check_resolution,
         nodes.reply,
         nodes.knowledge_unavailable,
+        nodes.plan_action,
+        nodes.execute_action,
+        nodes.await_approval,
+        nodes.report_action,
         nodes.summarize_ticket,
         nodes.create_ticket,
     ):
@@ -34,7 +43,9 @@ def build_graph(checkpointer: BaseCheckpointSaver) -> CompiledStateGraph:
 
     graph.add_edge(START, "classify_intent")
     graph.add_conditional_edges(
-        "classify_intent", nodes.route_after_classify, ["retrieve_knowledge", "reply", "summarize_ticket"]
+        "classify_intent",
+        nodes.route_after_classify,
+        ["retrieve_knowledge", "plan_action", "reply", "summarize_ticket"],
     )
     graph.add_conditional_edges(
         "retrieve_knowledge", nodes.route_after_retrieve, ["generate_answer", "summarize_ticket", "knowledge_unavailable"]
@@ -44,6 +55,12 @@ def build_graph(checkpointer: BaseCheckpointSaver) -> CompiledStateGraph:
     graph.add_conditional_edges(
         "check_resolution", nodes.route_after_resolution, [END, "classify_intent", "summarize_ticket"]
     )
+    graph.add_conditional_edges("plan_action", nodes.route_after_plan, ["execute_action", "summarize_ticket"])
+    graph.add_conditional_edges(
+        "execute_action", nodes.route_after_execute, ["await_approval", "report_action", "summarize_ticket"]
+    )
+    graph.add_edge("await_approval", "execute_action")
+    graph.add_edge("report_action", END)
     graph.add_edge("summarize_ticket", "create_ticket")
     graph.add_edge("create_ticket", END)
     graph.add_edge("reply", END)

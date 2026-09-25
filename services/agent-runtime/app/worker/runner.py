@@ -18,6 +18,13 @@ RECURSION_LIMIT = 25
 # run()'s return for a stale task that was skipped; not an outcome, so never published.
 SUPERSEDED = "superseded"
 BUDGET_EXCEEDED = "budget_exceeded"
+# An approval task nothing was waiting for; reported with no content, so no reply is stored.
+IGNORED = "ignored"
+
+
+def _awaiting(snapshot) -> str | None:
+    """What the paused run waits for: "feedback" (await_feedback) or "approval" (await_approval)."""
+    return snapshot.interrupts[0].value.get("awaiting") if snapshot.interrupts else None
 
 
 class TaskRunner:
@@ -63,6 +70,23 @@ class TaskRunner:
             logger.info("resuming task_id=%s at %s", task_id, snapshot.next)
             await events.publish("resumed")
             graph_input = None
+        elif _awaiting(snapshot) == "approval":
+            waiting_for = str(snapshot.interrupts[0].value["approval_id"])
+            if task.kind == "approval" and str(task.approval_id) == waiting_for:
+                # The handler decided: resume at await_approval, which calls the tool again.
+                graph_input = Command(resume={"decision": task.decision, "note": task.note})
+            elif task.kind == "approval":
+                return await self._ignore_approval(task, events, reason=f"waiting for {waiting_for}")
+            else:
+                # The employee wrote while the approval is pending: say so, leave the run paused.
+                # Their message is not the decision, so it must not resume the graph.
+                event("awaiting_approval_reply", approval_id=waiting_for)
+                await events.publish("reply", content=prompts.ACTION_WAITING_REPLY)
+                await events.finish(outcome="awaiting_approval", content=prompts.ACTION_WAITING_REPLY, ticket_id=None)
+                return "awaiting_approval"
+        elif task.kind == "approval":
+            # Nothing is waiting for it (e.g. a decision on an approval the run no longer awaits).
+            return await self._ignore_approval(task, events, reason="no approval awaited")
         elif snapshot.interrupts:
             # The previous run stopped at await_feedback; this message is the feedback.
             graph_input = Command(resume=task.content)
@@ -98,10 +122,17 @@ class TaskRunner:
         await events.finish(outcome=BUDGET_EXCEEDED, content=prompts.BUDGET_EXCEEDED_REPLY, ticket_id=None)
         return BUDGET_EXCEEDED
 
+    async def _ignore_approval(self, task: AgentTask, events: Events, *, reason: str) -> str:
+        """Reported, with no reply, so app-service can close the turn it opened for the decision."""
+        event("approval_ignored", approval_id=task.approval_id, reason=reason)
+        logger.warning("ignoring approval task_id=%s approval_id=%s: %s", task.task_id, task.approval_id, reason)
+        await events.finish(outcome=IGNORED, content="", ticket_id=None)
+        return IGNORED
+
     async def _finish(self, config: dict, events: Events) -> str:
         snapshot = await self._graph.aget_state(config)
         values = snapshot.values
-        outcome = "awaiting_feedback" if snapshot.interrupts else values["outcome"]
+        outcome = f"awaiting_{_awaiting(snapshot)}" if snapshot.interrupts else values["outcome"]
         # Every run ends with exactly one assistant message: the answer, a reply, or the ticket notice.
         content = next(m["content"] for m in reversed(values["messages"]) if m["role"] == "assistant")
         await events.finish(outcome=outcome, content=content, ticket_id=values.get("ticket_id"))

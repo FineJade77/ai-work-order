@@ -23,8 +23,9 @@ def queue(redis, consumer="c1", idle_ms=300):
     return RedisStreamTaskQueue(redis, consumer, claim_idle_ms=idle_ms, claim_interval_s=0)
 
 
-def task_fields(task):
-    return {k: str(v) for k, v in task.model_dump().items()}
+def task_fields(task) -> dict[str, str]:
+    """As app-service writes a task: fields a task doesn't use (None) are left out."""
+    return {k: str(v) for k, v in task.model_dump().items() if v is not None}
 
 
 async def pending_count(redis):

@@ -108,7 +108,8 @@ class ResultCollector:
                 # The employee has moved on since this turn failed; an answer now would land out of order.
                 logger.warning("dropping late %s result for superseded task_id=%s", status, task_id)
                 return
-            await repo.upsert_assistant_reply(session, turn, fields["content"])
+            if fields["content"]:  # empty: the agent had nothing to say (an approval nobody awaited)
+                await repo.upsert_assistant_reply(session, turn, fields["content"])
             first_completion = turn.status == "queued"  # not a late answer replacing a failure notice
             turn.status = status
             if status == "done":

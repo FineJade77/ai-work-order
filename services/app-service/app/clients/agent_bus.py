@@ -84,9 +84,13 @@ class AgentBus:
         content: str,
         parent: Context | None = None,
         requeue: int | None = None,
+        approval: dict[str, str] | None = None,
     ) -> None:
         """parent: the trace to send under; the current one by default. The requeuer passes the
-        turn's original trace, so a requeued task still belongs to it."""
+        turn's original trace, so a requeued task still belongs to it.
+
+        approval: for an approval turn, {approval_id, decision, note}; the task (kind "approval")
+        resumes the agent run waiting for that approval, and content is empty."""
         fields = {
             "task_id": task_id,
             "seq": seq,
@@ -95,6 +99,8 @@ class AgentBus:
             "user_id": user_id,
             "content": content,
         }
+        if approval is not None:
+            fields |= {"kind": "approval", **approval}
         attributes = messaging_attributes(
             TASK_STREAM, "send", task_id=task_id, seq=seq, conversation_id=conversation_id, requeue=requeue
         )

@@ -6,6 +6,7 @@ from opentelemetry.instrumentation.utils import suppress_instrumentation
 from sqlalchemy import func, select
 
 from app.clients.agent_bus import AgentBus, context_from
+from app.workers.approval_events import approval_fields
 from app.core.config import Settings
 from app.db.models import Conversation, Message, Tenant, Turn
 from app.db.session import session_factory, tenant_scope
@@ -57,7 +58,7 @@ class Requeuer:
                     stmt = (
                         select(Turn, Conversation.user_id, Message.content)
                         .join(Conversation, Conversation.id == Turn.conversation_id)
-                        .join(Message, Message.id == Turn.user_message_id)
+                        .outerjoin(Message, Message.id == Turn.user_message_id)  # approval turns have none
                         .where(Turn.status == "queued", Turn.updated_at < stale_before)
                         .with_for_update(of=Turn, skip_locked=True)
                     )
@@ -73,8 +74,8 @@ class Requeuer:
                         # again, and a duplicate task is harmless.
                         await self._bus.enqueue(
                             task_id=turn.id, seq=turn.seq, conversation_id=turn.conversation_id, tenant_id=tenant_id,
-                            user_id=user_id, content=content, parent=context_from(turn.traceparent),
-                            requeue=turn.enqueue_count,
+                            user_id=user_id, content=content or "", parent=context_from(turn.traceparent),
+                            requeue=turn.enqueue_count, approval=approval_fields(turn),
                         )
                         TURN_REQUEUES.add(1, {"app.gave_up": False, "app.tenant_id": str(tenant_id)})
                         turn.enqueue_count += 1

@@ -11,7 +11,7 @@ import anyio
 from langgraph.runtime import Runtime
 from langgraph.types import interrupt
 
-from app.clients.tool_gateway import classify_failure
+from app.clients.tool_gateway import ApprovalPending, ToolCallFailed, classify_failure
 from app.graph import prompts
 from app.graph.state import AgentState, Deps
 from app.metrics import CLASSIFIED_INTENTS, KNOWLEDGE_SEARCHES
@@ -26,7 +26,10 @@ SUMMARY_MAX_CHARS = 500  # create_ticket's schema limit
 # these, stays well inside task_timeout_seconds (60s) together with classify_intent.
 SEARCH_RETRY_DELAYS = (0.5, 1.0)
 
-INTENTS = {"question", "ticket_request", "chitchat"}
+INTENTS = {"question", "action", "ticket_request", "chitchat"}
+# Tools every tenant's agent uses on its fixed paths; the action path picks among the others.
+BUILTIN_TOOLS = frozenset({"search_knowledge", "create_ticket"})
+FINAL_APPROVAL_CODES = {"APPROVAL_REJECTED": "rejected", "APPROVAL_EXPIRED": "expired"}
 # A ticket's category when no knowledge entry was used (tool-gateway caps categories at 50 chars).
 FALLBACK_CATEGORY = "other"
 CATEGORY_MAX_CHARS = 50
@@ -196,11 +199,97 @@ async def create_ticket(state: AgentState, runtime: Runtime[Deps]) -> dict:
     return {"ticket_id": ticket_id, "outcome": "ticket_created", "messages": [{"role": "assistant", "content": content}]}
 
 
+async def plan_action(state: AgentState, runtime: Runtime[Deps]) -> dict:
+    """Has the model pick one of the tenant's action tools and its arguments from the conversation.
+    What the tools are is tool-gateway's business (tools/list), so nothing here names a domain.
+    The idempotency key is fixed here: this node's result is checkpointed, so the call made after
+    an approval (in a later run, under another task) reuses it and the tool runs at most once."""
+    deps = runtime.context
+    key = f"{deps.task.conversation_id}:{deps.task.task_id}:action"
+    try:
+        tools = [t["function"] for t in await deps.tools.list_tools(deps.task)]
+    except Exception as exc:
+        if classify_failure(exc) is None:
+            raise
+        event("action_tools_unavailable", error=type(exc).__name__)
+        return {"action_tool": None, "action_key": key}
+    tools = [t for t in tools if t["name"] not in BUILTIN_TOOLS]
+    if not tools:
+        event("no_action_tools")
+        return {"action_tool": None, "action_key": key}
+    system_prompt = prompts.PLAN_ACTION.replace("{tools}", json.dumps(tools, ensure_ascii=False))
+    plan = _parse_json(await deps.models.complete(deps.task, system_prompt=system_prompt, messages=_history(state)))
+    tool, arguments = plan.get("tool"), plan.get("arguments")
+    if tool not in {t["name"] for t in tools} or not isinstance(arguments, dict):
+        # No fitting tool, missing information, or unreadable output: a person takes it from here.
+        event("no_action_planned", tool=tool)
+        return {"action_tool": None, "action_key": key}
+    return {"action_tool": tool, "action_arguments": arguments, "action_key": key}
+
+
+async def execute_action(state: AgentState, runtime: Runtime[Deps]) -> dict:
+    """Calls the planned tool. If the tenant's policy makes it wait for a handler, tells the
+    employee and hands over to await_approval; once resumed, runs again with the same key and
+    gets the tool's result, or the rejection or expiry, back from tool-gateway."""
+    deps = runtime.context
+    try:
+        result = await deps.tools.call(
+            deps.task, state["action_tool"], state["action_arguments"], idempotency_key=state["action_key"]
+        )
+    except ApprovalPending as pending:
+        event("approval_pending", approval_id=pending.approval_id)
+        await deps.events.publish("reply", content=prompts.ACTION_SUBMITTED_REPLY)
+        return {
+            "action_status": "pending",
+            "approval_id": pending.approval_id,
+            "messages": [{"role": "assistant", "content": prompts.ACTION_SUBMITTED_REPLY}],
+        }
+    except ToolCallFailed as exc:
+        if exc.code in FINAL_APPROVAL_CODES:  # the approver's note came with the decision (await_approval)
+            return {"action_status": FINAL_APPROVAL_CODES[exc.code]}
+        event("action_failed", code=exc.code)
+        return {"action_status": "failed"}  # a person takes over: summarize_ticket
+    event("action_done", tool=state["action_tool"])
+    return {"action_status": "done"}
+
+
+async def await_approval(state: AgentState, runtime: Runtime[Deps]) -> dict:
+    # Ends this run. An approval task (app-service turns the decision event into one) resumes
+    # here; employee messages meanwhile get a status reply from the runner and do not resume.
+    # Nothing may come before interrupt(): the node runs again from the top when resumed.
+    decision = interrupt({"awaiting": "approval", "approval_id": state["approval_id"]})
+    task = runtime.context.task
+    event("approval_decided", decision=decision.get("decision"))
+    return {"task_id": str(task.task_id), "seq": task.seq, "approval_note": decision.get("note") or None}
+
+
+async def report_action(state: AgentState, runtime: Runtime[Deps]) -> dict:
+    status = state["action_status"]
+    if status == "done":
+        content = prompts.ACTION_APPROVED_REPLY if state.get("approval_id") else prompts.ACTION_DONE_REPLY
+    elif status == "rejected":
+        note = state.get("approval_note")
+        content = prompts.ACTION_REJECTED_REPLY.format(note=f"审批意见：{note}。" if note else "")
+    else:
+        content = prompts.ACTION_EXPIRED_REPLY
+    await runtime.context.events.publish("reply", content=content)
+    return {"outcome": f"action_{status}", "messages": [{"role": "assistant", "content": content}]}
+
+
 def route_after_classify(state: AgentState) -> str:
     return {
         "question": "retrieve_knowledge",
+        "action": "plan_action",
         "chitchat": "reply",
     }.get(state["intent"], "summarize_ticket")  # ticket_request
+
+
+def route_after_plan(state: AgentState) -> str:
+    return "execute_action" if state.get("action_tool") else "summarize_ticket"
+
+
+def route_after_execute(state: AgentState) -> str:
+    return {"pending": "await_approval", "failed": "summarize_ticket"}.get(state["action_status"], "report_action")
 
 
 def route_after_retrieve(state: AgentState) -> str:

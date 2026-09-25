@@ -124,7 +124,8 @@ ai-work-order/
 > 设计见架构文档 3.4 节（网关）、3.3 节（Agent）、3.2 节（应用服务）。分三步，每步单独提交。
 - **8.1 Tool Gateway 审批状态机（已完成）**：迁移 0004（`role_tool_bindings.requires_approval`、`tool_calls`/`tool_call_logs` 状态加 `pending_approval`、`tool_approvals`、`approval_outbox`、`access_grants`）；`grant_access` 工具与 `MockAccessProvider`；调用管线的审批分支（开审批、按审批状态恢复、拒绝/过期为最终结果）；审批接口（列表、详情、决定，四眼原则，过期后不能决定）；发件箱 relay（发布决定、到期置为 expired）发到 `approval_events`；seed 让 demo 租户的 `grant_access` 需要审批、northwind 不需要；tool-gateway 新增 `REDIS_URL`。
   - **验收标准**：集成测试（真 tool-gateway、Postgres、Redis）覆盖——批准后同一幂等键再调才执行且只执行一次、之后重放；自批 403；拒绝后再调永远是 `APPROVAL_REJECTED`（附备注）且不执行；无人处理时 relay 置为过期并发事件、之后不能再批准、再调为 `APPROVAL_EXPIRED`；截止时间已过但 relay 还没处理时批准也被拒；另一租户的策略下直接执行；等待中的调用审计为 `pending_approval`；每个决定都出现在 `approval_events`。迁移可降级再升级。
-- **8.2 Agent 动作路径与应用服务审批（待做）**：分诊的 `action` 意图、`plan_action`（模型从 `tools/list` 选工具）、`execute_action`（`pending_approval` 时 interrupt，恢复后同一幂等键再调）；等审批期间员工发消息只回复状态；应用服务的审批接口（处理人）、消费 `approval_events` 建系统轮次并投递恢复任务。
+- **8.2 Agent 动作路径与应用服务审批（已完成）**：agent-runtime——任务新增 `kind=approval`（`approval_id`、`decision`、`note`）；分诊的 `action` 意图；`plan_action`（`tools/list` + 模型选工具与参数，幂等键在此决定并落盘）、`execute_action`、`await_approval`（interrupt）、`report_action`；runner 按任务类型与中断类型分流（等审批时员工消息只回复状态、不恢复；对不上的审批任务回报空结果）；客户端认识 `pending_approval`、`list_tools`。app-service——迁移 0007（审批轮次）；`ApprovalEventConsumer` 消费 `approval_events` 开审批轮次并投递任务（按审批 id 去重，会话有轮次在处理时稍后重试）；审批 BFF 接口（处理人决定、员工看自己的）；空结果不写助手消息；补偿重投覆盖审批轮次；app-service 新增 `TOOL_GATEWAY_URL`/`TOOL_GATEWAY_SERVICE_TOKEN`。
+  - **验收标准**：agent-runtime 单测覆盖——需要审批时暂停、批准后恢复且全程同一幂等键、工具只执行一次；等待中员工消息只得到状态回复、不分诊不恢复；拒绝（附审批意见）与过期都不执行、不建单；直接执行的策略下无审批；没有可用计划或执行失败转人工；对不上的审批任务回报空结果。端到端（真 tool-gateway）：请求 → 暂停 → 网关批准 → 审批任务恢复 → 开通记录恰好一条。app-service 集成测试：决定事件开审批轮次并投递带审批字段的任务、重复事件不重复开、会话有轮次在处理时等它结束后再开、空结果不写回复；审批接口的角色与可见性，网关错误透传。真实模型走通：申请 → 已提交审批 → 等待中追问得到状态 → 员工自批被拒 → 处理人批准 → 员工收到"已通过审批并办理完成"。
 - **8.3 可观测性、演示与文档（待做）**：审批的 span、事件与 link，审批指标、看板和告警；`scripts/demo.sh access`。
 
 ## 工作方式要求

@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     jwt_secret: str = Field(min_length=32)
     ticket_service_url: str
     ticket_service_token: str
+    # Approvals (HITL) live in tool-gateway; handlers list and decide them through app-service.
+    tool_gateway_url: str
+    tool_gateway_service_token: str
 
     jwt_ttl_seconds: int = 8 * 3600
     # A turn still queued this long has probably lost its task (e.g. Redis failover), so it is

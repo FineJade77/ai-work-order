@@ -7,6 +7,12 @@ DATABASE_URL = os.environ.get(
 REDIS_URL = os.environ.get("APP_SERVICE_TEST_REDIS_URL", "redis://localhost:26379/13")
 TICKET_SERVICE_URL = os.environ.get("TICKET_SERVICE_URL", "http://localhost:8006")
 TICKET_SERVICE_TOKEN = os.environ.get("TICKET_SERVICE_TOKEN", "dev-ticket-service-token")
+TOOL_GATEWAY_URL = os.environ.get("TOOL_GATEWAY_URL", "http://localhost:8003")
+TOOL_GATEWAY_TOKEN = os.environ.get("TOOL_GATEWAY_SERVICE_TOKEN", "dev-tool-gateway-token")
+# The tool-gateway database, for creating approvals to test against (superuser: bypasses RLS).
+GATEWAY_ADMIN_DB_URL = os.environ.get(
+    "TOOL_GATEWAY_ADMIN_DB_URL", "postgresql://work_order:work_order@localhost:25432/tool_gateway"
+)
 # Superuser connections: bypass RLS, used only for fixtures, assertions and cleanup.
 ADMIN_DB_URL = os.environ.get("APP_SERVICE_ADMIN_DB_URL", "postgresql://work_order:work_order@localhost:25432/app_service")
 TICKET_ADMIN_DB_URL = os.environ.get(
