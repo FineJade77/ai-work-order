@@ -111,6 +111,15 @@ ai-work-order/
 - `README.md`：本地启动、5 个演示场景（`scripts/demo.sh`：demo 租户的 vpn/account/email/printer，其中 printer 是知识库未命中直接建单；northwind 租户的 leave）、curl 完整闭环（含处理人处理）、审计与用量查询、运行测试（`scripts/test-all.sh`）、排障。
 - **验收标准**：在不含 `.venv`/`.env` 的干净副本里严格按 README 操作：一条命令启动、演示脚本和 README 中的 curl 代码块原样执行跑通闭环（真实 DeepSeek）、审计与用量查询有输出、`scripts/test-all.sh` 从零建环境全部通过；K8s 清单做静态校验（本地渲染，检查 Secret/ConfigMap 引用、Service 选择器与端口、环境变量与 compose 一致），未在真实集群部署。
 
+### 阶段 7：可观测性（OpenTelemetry）
+> 设计见架构文档第 5 节。分三步，每步单独提交。
+- **7.1 追踪与日志（已完成）**：六个服务加 OTel 依赖（distro、OTLP HTTP exporter，以及各自用到的 fastapi/httpx/psycopg/logging 插桩），用 `opentelemetry-instrument` 启动，镜像默认关闭 SDK；FastAPI 在代码里插桩（去掉 send/receive 子 span，跳过 `/healthz`）；日志改为带 `trace_id` 的 JSON；compose 新增 `observability`（`grafana/otel-lgtm:0.33.1`），各服务共用 `x-otel-env`。
+  - **验收标准**：每个服务的 `tests/unit/test_telemetry.py`（JSON 字段、span 内带 id、重复配置幂等、一次请求只有一个服务端 span 且不记探针）全部通过；跑一次演示后 Tempo 里六个服务都有 trace，agent-runtime → tool-gateway → knowledge-service / ticket-service 在同一条 trace 里且带数据库 span；Loki 能按 `trace_id` 查到这条 trace 的日志。
+- **7.2 跨队列与 Agent/LLM（待做）**：任务和结果消息携带 `traceparent`，一轮对话一条 trace；LangGraph 节点 span；ai-gateway 的 GenAI span（内容记录有开关）；锁冲突、跳过旧副本、降级、预算拒绝、死信记为 span 事件。
+  - **验收标准**：内存 exporter 单测覆盖上下文注入与恢复、节点 span 名称与属性；集成测试跑一轮对话后经 Tempo 查询接口断言同一条 trace 覆盖至少 5 个服务且含队列生产/消费 span。
+- **7.3 指标、看板、告警（待做）**：OTel metrics 覆盖队列、任务、Agent、LLM、入口；Grafana 看板与告警规则放进仓库（provisioning）；示例 SLO；k8s 可选组件 `components/observability`。
+  - **验收标准**：看板在演示流量下有数据；人为制造死信和降级时对应告警触发。
+
 ## 工作方式要求
 
 - 每个阶段先给出接口/数据结构定义（可以是简短的代码骨架或类型声明），确认结构合理后再补全实现逻辑，不要一次性输出整个阶段的完整代码而不做中间检查点。

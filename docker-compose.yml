@@ -3,8 +3,33 @@
 # Seeds are local demo data (idempotent), so `docker compose up -d --build` yields a usable stack.
 # The work_order superuser is for db-init and test fixtures only; services never use it.
 # It has no database of its own: it connects to the built-in 'postgres' maintenance database.
+# Telemetry: every service sends traces, metrics and logs over OTLP to `observability`
+# (grafana/otel-lgtm: collector + Tempo + Prometheus + Loki + Grafana, http://localhost:23000).
+
+x-otel-env: &otel-env
+  OTEL_SDK_DISABLED: "false"  # the images default to true
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://observability:4318
+  OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf  # only the HTTP exporter is installed; the default is gRPC
+  OTEL_TRACES_EXPORTER: otlp
+  OTEL_METRICS_EXPORTER: otlp
+  OTEL_LOGS_EXPORTER: otlp
+  OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED: "true"  # also ship log records, not just stdout
+  OTEL_RESOURCE_ATTRIBUTES: service.namespace=ai-work-order,deployment.environment.name=local
+  OTEL_METRIC_EXPORT_INTERVAL: "15000"
 
 services:
+  observability:
+    # One container for learning and local use; production runs these as separate components.
+    # Data lives in the container: recreating it starts from empty.
+    image: grafana/otel-lgtm:0.33.1
+    ports:
+      - "23000:3000"   # Grafana
+      - "24317:4317"   # OTLP gRPC
+      - "24318:4318"   # OTLP HTTP
+      - "23200:3200"   # Tempo query API
+      - "23100:3100"   # Loki query API
+      - "29090:9090"   # Prometheus
+
   postgres:
     image: postgres:16-alpine
     environment:
@@ -65,12 +90,16 @@ services:
     ports:
       - "8001:8001"
     environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: app-service
       DATABASE_URL: postgresql+psycopg://app_service_app:app_service_app_dev@postgres:5432/app_service
       REDIS_URL: redis://redis:6379/0
       JWT_SECRET: ${JWT_SECRET:-dev-jwt-secret-change-me-in-any-real-deployment}
       TICKET_SERVICE_URL: http://ticket-service:8006
       TICKET_SERVICE_TOKEN: ${TICKET_SERVICE_TOKEN:-dev-ticket-service-token}
     depends_on:
+      observability:
+        condition: service_started
       app-service-seed:
         condition: service_completed_successfully
       redis:
@@ -92,6 +121,8 @@ services:
   agent-runtime:
     build: ./services/agent-runtime
     environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: agent-runtime
       REDIS_URL: redis://redis:6379/0
       CHECKPOINT_DATABASE_URL: postgresql://agent_runtime_app:agent_runtime_app_dev@postgres:5432/agent_runtime
       TOOL_GATEWAY_URL: http://tool-gateway:8003
@@ -99,6 +130,8 @@ services:
       AI_GATEWAY_URL: http://ai-gateway:8004
       AI_GATEWAY_SERVICE_TOKEN: ${AI_GATEWAY_SERVICE_TOKEN:-dev-ai-gateway-token}
     depends_on:
+      observability:
+        condition: service_started
       redis:
         condition: service_healthy
       agent-runtime-migrate:
@@ -131,6 +164,8 @@ services:
     ports:
       - "8003:8003"
     environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: tool-gateway
       DATABASE_URL: postgresql+psycopg://tool_gateway_app:tool_gateway_app_dev@postgres:5432/tool_gateway
       TOOL_GATEWAY_SERVICE_TOKEN: ${TOOL_GATEWAY_SERVICE_TOKEN:-dev-tool-gateway-token}
       KNOWLEDGE_SERVICE_URL: http://knowledge-service:8005
@@ -138,6 +173,8 @@ services:
       TICKET_SERVICE_URL: http://ticket-service:8006
       TICKET_SERVICE_TOKEN: ${TICKET_SERVICE_TOKEN:-dev-ticket-service-token}
     depends_on:
+      observability:
+        condition: service_started
       tool-gateway-seed:
         condition: service_completed_successfully
       knowledge-service:
@@ -159,12 +196,16 @@ services:
     ports:
       - "8004:8004"
     environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: ai-gateway
       DATABASE_URL: postgresql+psycopg://ai_gateway_app:ai_gateway_app_dev@postgres:5432/ai_gateway
       MODEL_BASE_URL: https://api.deepseek.com
       MODEL_NAME: deepseek-chat
       MODEL_API_KEY: ${DEEPSEEK_API_KEY}
       AI_GATEWAY_SERVICE_TOKEN: ${AI_GATEWAY_SERVICE_TOKEN:-dev-ai-gateway-token}
     depends_on:
+      observability:
+        condition: service_started
       ai-gateway-migrate:
         condition: service_completed_successfully
 
@@ -173,7 +214,12 @@ services:
     ports:
       - "8005:8005"
     environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: knowledge-service
       KNOWLEDGE_SERVICE_TOKEN: ${KNOWLEDGE_SERVICE_TOKEN:-dev-knowledge-service-token}
+    depends_on:
+      observability:
+        condition: service_started
 
   ticket-service-migrate:
     build: ./services/ticket-service
@@ -189,9 +235,13 @@ services:
     ports:
       - "8006:8006"
     environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: ticket-service
       DATABASE_URL: postgresql+psycopg://ticket_service_app:ticket_service_app_dev@postgres:5432/ticket_service
       TICKET_SERVICE_TOKEN: ${TICKET_SERVICE_TOKEN:-dev-ticket-service-token}
     depends_on:
+      observability:
+        condition: service_started
       ticket-service-migrate:
         condition: service_completed_successfully
 

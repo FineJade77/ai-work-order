@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from app import budget
 from app.core.config import Settings, get_settings
+from app.core.telemetry import configure_logging, instrument_app
 from app.providers import ModelProvider, get_provider
 from app.schemas import GenerateRequest
 from app.security import require_service_token
@@ -23,7 +24,9 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     yield
 
 
+configure_logging("ai-gateway")
 app = FastAPI(title="ai-gateway", lifespan=lifespan)
+instrument_app(app)
 
 
 @app.get("/healthz")

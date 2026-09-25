@@ -13,6 +13,7 @@ from redis.asyncio import Redis
 from app.clients.ai_gateway import AIGatewayClient
 from app.clients.tool_gateway import ToolGatewayClient
 from app.core.config import get_settings
+from app.core.telemetry import configure_logging, instrument_app
 from app.events import EventPublisher
 from app.graph.builder import build_graph
 from app.worker.consumer import POLL_BLOCK_MS, TaskConsumer
@@ -89,7 +90,9 @@ def create_app() -> FastAPI:
             return {"status": "consumer stopped"}
         return {"status": "ok"}
 
+    instrument_app(app)
     return app
 
 
+configure_logging("agent-runtime")
 app = create_app()

@@ -13,6 +13,7 @@ from app.clients.agent_bus import AgentBus
 from app.clients.ticket_service import TicketServiceClient
 from app.core.config import get_settings
 from app.core.errors import ApiError
+from app.core.telemetry import configure_logging, instrument_app
 from app.services.rate_limit import MessageRateLimiter
 from app.services.stream_service import READ_BLOCK_MS
 from app.services.ticket_access import TicketAccess
@@ -82,7 +83,9 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     app.include_router(api_router)
+    instrument_app(app)
     return app
 
 
+configure_logging("app-service")
 app = create_app()

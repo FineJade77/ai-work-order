@@ -11,6 +11,12 @@ dependencies = [
     "alembic>=1.13",
     "jsonschema>=4.18",
     "httpx>=0.27",
+    "opentelemetry-distro>=0.65b0",
+    "opentelemetry-exporter-otlp-proto-http>=1.44",
+    "opentelemetry-instrumentation-fastapi>=0.65b0",
+    "opentelemetry-instrumentation-logging>=0.65b0",
+    "opentelemetry-instrumentation-psycopg>=0.65b0",
+    "opentelemetry-instrumentation-httpx>=0.65b0",
 ]
 
 [project.optional-dependencies]

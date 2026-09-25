@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 from app.api.internal.router import internal_router
 from app.core.config import get_settings
 from app.core.errors import ApiError
+from app.core.telemetry import configure_logging, instrument_app
 
 
 @asynccontextmanager
@@ -28,7 +29,9 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     app.include_router(internal_router)
+    instrument_app(app)
     return app
 
 
+configure_logging("ticket-service")
 app = create_app()

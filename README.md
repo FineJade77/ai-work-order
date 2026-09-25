@@ -198,6 +198,18 @@ docker compose exec postgres psql -U work_order -d app_service -c \
 
 - 每个员工每分钟最多发 6 条消息、每天 200 条，超出返回 429 `RATE_LIMITED`（带 `Retry-After`）。用 app-service 的 `MESSAGE_RATE_PER_MINUTE`、`MESSAGE_RATE_PER_DAY` 调整。
 
+## 可观测性
+
+`docker compose up` 会一起启动 `observability`（`grafana/otel-lgtm`：OTel Collector + Tempo + Prometheus + Loki + Grafana），六个服务把 trace、指标、日志经 OTLP 发给它。数据存在容器里，重建容器就清空。
+
+- Grafana：http://localhost:23000（本地匿名访问），在 Explore 里选数据源：
+  - **Tempo**：按服务查 `{resource.service.name="tool-gateway"}`，打开一条 trace 能看到跨服务调用和每条 SQL；
+  - **Loki**：`{service_name="app-service"}` 看日志，每行是 JSON，带 `trace_id`，可以跳到对应的 trace；
+  - **Prometheus**：各服务的 HTTP 指标（自动插桩提供）。
+- 直接查询的端口：Tempo `23200`、Loki `23100`、Prometheus `29090`；OTLP 接收 `24317`（gRPC）/`24318`（HTTP），本地直接跑服务时可以把 `OTEL_EXPORTER_OTLP_ENDPOINT` 指向 `http://localhost:24318`。
+- 服务的标准输出也是一行一个 JSON：`docker compose logs app-service`。
+- 现阶段的缺口：Redis 队列两端还没有串成一条 trace（agent-runtime 的处理各自是独立的 trace），指标看板和告警也还没有，见 `docs/implementation-plan.md` 阶段 7。
+
 ## 运行测试
 
 ```bash
@@ -213,7 +225,8 @@ scripts/test-all.sh app-service     # 只跑指定服务
 
 ## 排障
 
-- **端口被占用**：compose 用到 8001、8003–8006、25432（Postgres）、26379（Redis）。
+- **端口被占用**：compose 用到 8001、8003–8006、25432（Postgres）、26379（Redis），以及可观测性的 23000、23100、23200、24317、24318、29090。
+- **Grafana 里没有数据**：确认 `observability` 容器是 `Up`；服务是否打开了遥测（`docker compose exec app-service env | grep OTEL_SDK_DISABLED` 应为 `false`）。
 - **发消息后迟迟没有回复，或收到 `error` 事件**：多半是模型调用失败。检查 `.env` 里的 `DEEPSEEK_API_KEY`，看 `docker compose logs ai-gateway agent-runtime`。Worker 会自动重试，每次间隔约 90 秒，3 次都失败后任务进入死信：
   `docker compose exec redis redis-cli XRANGE agent_tasks:dead - +`
 - **收到"今天 AI 助手的使用额度已经用完"**：租户当天的 token 预算用完了，agent-runtime 日志里有 `budget_exceeded tenant_id=…`。按"调整限额"一节提高预算，不用重启。

@@ -42,6 +42,7 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
 | ai-gateway | Postgres `ai_gateway` | 模型调用唯一出口：服务令牌、每日 token 预算、用量记录（3.5 节） |
 | knowledge-service | 无（随镜像发布的静态 JSON） | 只读检索（3.6 节） |
 | ticket-service | Postgres `ticket_service` | 工单数据与生命周期的唯一所有者（3.7 节） |
+| observability | 容器内（重建即清空） | `grafana/otel-lgtm`：OTel Collector + Tempo + Prometheus + Loki + Grafana，各服务经 OTLP 上报（5 节） |
 | Redis | — | 任务队列 `agent_tasks`（含死信）、结果流 `agent_results`、每会话事件流、会话锁、会话下限、发消息限流计数；V1 不做会话缓存 |
 
 - 向量库（知识库 V2）、对象存储（附件）【V1 未实现】。
@@ -195,7 +196,17 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
 - 组件容器化，每个逻辑组件（API Gateway 除外，用 Ingress Controller）独立部署：`app-service`（Deployment，处理 HTTP/SSE）、`agent-runtime`（Deployment，作为 **无状态 Worker** 消费队列，不建 Service）、`tool-gateway`、`ai-gateway`、`knowledge-service`、`ticket-service`。
 - 弹性扩缩容（`deploy/k8s/components/autoscaling`，默认不启用）：五个 HTTP 服务（`app-service`、`tool-gateway`、`ai-gateway`、`knowledge-service`、`ticket-service`）用标准 **HPA**（CPU）；`agent-runtime` 用 **KEDA 的 redis-streams scaler**，按 `agent_tasks` 尚未投递的积压（`lagCount`，而不是 pending 数：每个副本最多同时处理 8 个，pending 会卡在 8 × 副本数）扩缩容 Worker 副本，负载突增（如上班早高峰集中反馈 VPN 问题）时可快速扩容，队列清空后缩回最小副本数（1）。
 - 有状态依赖（PostgreSQL、Redis、向量库）优先使用云无关 Operator（如 CloudNativePG、Redis Operator）或直接对接任意云厂商的托管兼容服务，业务代码只依赖标准协议（Postgres wire protocol / Redis protocol），不绑定专有 SDK。
-- 可观测性【V1 未实现，只有日志】：降级和预算用完各有一条固定格式的 ERROR 日志（`knowledge_unavailable …`、`budget_exceeded …`）可以配告警。目标方案：OpenTelemetry 统一埋点（Trace 贯穿 API Gateway → 应用服务 → Agent Runtime → Tool/AI Gateway），Prometheus + Grafana 做指标，日志集中到 Loki/ELK，按 `tenant_id` 打标签便于按租户排查问题和统计用量。
+- 可观测性：全部基于 OpenTelemetry，业务代码只依赖 OTel API，后端可换（Jaeger、SigNoz、云厂商）只改 Collector。分三个阶段：
+  - **阶段 1（已完成）追踪与日志**：
+    - 各服务用 `opentelemetry-instrument uvicorn …` 启动（零代码插桩），由 `OTEL_*` 环境变量配置；镜像默认 `OTEL_SDK_DISABLED=true`，部署时打开并指向 Collector（compose 用 `x-otel-env` 锚点统一配置，协议 `http/protobuf`）。
+    - 自动插桩：httpx（跨服务传递 W3C trace context）、psycopg（五个有库的服务都用驱动层插桩；SQLAlchemy 2.1 超出了 SQLAlchemy 插桩支持的版本范围，会被静默跳过，驱动层与 ORM 版本无关）、logging。
+    - FastAPI 在代码里插桩（`app/core/telemetry.py: instrument_app`，镜像里关闭了自动的 FastAPI 插桩）：只有这里能去掉 ASGI send/receive 子 span（对 SSE 是每个事件一个 span），`/healthz` 不记。
+    - 不自动插桩 Redis：阻塞轮询和 SSE 读会让每条命令各成一条根 trace；队列的 span 在阶段 2 手工埋。
+    - 日志：每行一个 JSON 对象（`time/level/service/logger/message` + `extra` 字段），在 span 内时带 `trace_id`/`span_id`；同时经 OTLP 进 Loki（`service_name` 等为标签，`trace_id` 为结构化元数据），日志与 trace 可互查。
+    - 已知缺口：队列两端还没串起来（agent-runtime 的工作各自成 trace），SQLAlchemy 连接池预检是名为 `;` 的 span。
+  - **阶段 2（待做）跨队列与 Agent/LLM**：`traceparent` 写进 `agent_tasks`/`agent_results`，一轮对话一条 trace（消费端 span 挂在生产端下，补偿重投和结果落库用 link）；LangGraph 每个节点一个 span；ai-gateway 按 OTel GenAI 约定记录模型调用（提示词和回复内容由开关控制，compose 默认开、k8s 默认关）；锁冲突、跳过旧副本、降级、预算拒绝、死信记为 span 事件。
+  - **阶段 3（待做）指标、看板、告警**：队列、任务、Agent、LLM、入口的指标（`tenant_id` 可做标签，`user_id`/`task_id` 不做），Grafana 看板和告警规则放进仓库，示例 SLO"95% 的轮次 30 秒内完成"。
+  - 生产环境：Collector 用 OTel Operator 或独立 Deployment，后端各自部署（Tempo、Loki、Prometheus/Mimir、Grafana），在 Collector 做尾部采样（错误和慢请求全留）；k8s 的可选组件 `components/observability` 在阶段 3 加。
 - 部署清单：V1 用 Kustomize（`deploy/k8s`：base + overlays + 可选的扩缩容组件），kubectl 自带、没有模板语法；"迁移完成后再更新服务"的顺序由 `apply-dev.sh` 保证，以后用 Helm hook 或 Argo CD sync wave 表达。服务容器一律非 root、只读根文件系统。
 - CI/CD 流水线、多环境（staging/prod）overlay【V1 未实现】。租户级配置里已经能不重新部署就生效的：工具绑定（`role_tool_bindings`）和 token 预算（`tenant_token_budgets`），都是数据库表。
 
