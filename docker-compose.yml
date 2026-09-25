@@ -177,9 +177,12 @@ services:
       KNOWLEDGE_SERVICE_TOKEN: ${KNOWLEDGE_SERVICE_TOKEN:-dev-knowledge-service-token}
       TICKET_SERVICE_URL: http://ticket-service:8006
       TICKET_SERVICE_TOKEN: ${TICKET_SERVICE_TOKEN:-dev-ticket-service-token}
+      REDIS_URL: redis://redis:6379/0  # approval decisions go out on the approval_events stream
     depends_on:
       observability:
         condition: service_started
+      redis:
+        condition: service_healthy
       tool-gateway-seed:
         condition: service_completed_successfully
       knowledge-service:

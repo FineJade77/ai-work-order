@@ -58,7 +58,7 @@ ai-work-order/
 > 最初按 MCP 接口实现，后改为 REST 策略网关（架构文档 3.4 节）。以下为当前版本。
 - `GET /v1/tools/list?tenant_id&agent_role`：返回角色可用工具的 OpenAI function 元数据，不含密钥/下游地址。
 - `POST /v1/tools/call`：`tenant_id, session_id, user_id, agent_role, tool_name, arguments`，返回 `success / error`；副作用工具必须带 `Idempotency-Key` 头。
-- 能力：多租户（RLS）、`role_tool_bindings` 角色工具绑定、JSON Schema 参数校验、副作用工具的 `tool_calls` 幂等记录、`tool_call_logs` 审计（参数脱敏）、返回体凭据字段屏蔽、服务间 Bearer 令牌鉴权。HITL 审批与 Redis 限流 V1 暂不做（见架构文档 3.4 节）。
+- 能力：多租户（RLS）、`role_tool_bindings` 角色工具绑定、JSON Schema 参数校验、副作用工具的 `tool_calls` 幂等记录、`tool_call_logs` 审计（参数脱敏）、返回体凭据字段屏蔽、服务间 Bearer 令牌鉴权。Redis 限流 V1 暂不做；HITL 审批见阶段 8。
 - 工具：`search_knowledge(query)` 调 knowledge-service，结果带每条的 `category`；`create_ticket(summary, category)`（`category` 为 1–50 字的任意字符串，不是固定枚举）调 ticket-service 的 `POST /internal/v1/tickets`（会话 ID、员工 `user_id`、幂等键由网关注入，幂等键透传）。`TicketProvider` 抽象，v1 只有 `InternalTicketProvider`。
 - 调用上下文：`/v1/tools/call` 必须带 `user_id`（当前员工 UUID），作为工单提单人，记入审计和幂等指纹。
 - Agent 角色为 `service_agent`（迁移 0003 由 `it_support_agent` 改名，临时关闭 FORCE；已有同名绑定时保留新的、删掉旧的）。
@@ -119,6 +119,13 @@ ai-work-order/
   - **验收标准**：内存 exporter 测试覆盖——agent-runtime：消费端 span 是生产端的子 span、跳过旧副本的事件、结果带运行的 `traceparent`、节点 span 的名字与决定属性、`interrupt` 不算错误、检索失败事件、失败节点为错误；app-service：生产端 span 挂在请求下且消息和 `turns` 带同一条 trace、重投留在原 trace、结果落库 span 有 link；ai-gateway：GenAI 属性、内容只在开关打开时记录且已脱敏、失败为错误。真实环境（真实模型）跑一次演示后，用 `scripts/show-trace.py` 确认一轮对话是一条 trace，覆盖 app-service、agent-runtime、ai-gateway、tool-gateway 以及 knowledge-service 或 ticket-service，含队列生产/消费、节点和 GenAI span。
 - **7.3 指标、看板、告警（已完成）**：OTel metrics 覆盖队列（含 `QueueMonitor` 采样的积压/待确认/最老待确认/死信 gauge）、任务、Agent、LLM（GenAI 标准指标）、预算、轮次耗时（SLO）、限流、SSE、工具调用；看板与告警规则由 `deploy/observability/grafana/generate_*.py` 生成并提交，compose 挂载、k8s 组件用 ConfigMap；SLO 95% 的轮次 30 秒内完成，带多窗口燃烧率告警；k8s 可选组件 `components/observability`（otel-lgtm + 给六个服务打开 OTel 的 patch）。
   - **验收标准**：内存 metric reader 测试覆盖——agent-runtime：节点耗时、意图、检索结果计数，每次投递按结果计数和计时，`QueueMonitor` 读出积压、待确认、最老待确认和死信；app-service：一轮只在第一次完成时记一次耗时，限流拒绝按窗口计数；ai-gateway：token 用量和调用耗时；tool-gateway：每次调用按工具和状态计数。真实环境：看板每个面板的查询在演示流量下都有数据（没有发生的事显示 0 而不是无数据）；人为制造死信、停掉 knowledge-service、把租户预算调到约 90% 后，对应的三条告警进入 Alerting，其余保持正常；k8s 组件本地渲染后六个服务都带上 OTel 配置、所有 ConfigMap 引用都能解析。
+
+### 阶段 8：HITL 审批
+> 设计见架构文档 3.4 节（网关）、3.3 节（Agent）、3.2 节（应用服务）。分三步，每步单独提交。
+- **8.1 Tool Gateway 审批状态机（已完成）**：迁移 0004（`role_tool_bindings.requires_approval`、`tool_calls`/`tool_call_logs` 状态加 `pending_approval`、`tool_approvals`、`approval_outbox`、`access_grants`）；`grant_access` 工具与 `MockAccessProvider`；调用管线的审批分支（开审批、按审批状态恢复、拒绝/过期为最终结果）；审批接口（列表、详情、决定，四眼原则，过期后不能决定）；发件箱 relay（发布决定、到期置为 expired）发到 `approval_events`；seed 让 demo 租户的 `grant_access` 需要审批、northwind 不需要；tool-gateway 新增 `REDIS_URL`。
+  - **验收标准**：集成测试（真 tool-gateway、Postgres、Redis）覆盖——批准后同一幂等键再调才执行且只执行一次、之后重放；自批 403；拒绝后再调永远是 `APPROVAL_REJECTED`（附备注）且不执行；无人处理时 relay 置为过期并发事件、之后不能再批准、再调为 `APPROVAL_EXPIRED`；截止时间已过但 relay 还没处理时批准也被拒；另一租户的策略下直接执行；等待中的调用审计为 `pending_approval`；每个决定都出现在 `approval_events`。迁移可降级再升级。
+- **8.2 Agent 动作路径与应用服务审批（待做）**：分诊的 `action` 意图、`plan_action`（模型从 `tools/list` 选工具）、`execute_action`（`pending_approval` 时 interrupt，恢复后同一幂等键再调）；等审批期间员工发消息只回复状态；应用服务的审批接口（处理人）、消费 `approval_events` 建系统轮次并投递恢复任务。
+- **8.3 可观测性、演示与文档（待做）**：审批的 span、事件与 link，审批指标、看板和告警；`scripts/demo.sh access`。
 
 ## 工作方式要求
 

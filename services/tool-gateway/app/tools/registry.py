@@ -2,11 +2,12 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
+from app.tools.access import GRANT_ACCESS
 from app.tools.base import ToolSpec
 from app.tools.knowledge import SEARCH_KNOWLEDGE
 from app.tools.tickets import CREATE_TICKET
 
-REGISTRY: dict[str, ToolSpec] = {spec.name: spec for spec in (SEARCH_KNOWLEDGE, CREATE_TICKET)}
+REGISTRY: dict[str, ToolSpec] = {spec.name: spec for spec in (SEARCH_KNOWLEDGE, CREATE_TICKET, GRANT_ACCESS)}
 
 _VALIDATORS: dict[str, Draft202012Validator] = {}
 for _spec in REGISTRY.values():

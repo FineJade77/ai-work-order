@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -22,9 +23,18 @@ class ToolErrorBody(BaseModel):
     message: str
 
 
+class ApprovalRef(BaseModel):
+    id: str
+    status: str
+    expires_at: datetime
+
+
 class ToolCallResponse(BaseModel):
-    status: Literal["success", "error"]
+    # pending_approval: the call waits for a handler (tenant policy). Call again with the same
+    # Idempotency-Key once it is decided: the tool then runs, or the rejection or expiry comes back.
+    status: Literal["success", "error", "pending_approval"]
     call_id: str | None = None
     result: Any = None
     error: ToolErrorBody | None = None
+    approval: ApprovalRef | None = None
     replayed: bool = False

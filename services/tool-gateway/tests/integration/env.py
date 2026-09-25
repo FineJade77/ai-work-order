@@ -13,3 +13,4 @@ ROLE = "service_agent"
 # Tenant with static data in knowledge-service (services/knowledge-service/app/data/knowledge.json).
 DEMO_TENANT = "e0e112f3-5afb-4229-869b-c0bd012324bb"
 ONCALL_ANSWER = "夜间请拨打 IT 值班电话 400-800-1234，或在企业微信搜索“IT 值班”。"
+REDIS_URL = os.environ.get("TOOL_GATEWAY_TEST_REDIS_URL", "redis://localhost:26379/0")  # the stream the gateway publishes to

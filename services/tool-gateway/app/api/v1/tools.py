@@ -3,7 +3,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Header
 
 from app.core.security import require_service_token
-from app.schemas.tools import ToolCallRequest, ToolCallResponse, ToolErrorBody, ToolListResponse
+from app.schemas.tools import ApprovalRef, ToolCallRequest, ToolCallResponse, ToolErrorBody, ToolListResponse
 from app.services import tool_call_service
 from app.services.tool_call_service import CallOutcome
 
@@ -38,10 +38,14 @@ def _to_response(outcome: CallOutcome) -> ToolCallResponse:
         if outcome.status == "error" and outcome.error_code
         else None
     )
+    approval = outcome.approval
     return ToolCallResponse(
         status=outcome.status,
         call_id=outcome.call_id,
         result=outcome.result,
         error=error,
+        approval=(
+            ApprovalRef(id=approval.id, status=approval.status, expires_at=approval.expires_at) if approval else None
+        ),
         replayed=outcome.replayed,
     )

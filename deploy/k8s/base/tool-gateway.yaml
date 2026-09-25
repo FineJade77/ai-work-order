@@ -60,6 +60,11 @@ spec:
                 secretKeyRef:
                   name: service-tokens
                   key: TICKET_SERVICE_TOKEN
+            - name: REDIS_URL  # approval decisions are published on the approval_events stream
+              valueFrom:
+                configMapKeyRef:
+                  name: service-endpoints
+                  key: REDIS_URL
           readinessProbe:
             httpGet:
               path: /healthz

@@ -131,8 +131,15 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
 - 脱敏：返回体只屏蔽 password/token 等凭据字段（知识库内容里的值班电话这类联系方式是员工需要的）；审计记录额外对手机号/邮箱/身份证做正则脱敏。
 - 核心工具（v1）：`search_knowledge(query)`（结果含每条的 `category`）、`create_ticket(summary, category)`。`category` 是 1–50 字的任意字符串，不是固定枚举：各租户的类别由其知识库决定。
 - Agent 角色：V1 只有一个 `service_agent`（迁移 0003 由 `it_support_agent` 改名；`tool_calls`、`tool_call_logs` 里的历史记录保留当时的角色名）。
-- **V1 暂不做、已有设计可恢复**（实现见提交 `f36530d`）：
-  - HITL 审批：`pending_approval` 状态、审批接口、`tool_approvals` 表、Redis Stream 恢复事件。等出现重置密码/解锁账号/开通权限这类高风险工具时再加。
+- **HITL 审批**（Tool Gateway 部分；Agent 与应用服务部分见 3.3、3.2 节）：
+  - 高风险工具 `grant_access(system, access_level, reason)`：handler 在 `AccessProvider` 接口后面，V1 是 `MockAccessProvider`（写 `access_grants`，按幂等键去重），以后换成对接 IAM。
+  - 是否需要审批是**租户策略**：`role_tool_bindings.requires_approval`。同一个工具在 demo 租户要审批、在 northwind 直接执行；只对副作用工具生效。
+  - 需要审批的调用：占位的 `tool_calls` 行直接是 `pending_approval`，同一事务里建 `tool_approvals`（`pending`，24 小时后过期，记下请求时的 `traceparent`）和一条到期检查的发件箱记录；返回 `pending_approval {approval: {id, status, expires_at}}`，审计状态也是 `pending_approval`。
+  - 同一个幂等键再调：还在等 → 仍是 `pending_approval`；已批准 → 条件更新 `pending_approval → running`（只有一个调用方胜出）后执行；已拒绝/已过期 → `APPROVAL_REJECTED`/`APPROVAL_EXPIRED`，并且是**最终结果**：再调也原样返回，不像普通错误那样被重新占位执行。所以工具最多执行一次。
+  - 审批接口（服务令牌，应用服务代处理人调用）：`GET /v1/approvals?tenant_id&status&requester_id`、`GET /v1/approvals/{id}`、`POST /v1/approvals/{id}/decision {decision, approver_id, note}`。只有 `pending` 且未过期的能决定（否则 409 `APPROVAL_NOT_PENDING`/`APPROVAL_EXPIRED`），审批人不能是申请人（403 `SELF_APPROVAL`，四眼原则）；角色由应用服务判断。
+  - 决定通过**事务性发件箱**发出：状态变更和一条 `approval_outbox` 记录同一事务提交，后台 relay 用 `FOR UPDATE SKIP LOCKED` 逐条取出、发到 Redis Stream `approval_events`（审批 id、租户、会话、申请人、状态、审批人、备注、`approval_traceparent`，外加 relay span 的 `traceparent`），再标记完成。发布后、标记前崩溃会再发一次，所以是至少一次投递，消费方按审批 id 去重。到期也是一条发件箱记录（到期时间即 due），relay 到点把仍在 `pending` 的审批改成 `expired` 并发出事件，不用跨租户扫描审批表。
+  - `approval_outbox` 不开 RLS：relay 要服务所有租户，表里只有路由用的 id（租户、审批 id、类型、到期时间），不含内容；读审批时再切到该租户的作用域。relay 的轮询本身不追踪，只追踪处理的那一条。relay 停了 `/healthz` 返回 503。
+- **V1 暂不做**：
   - Redis 令牌桶限流：V1 工具都是 PG 查询、量小；按用户限流 V1 在应用服务的发消息接口（3.2 节），部署 API Gateway 后可移过去；Agent 死循环靠 LangGraph `recursion_limit`。
 - 扩展设计：`TicketProvider` 接口预留多实现（`InternalTicketProvider` 默认启用，未来可加 `JiraTicketProvider`、`FeishuTicketProvider`），通过租户级配置选择实现，不改动 Agent/应用服务代码。
 
@@ -177,7 +184,7 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
 | 数据库 | 归属服务 | 表 |
 |---|---|---|
 | `app_service` | 应用服务 | `tenants`、`users`、`conversations`、`messages`、`turns` |
-| `tool_gateway` | Tool Gateway | `role_tool_bindings`、`tool_calls`、`tool_call_logs` |
+| `tool_gateway` | Tool Gateway | `role_tool_bindings`（含 `requires_approval`）、`tool_calls`、`tool_call_logs`、`tool_approvals`、`approval_outbox`（无 RLS，只含路由 id）、`access_grants`（模拟开通记录） |
 | `ticket_service` | 工单服务 | `tickets`（含幂等键局部唯一索引、版本号）、`ticket_events`（只追加） |
 | `ai_gateway` | AI Gateway | `model_call_logs`、`tenant_token_budgets`（租户预算覆盖；只开 RLS 不 FORCE，owner 可直接维护） |
 | `agent_runtime` | Agent Runtime | LangGraph checkpoint 表（`checkpoints`、`checkpoint_blobs`、`checkpoint_writes`，由库自身管理，无 RLS） |

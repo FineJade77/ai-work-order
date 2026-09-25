@@ -4,13 +4,17 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 
+from opentelemetry import propagate, trace
+
+from app.core.config import get_settings
 from app.core.errors import CallerError
 from app.core.redaction import mask_secret_fields
 from app.core.tenancy import parse_tenant_id
 from app.metrics import TOOL_CALL_DURATION, TOOL_CALLS
-from app.repositories import audit, bindings, tool_calls
+from app.repositories import approvals, audit, bindings, tool_calls
 from app.tools.base import ToolContext, ToolError, ToolSpec
 from app.tools.registry import REGISTRY, validate_arguments
 
@@ -25,25 +29,31 @@ _REJECTED_CODES = frozenset(
         "MISSING_IDEMPOTENCY_KEY",
         "IDEMPOTENCY_CONFLICT",
         "IN_PROGRESS",
+        "APPROVAL_REJECTED",
+        "APPROVAL_EXPIRED",
     }
 )
+# A handler's "no", or nobody deciding in time, ends the call for good: retrying it with the same
+# key returns the same error instead of running the tool (an ordinary error is retried).
+FINAL_CODES = frozenset({"APPROVAL_REJECTED", "APPROVAL_EXPIRED"})
 
 
 @dataclass(frozen=True)
 class CallOutcome:
     """A tool result for the model: success, or an error it can react to."""
 
-    status: str
+    status: str  # success | error | pending_approval
     call_id: str | None = None
     result: Any = None
     error_code: str | None = None
     error_message: str | None = None
     replayed: bool = False
+    approval: approvals.ApprovalRecord | None = None
 
     @property
     def audit_status(self) -> str:
-        if self.status == "success":
-            return "success"
+        if self.status in ("success", "pending_approval"):
+            return self.status
         return "rejected" if self.error_code in _REJECTED_CODES else "error"
 
 
@@ -85,7 +95,7 @@ def request_hash(
 
 async def list_tools(tenant_id: str, agent_role: str) -> list[dict[str, Any]]:
     require_tenant(tenant_id)
-    allowed = await bindings.bound_tool_names(tenant_id, agent_role) & REGISTRY.keys()
+    allowed = (await bindings.tool_bindings(tenant_id, agent_role)).keys() & REGISTRY.keys()
     return [REGISTRY[name].to_openai_tool() for name in sorted(allowed)]
 
 
@@ -159,7 +169,8 @@ async def _call_tool(
     if spec is None:
         return _error("UNKNOWN_TOOL", f"unknown tool: {tool_name}")
 
-    if tool_name not in await bindings.bound_tool_names(tenant_id, agent_role):
+    bound = await bindings.tool_bindings(tenant_id, agent_role)
+    if tool_name not in bound:
         return _error("TOOL_NOT_ALLOWED", f"role {agent_role!r} is not allowed to call {tool_name}")
 
     violation = validate_arguments(tool_name, arguments)
@@ -191,6 +202,19 @@ async def _call_tool(
     if existing is not None:
         return await _resume(existing, fingerprint, spec, ctx)
 
+    if bound[tool_name]:  # tenant policy: this tool waits for a handler
+        opened = await approvals.open_for_call(
+            tenant_id=tenant_id, session_id=session_id, user_id=user_id, agent_role=agent_role, tool_name=tool_name,
+            arguments=arguments, request_hash=fingerprint, idempotency_key=idempotency_key,
+            traceparent=_current_traceparent(), ttl=timedelta(hours=get_settings().approval_ttl_hours),
+        )
+        if opened is None:  # a concurrent request with the same key won
+            winner = await tool_calls.find_by_idempotency_key(tenant_id, idempotency_key)
+            return await _resume(winner, fingerprint, spec, ctx)
+        call_id, approval = opened
+        trace.get_current_span().add_event("approval_requested", {"app.approval_id": approval.id})
+        return CallOutcome(status="pending_approval", call_id=call_id, approval=approval)
+
     call_id = await tool_calls.claim(
         tenant_id=tenant_id,
         session_id=session_id,
@@ -213,12 +237,39 @@ async def _resume(existing: tool_calls.CallRecord, fingerprint: str, spec: ToolS
         raise CallerError(409, "IDEMPOTENCY_CONFLICT", "Idempotency-Key was already used for a different request")
     if existing.status == "success":
         return CallOutcome(status="success", call_id=existing.id, result=existing.result, replayed=True)
+    if existing.status == "pending_approval":
+        return await _after_approval(existing, spec, ctx)
+    if existing.status == "error" and existing.error_code in FINAL_CODES:
+        return _error(existing.error_code, existing.error_message or "", call_id=existing.id, replayed=True)
 
     # 'error' is retryable; 'running' may be orphaned by a crashed replica. reclaim() lets
     # exactly one retrier through, and only once a 'running' row has gone stale.
     if await tool_calls.reclaim(ctx.tenant_id, existing.id):
         return await _execute_recorded(existing.id, spec, ctx, existing.arguments)
     raise CallerError(409, "IN_PROGRESS", "a call with this Idempotency-Key is still executing; retry later")
+
+
+async def _after_approval(existing: tool_calls.CallRecord, spec: ToolSpec, ctx: ToolContext) -> CallOutcome:
+    """A call that waited for approval, called again with its key (the agent resuming)."""
+    approval = await approvals.find_by_call(ctx.tenant_id, existing.id)
+    if approval.status == "pending":
+        return CallOutcome(status="pending_approval", call_id=existing.id, approval=approval, replayed=True)
+    if approval.status == "approved":
+        # Only one caller moves it to running; a concurrent one is told to come back.
+        if await approvals.start_execution(ctx.tenant_id, existing.id):
+            trace.get_current_span().add_event("approved_call_executing", {"app.approval_id": approval.id})
+            return await _execute_recorded(existing.id, spec, ctx, existing.arguments)
+        raise CallerError(409, "IN_PROGRESS", "the approved call is already executing; retry later")
+    code = "APPROVAL_REJECTED" if approval.status == "rejected" else "APPROVAL_EXPIRED"
+    message = f"approval {approval.status}" + (f": {approval.note}" if approval.note else "")
+    await approvals.close_call(ctx.tenant_id, existing.id, code, message)
+    return _error(code, message, call_id=existing.id)
+
+
+def _current_traceparent() -> str | None:
+    carrier: dict[str, str] = {}
+    propagate.inject(carrier)
+    return carrier.get("traceparent")
 
 
 async def _execute_recorded(call_id: str, spec: ToolSpec, ctx: ToolContext, arguments: dict[str, Any]) -> CallOutcome:

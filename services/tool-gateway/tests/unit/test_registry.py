@@ -2,7 +2,7 @@ from app.tools.registry import REGISTRY, validate_arguments
 
 
 def test_registry_holds_the_v1_tools():
-    assert set(REGISTRY) == {"search_knowledge", "create_ticket"}
+    assert set(REGISTRY) == {"search_knowledge", "create_ticket", "grant_access"}
 
 
 def test_openai_tool_exposes_only_name_description_parameters():

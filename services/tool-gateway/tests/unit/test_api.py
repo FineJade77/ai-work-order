@@ -22,6 +22,7 @@ async def client():
         knowledge_service_token="unused",
         ticket_service_url="http://unused",
         ticket_service_token="unused",
+        redis_url="redis://unused",
     )
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
         yield c

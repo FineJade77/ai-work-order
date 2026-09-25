@@ -66,15 +66,15 @@ def env(monkeypatch):
     async def search_handler(ctx, args):
         return {"results": []}
 
-    async def bound_tool_names(tenant_id, agent_role):
-        return {"search_knowledge", "create_ticket"} if agent_role == ROLE else set()
+    async def tool_bindings(tenant_id, agent_role):
+        return {"search_knowledge": False, "create_ticket": False} if agent_role == ROLE else {}
 
     async def write_audit(**row):
         audits.append(row)
 
     monkeypatch.setitem(REGISTRY, "create_ticket", dataclasses.replace(REGISTRY["create_ticket"], handler=ticket_handler))
     monkeypatch.setitem(REGISTRY, "search_knowledge", dataclasses.replace(REGISTRY["search_knowledge"], handler=search_handler))
-    monkeypatch.setattr(svc.bindings, "bound_tool_names", bound_tool_names)
+    monkeypatch.setattr(svc.bindings, "tool_bindings", tool_bindings)
     monkeypatch.setattr(svc.audit, "write", write_audit)
     for name in ("find_by_idempotency_key", "claim", "reclaim", "complete", "fail"):
         monkeypatch.setattr(svc.tool_calls, name, getattr(fake, name))
