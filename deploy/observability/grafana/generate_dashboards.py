@@ -156,6 +156,26 @@ panels += [
        [(f"sum by (app_tool, app_status) (rate(app_tool_calls_total{T}[{RI}])) * 60", "{{app_tool}} {{app_status}}")],
        18, y, w=6, stack=True),
 ]
+y += 8
+
+# HITL: pending counts are sampled by tool-gateway's outbox relay; decisions are counted as they
+# happen (by a handler, or by the relay when the approval expires). Every replica samples the same
+# database, so the gauges are max'd per tenant before summing, never summed across instances.
+panels.append(row("审批（HITL）", y)); y += 1
+panels += [
+    stat("待审批", f"sum(max by (app_tenant_id) (app_approvals_pending{T})) or vector(0)", 0, y, w=4, h=8,
+         thresholds=[(None, "green"), (1, "yellow"), (10, "red")], description="等待处理人审批的工具调用"),
+    stat("最久等待", f"max(app_approvals_oldest_pending_age_seconds{T}) or vector(0)", 4, y, w=4, h=8, unit="s",
+         thresholds=[(None, "green"), (900, "yellow"), (3600, "red")],
+         description="最老的待审批已等待多久；超过 1 小时会告警"),
+    ts("每小时审批（申请 / 按结果）",
+       [(f"round(sum(increase(app_approvals_requested_total{T}[1h])))", "申请"),
+        (f"round(sum by (app_decision) (increase(app_approvals_decided_total{T}[1h])))", "{{app_decision}}")],
+       8, y, w=8, description="approved / rejected 由处理人决定，expired 为超时未处理"),
+    ts("审批耗时 p50 / p95（申请到决定）",
+       [(q(0.5, "app_approval_decision_time_seconds"), "p50"),
+        (q(0.95, "app_approval_decision_time_seconds"), "p95")], 16, y, w=8, unit="s"),
+]
 
 overview = {
     "uid": "ai-work-order-overview", "title": "ai-work-order 系统总览", "tags": ["ai-work-order"],

@@ -148,7 +148,7 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
   - 需要审批的调用：占位的 `tool_calls` 行直接是 `pending_approval`，同一事务里建 `tool_approvals`（`pending`，24 小时后过期，记下请求时的 `traceparent`）和一条到期检查的发件箱记录；返回 `pending_approval {approval: {id, status, expires_at}}`，审计状态也是 `pending_approval`。
   - 同一个幂等键再调：还在等 → 仍是 `pending_approval`；已批准 → 条件更新 `pending_approval → running`（只有一个调用方胜出）后执行；已拒绝/已过期 → `APPROVAL_REJECTED`/`APPROVAL_EXPIRED`，并且是**最终结果**：再调也原样返回，不像普通错误那样被重新占位执行。所以工具最多执行一次。
   - 审批接口（服务令牌，应用服务代处理人调用）：`GET /v1/approvals?tenant_id&status&requester_id`、`GET /v1/approvals/{id}`、`POST /v1/approvals/{id}/decision {decision, approver_id, note}`。只有 `pending` 且未过期的能决定（否则 409 `APPROVAL_NOT_PENDING`/`APPROVAL_EXPIRED`），审批人不能是申请人（403 `SELF_APPROVAL`，四眼原则）；角色由应用服务判断。
-  - 决定通过**事务性发件箱**发出：状态变更和一条 `approval_outbox` 记录同一事务提交，后台 relay 用 `FOR UPDATE SKIP LOCKED` 逐条取出、发到 Redis Stream `approval_events`（审批 id、租户、会话、申请人、状态、审批人、备注、`approval_traceparent`，外加 relay span 的 `traceparent`），再标记完成。发布后、标记前崩溃会再发一次，所以是至少一次投递，消费方按审批 id 去重。到期也是一条发件箱记录（到期时间即 due），relay 到点把仍在 `pending` 的审批改成 `expired` 并发出事件，不用跨租户扫描审批表。
+  - 决定通过**事务性发件箱**发出：状态变更和一条 `approval_outbox` 记录同一事务提交，后台 relay 用 `FOR UPDATE SKIP LOCKED` 逐条取出、发到 Redis Stream `approval_events`（审批 id、租户、会话、申请人、状态、审批人、备注、`approval_traceparent`，外加 relay span 的 `traceparent`），再标记完成。发布后、标记前崩溃会再发一次，所以是至少一次投递，消费方按审批 id 去重。到期也是一条发件箱记录（到期时间即 due），relay 到点把仍在 `pending` 的审批改成 `expired` 并发出事件，不用跨租户扫描审批表。处理人决定时同一事务里把这条到期检查标记完成（relay 自己执行到期时不动它：那一行正被它锁着，由它自己标记），所以"未完成的到期检查"就是"待审批"，指标直接数它。
   - `approval_outbox` 不开 RLS：relay 要服务所有租户，表里只有路由用的 id（租户、审批 id、类型、到期时间），不含内容；读审批时再切到该租户的作用域。relay 的轮询本身不追踪，只追踪处理的那一条。relay 停了 `/healthz` 返回 503。
 - **V1 暂不做**：
   - Redis 令牌桶限流：V1 工具都是 PG 查询、量小；按用户限流 V1 在应用服务的发消息接口（3.2 节），部署 API Gateway 后可移过去；Agent 死循环靠 LangGraph `recursion_limit`。
@@ -235,9 +235,10 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
     - agent-runtime：`app.task.deliveries`/`app.task.duration`（按 `app.result`：run 的 outcome，或 conversation_busy、skipped_stale、retry_later、dead_letter、error）、`app.queue.wait`、`app.node.duration`、`app.agent.intents`、`app.knowledge.searches`（hit/miss/unavailable）；队列 gauge（`app.queue.lag`/`pending`/`oldest_pending_age`/`dead_letters`）由 `QueueMonitor` 每 15 秒采样 Redis（XINFO/XPENDING/XLEN），每个副本报同样的值，查询用 max。
     - ai-gateway：GenAI 标准指标 `gen_ai.client.token.usage`（按 `gen_ai.token.type`）、`gen_ai.client.operation.duration`，加 `app.genai.time_to_first_token`；`app.budget.refusals`、`app.budget.utilization`（每次预算检查时更新的 gauge）。
     - app-service：`app.turn.duration`——从存下员工消息到存下回复，中间的排队、重试、重投全算在内，SLO 就算在它上面（分桶含 30 秒边界）；只在一轮第一次完成时记录，重复投递的结果不重复计。另有 `app.turn.requeues`、`app.rate_limit.refusals`、`app.sse.connections`。
-    - tool-gateway：`app.tool.calls`/`app.tool.call.duration`，标签同审计行（工具、状态、错误码）。
-    - 看板与告警都是代码：`deploy/observability/grafana/` 下的生成脚本产出看板 JSON 和告警 YAML（提交的是产物，改脚本再生成），compose 挂载进容器、k8s 组件做成 ConfigMap，Grafana 启动时 provisioning。看板：`ai-work-order 系统总览`（轮次与 SLO、队列、Agent、LLM、入口与工具，可按租户过滤）、`ai-work-order 单轮排查`（输入会话 id 找各轮 trace，输入 trace id 看调用树和所有服务的日志）。
-    - 告警（Grafana 管理，每分钟评估；没有数据不算告警）：任务积压（>20 持续 5 分钟）、任务长时间未确认（>300 秒）、新死信（15 分钟内）、检索降级（10 分钟内有）、租户预算 >80%、SLO 快速燃烧（1 小时和 5 分钟窗口都超过 14.4 倍，且 1 小时内至少 10 轮）、服务 5xx >5%。
+    - tool-gateway：`app.tool.calls`/`app.tool.call.duration`，标签同审计行（工具、状态、错误码）；审批：`app.approvals.requested`、`app.approvals.decided`（按 `app.decision`：approved/rejected/expired，过期由 relay 记）、`app.approval.decision_time`（申请到决定，分桶 10 秒到 24 小时）；`app.approvals.pending`/`oldest_pending_age` 由发件箱 relay 每轮采样。一条审批"待决定"恰好等于它的到期检查记录还没完成（处理人决定时同一事务里把那条记录标记完成），发件箱表不开 RLS，所以一条 `GROUP BY tenant_id` 就能跨租户统计；每个副本报同样的值，查询用 max。
+    - Prometheus 开 `created-timestamp-zero-ingestion`：按 OTLP 的起始时间给每条计数器序列补一个 0，否则序列第一次出现时值已是 1，`increase()` 看不到这第一次——审批这种低频计数器会整个漏掉。
+    - 看板与告警都是代码：`deploy/observability/grafana/` 下的生成脚本产出看板 JSON 和告警 YAML（提交的是产物，改脚本再生成），compose 挂载进容器、k8s 组件做成 ConfigMap，Grafana 启动时 provisioning。看板：`ai-work-order 系统总览`（轮次与 SLO、队列、Agent、LLM、入口与工具、审批，可按租户过滤）、`ai-work-order 单轮排查`（输入会话 id 找各轮 trace，输入 trace id 看调用树和所有服务的日志）。
+    - 告警（Grafana 管理，每分钟评估；没有数据不算告警）：任务积压（>20 持续 5 分钟）、任务长时间未确认（>300 秒）、新死信（15 分钟内）、检索降级（10 分钟内有）、租户预算 >80%、SLO 快速燃烧（1 小时和 5 分钟窗口都超过 14.4 倍，且 1 小时内至少 10 轮）、服务 5xx >5%、审批超过 1 小时没人处理（按租户，最老待审批的等待时间）。
     - SLO：95% 的轮次 30 秒内完成。
   - 生产环境：Collector 用 OTel Operator 或独立 Deployment，后端各自部署（Tempo、Loki、Prometheus/Mimir、Grafana），在 Collector 做尾部采样（错误和慢请求全留），告警接到值班系统。k8s 的可选组件 `components/observability` 部署和 compose 一样的一体化容器（数据在 Pod 里），只适合开发集群。
 - 部署清单：V1 用 Kustomize（`deploy/k8s`：base + overlays + 可选的扩缩容组件），kubectl 自带、没有模板语法；"迁移完成后再更新服务"的顺序由 `apply-dev.sh` 保证，以后用 Helm hook 或 Argo CD sync wave 表达。服务容器一律非 root、只读根文件系统。
@@ -275,7 +276,7 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
 - 知识库：独立的 knowledge-service，V1 只提供检索、数据按租户写死；后续在同一接口后面换成数据库/向量检索。
 - 工单：独立的 ticket-service，4 状态状态机 + 乐观锁 + 处理记录；应用服务不再持有工单表。
 - 数据：同一 Postgres 实例、每服务独立 database，库内 `tenant_id` + RLS 隔离；服务间不共享表和模型代码，没有 `libs/shared`（见第 4 节）。
-- Tool Gateway：REST 策略网关；HITL 审批与工具调用限流 V1 暂不做（见 3.4 节）。
+- Tool Gateway：REST 策略网关；工具调用限流 V1 暂不做。HITL 审批在 Tool Gateway 做成按租户的策略（`requires_approval`），而不是写在 Agent 的图里：策略、审计和"最多执行一次"都由网关保证，Agent 只负责暂停与恢复；决定经事务性发件箱以事件发出，由应用服务开审批轮次恢复运行（见 3.2–3.4 节）。
 - 队列服务：Redis Streams（与事件流、会话锁共用一个 Redis 实例）。对比过 RabbitMQ/RocketMQ：规模用不上、事件回传仍需 Redis，V1 不引入；Redis 可能丢消息的问题由应用服务记录任务状态并重新入队弥补（阶段 5）。
 - AI Gateway：服务令牌鉴权，只有 Agent Runtime 可调用。
 - 成本防护：应用服务按员工限制发消息频率，AI Gateway 按租户设每日 token 预算（软上限，可按租户覆盖）；预算用完固定回复、不建单（见 3.2、3.3、3.5 节）。

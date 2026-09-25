@@ -13,7 +13,8 @@
                        └─ 工单页面（查询 / 流转）─────────▶ ticket-service
 
 agent-runtime ─┬─▶ tool-gateway ─┬─▶ knowledge-service
-               │                 └─▶ ticket-service（create_ticket）
+               │                 ├─▶ ticket-service（create_ticket）
+               │                 └─ 需审批的调用：outbox ──XADD approval_events──▶ app-service ──▶ agent_tasks（恢复运行）
                └─▶ ai-gateway ──▶ DeepSeek
 ```
 
@@ -21,7 +22,7 @@ agent-runtime ─┬─▶ tool-gateway ─┬─▶ knowledge-service
 |---|---|---|---|
 | app-service | 8001 | 登录（JWT）、会话与消息、发消息限流、SSE 推送、回复落库、员工/处理人工单页面的 BFF | `app_service` |
 | agent-runtime | 无对外端口 | 消费任务队列，跑 LangGraph 状态图：分类 → 检索 → 回答 → 等反馈 → 建单 | `agent_runtime`（checkpoint） |
-| tool-gateway | 8003 | 工具策略网关：角色绑定、参数校验、幂等、审计、脱敏 | `tool_gateway` |
+| tool-gateway | 8003 | 工具策略网关：角色绑定、参数校验、幂等、审计、脱敏；按租户策略把高风险调用挂起等处理人审批（HITL） | `tool_gateway` |
 | ai-gateway | 8004 | 模型调用唯一出口（OpenAI 兼容协议，当前接 DeepSeek），记录用量、每日 token 预算 | `ai_gateway` |
 | knowledge-service | 8005 | 知识检索，V1 为按租户写死的数据 | 无 |
 | ticket-service | 8006 | 工单生命周期：4 状态状态机、乐观锁、处理记录 | `ticket_service` |
@@ -73,6 +74,8 @@ scripts/demo.sh account   # 回答 → 员工说"好了，谢谢" → 已解决�
 scripts/demo.sh email     # 回答 → 员工说"还是收不到" → 自动建单
 scripts/demo.sh printer   # 知识库里没有 → 直接建单（描述带 [知识库未命中]，类别 other）
 scripts/demo.sh leave     # northwind 租户（HR/行政）：回答 → "还是没通过" → 建单，类别 leave
+scripts/demo.sh access    # HITL：申请开通系统权限 → 等处理人审批 → 处理人批准 → Agent 恢复运行并开通
+DECISION=reject scripts/demo.sh access   # 同上，处理人拒绝
 ```
 
 VPN 场景的输出大致如下（回答由模型生成，措辞每次不同；极少数情况下分类结果也会不同）：
@@ -149,6 +152,25 @@ act "$EMP"     "{\"action\":\"close\",\"expected_version\":$(version)}"
 curl -s $BASE/tickets/$TICKET -H "$EMP" | jq '.events[] | {action, to_status, note}'
 ```
 
+### 人工审批（HITL）
+
+有些工具调用不能让 Agent 自己做主，比如 `grant_access`（开通系统权限）。每个租户在 tool-gateway 的角色绑定上配置哪些工具要审批（`role_tool_bindings.requires_approval`，演示数据里 demo 租户要审批、northwind 直接执行）。流程：
+
+1. 员工说"帮我开通财务系统的只读权限"，模型从可用工具里选中 `grant_access` 并填好参数；
+2. tool-gateway 不执行，记一条待审批（24 小时过期），返回 `pending_approval`；Agent 用 LangGraph `interrupt()` 暂停这次运行（状态在 Postgres checkpoint 里，不占 Worker），回复"已提交审批"，本轮 `outcome` 为 `awaiting_approval`。等待期间员工再发消息只会收到"还在等待审批"，不会恢复运行；
+3. 处理人在 `/v1/approvals` 看到待审批（工具、参数、申请人），批准或拒绝（可附意见）。申请人不能审批自己的申请（四眼原则），员工调用会 403 `NOT_HANDLER`；
+4. 决定和一条 outbox 记录在同一事务提交，relay 把它发到 `approval_events`；app-service 消费后在会话里开一个"审批轮次"排进 `agent_tasks`，Agent 用 `Command(resume=...)` 从暂停处继续：批准就用同一个幂等键再调一次工具（只会执行一次），拒绝或过期就告知员工。
+
+```bash
+# 接着上面的 login / $EMP / $HANDLER
+CONV=$(curl -s -X POST $BASE/conversations -H "$EMP" | jq -r .id)
+curl -s $BASE/conversations/$CONV/messages -H "$EMP" -H 'content-type: application/json' \
+  -d '{"content":"帮我开通财务系统的只读权限，月底对账要看报表"}'
+curl -s $BASE/approvals -H "$HANDLER" | jq '.items[] | {id, tool_name, arguments, conversation_id}'
+curl -s -X POST $BASE/approvals/<id>/approve -H "$HANDLER" -H 'content-type: application/json' -d '{"note":"已核实"}'
+curl -s $BASE/conversations/$CONV/messages -H "$EMP" | jq '.messages[-1].content'   # 已通过审批，已为你办理完成
+```
+
 ### 接口一览
 
 | 接口 | 说明 |
@@ -161,8 +183,10 @@ curl -s $BASE/tickets/$TICKET -H "$EMP" | jq '.events[] | {action, to_status, no
 | `GET /v1/conversations/{id}/stream?task_id=` | SSE；支持 `Last-Event-ID` 断线续读 |
 | `GET /v1/tickets`、`GET /v1/tickets/{id}` | 员工只看得到自己的工单，处理人看全租户 |
 | `POST /v1/tickets/{id}/transitions` | `{action, expected_version, note?}`；`start`/`resolve` 仅处理人（否则 403 `NOT_HANDLER`），`start` 指派给自己 |
+| `GET /v1/approvals?status=`、`GET /v1/approvals/{id}` | 处理人看全租户的审批（默认 `pending`），员工只看自己的申请 |
+| `POST /v1/approvals/{id}/approve`、`.../reject` | `{note?}`；仅处理人；已决定 409 `APPROVAL_NOT_PENDING`，已过期 409 `APPROVAL_EXPIRED`，审批自己的申请 403 `SELF_APPROVAL` |
 
-SSE 事件：`retrieving`（检索中）、`answer_chunk`（增量回答）、`answer`（完整回答）、`reply`（固定回复，如问候或确认已解决）、`ticket_created`、`resumed`（Worker 崩溃后续跑，丢弃已显示的半截回答）、`error`、`done`（`outcome`：`awaiting_feedback` / `resolved` / `replied` / `ticket_created`）。
+SSE 事件：`retrieving`（检索中）、`answer_chunk`（增量回答）、`answer`（完整回答）、`reply`（固定回复，如问候或确认已解决）、`ticket_created`、`resumed`（Worker 崩溃后续跑，丢弃已显示的半截回答）、`error`、`done`（`outcome`：`awaiting_feedback` / `resolved` / `replied` / `ticket_created` / `awaiting_approval` / `action_done` / `action_rejected` / `action_expired`）。审批恢复的那一轮由事件触发，不是员工发起的，想看结果就读会话历史。
 
 ## 查看审计日志与用量
 
@@ -205,7 +229,8 @@ docker compose exec postgres psql -U work_order -d app_service -c \
 - Grafana：http://localhost:23000（本地匿名访问），在 Explore 里选数据源：
   - **Tempo**：一轮对话是一条 trace，从发消息的请求开始，经 Redis 队列到 agent-runtime 的每个图节点、每次模型调用（token 数、首 token 延迟，开发环境还有提示词和回复）、工具调用和每条 SQL。常用 TraceQL：`{name="process agent_tasks"}`（所有轮次）、`{span."app.conversation_id"="<会话 id>"}`、`{name=~"chat .*"}`（模型调用）、`{status=error}`；
   - **Loki**：`{service_name="app-service"}` 看日志，每行是 JSON，带 `trace_id`，可以跳到对应的 trace；
-  - **Prometheus**：各服务的 HTTP 指标（自动插桩提供）。
+  - **Prometheus**：各服务的 HTTP 指标（自动插桩提供）和业务指标（队列、Agent、模型、工具、审批）。
+  - 一次审批的来龙去脉也在 Tempo 里：`{name="process approval_events"}` 从 tool-gateway 发出决定开始，经 app-service 到 agent-runtime 的 `node await_approval` → `node execute_action` → 工具调用；它用 link 指回员工提出申请的那一轮。
 - 直接查询的端口：Tempo `23200`、Loki `23100`、Prometheus `29090`；OTLP 接收 `24317`（gRPC）/`24318`（HTTP），本地直接跑服务时可以把 `OTEL_EXPORTER_OTLP_ENDPOINT` 指向 `http://localhost:24318`。
 - 不开 Grafana 也能看：`scripts/show-trace.py` 把最近一轮对话打印成调用树（`scripts/show-trace.py <trace_id>` 看指定的一条）：
 
@@ -223,9 +248,9 @@ docker compose exec postgres psql -U work_order -d app_service -c \
 - 结果落库是另一条 trace（`process agent_results`），用 link 指回 Agent 的那次运行。
 - 服务的标准输出也是一行一个 JSON：`docker compose logs app-service`。
 - **看板**（Grafana → Dashboards → ai-work-order）：
-  - **系统总览**：轮次与 SLO（30 秒内完成的比例、p95）、任务队列（积压、待确认、最老待确认、死信、每次投递的结果）、Agent（节点耗时、意图、检索命中）、大模型（token、调用耗时、首 token、各租户预算使用率）、入口与工具（HTTP、5xx、限流、SSE、工具调用）。顶部可按租户过滤。
+  - **系统总览**：轮次与 SLO（30 秒内完成的比例、p95）、任务队列（积压、待确认、最老待确认、死信、每次投递的结果）、Agent（节点耗时、意图、检索命中）、大模型（token、调用耗时、首 token、各租户预算使用率）、入口与工具（HTTP、5xx、限流、SSE、工具调用）、审批（待审批数、最久等待、每小时申请与各结果、审批耗时）。顶部可按租户过滤。
   - **单轮排查**：填会话 id 列出它的各轮 trace；填 trace id 看调用树和这一轮在所有服务里的日志。
-- **告警**（Grafana → Alerting）：任务积压、任务长时间未确认、新死信、检索降级、预算超过 80%、SLO 快速燃烧、5xx 过高。本地没有接通知渠道，在 Alerting 页面看状态。想看它们触发，可以：
+- **告警**（Grafana → Alerting）：任务积压、任务长时间未确认、新死信、检索降级、预算超过 80%、SLO 快速燃烧、5xx 过高、审批超过 1 小时没人处理。本地没有接通知渠道，在 Alerting 页面看状态。想看它们触发，可以：
   ```bash
   docker compose exec redis redis-cli XADD agent_tasks '*' task_id not-a-uuid content broken   # 死信
   docker compose stop knowledge-service && scripts/demo.sh vpn; docker compose start knowledge-service   # 检索降级

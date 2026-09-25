@@ -393,6 +393,70 @@
           }
         },
         {
+          "uid": "ai-work-order-approval-waiting",
+          "title": "有审批超过 1 小时没人处理",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 3600,
+                "to": 0
+              },
+              "datasourceUid": "prometheus",
+              "model": {
+                "refId": "A",
+                "expr": "max by (app_tenant_id) (app_approvals_oldest_pending_age_seconds)",
+                "instant": true,
+                "range": false
+              }
+            },
+            {
+              "refId": "B",
+              "datasourceUid": "__expr__",
+              "model": {
+                "refId": "B",
+                "type": "reduce",
+                "expression": "A",
+                "reducer": "last",
+                "settings": {
+                  "mode": "dropNN"
+                }
+              }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "refId": "C",
+                "type": "threshold",
+                "expression": "B",
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "type": "gt",
+                      "params": [
+                        3600
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "for": "0s",
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "labels": {
+            "severity": "warning",
+            "service": "ai-work-order"
+          },
+          "annotations": {
+            "summary": "租户 {{ $labels.app_tenant_id }} 最老的待审批已等待 {{ humanizeDuration $values.B.Value }}",
+            "description": "员工的操作卡在 HITL 审批上，处理人还没批准或拒绝；24 小时后会自动过期。GET /v1/approvals?status=pending 查看。"
+          }
+        },
+        {
           "uid": "ai-work-order-http-errors",
           "title": "服务 5xx 比例过高",
           "condition": "C",

@@ -8,6 +8,7 @@ pending and not past its expiry, and nobody approves their own request (four-eye
 from app.core.errors import CallerError
 from app.core.redaction import mask_secret_fields
 from app.core.tenancy import parse_tenant_id
+from app.metrics import record_decision
 from app.repositories import approvals
 from app.schemas.approvals import ApprovalView
 
@@ -58,4 +59,5 @@ async def decide(
         if current.status == "pending":  # still pending, so it must be past its expiry
             raise CallerError(409, "APPROVAL_EXPIRED", "the approval expired before it was decided")
         raise CallerError(409, "APPROVAL_NOT_PENDING", f"the approval is already {current.status}")
+    record_decision(tenant_id=tenant_id, tool_name=approval.tool_name, decision=status, requested_at=approval.created_at)
     return view(await approvals.get(tenant_id, approval_id))

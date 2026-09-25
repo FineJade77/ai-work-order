@@ -77,6 +77,13 @@ def grants(db, tenant_id: str) -> int:
     return db.execute("SELECT count(*) FROM access_grants WHERE tenant_id = %s", (tenant_id,)).fetchone()[0]
 
 
+def open_expiry_checks(db, approval_id: str) -> int:
+    return db.execute(
+        "SELECT count(*) FROM approval_outbox WHERE approval_id = %s AND kind = 'expire' AND done_at IS NULL",
+        (approval_id,),
+    ).fetchone()[0]
+
+
 def test_an_approved_call_runs_once_the_agent_calls_again(gateway, db, redis, approving):
     call, key = make_call(gateway, approving), str(uuid.uuid4())
     first = call("grant_access", GRANT, key=key).json()
@@ -112,6 +119,7 @@ def test_an_approved_call_runs_once_the_agent_calls_again(gateway, db, redis, ap
 def test_a_rejected_call_never_runs(gateway, db, redis, approving):
     call, key = make_call(gateway, approving), str(uuid.uuid4())
     approval_id = call("grant_access", GRANT, key=key).json()["approval"]["id"]
+    assert open_expiry_checks(db, approval_id) == 1
     decide(gateway, approving, approval_id, "reject", approver=approving.handler, note="权限需部门经理申请")
     event_for(redis, approval_id, "rejected")
 
@@ -120,6 +128,7 @@ def test_a_rejected_call_never_runs(gateway, db, redis, approving):
         assert (body["status"], body["error"]["code"], body["replayed"]) == ("error", "APPROVAL_REJECTED", replayed)
         assert "权限需部门经理申请" in body["error"]["message"]
     assert grants(db, approving.id) == 0
+    assert open_expiry_checks(db, approval_id) == 0  # decided: no longer counted as pending
 
 
 def test_an_approval_nobody_decides_expires(gateway, db, redis, approving):

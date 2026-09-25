@@ -13,7 +13,7 @@ from app.core.config import get_settings
 from app.core.errors import CallerError
 from app.core.redaction import mask_secret_fields
 from app.core.tenancy import parse_tenant_id
-from app.metrics import TOOL_CALL_DURATION, TOOL_CALLS
+from app.metrics import APPROVALS_REQUESTED, TOOL_CALL_DURATION, TOOL_CALLS
 from app.repositories import approvals, audit, bindings, tool_calls
 from app.tools.base import ToolContext, ToolError, ToolSpec
 from app.tools.registry import REGISTRY, validate_arguments
@@ -213,6 +213,7 @@ async def _call_tool(
             return await _resume(winner, fingerprint, spec, ctx)
         call_id, approval = opened
         trace.get_current_span().add_event("approval_requested", {"app.approval_id": approval.id})
+        APPROVALS_REQUESTED.add(1, {"app.tool": tool_name, "app.tenant_id": tenant_id})
         return CallOutcome(status="pending_approval", call_id=call_id, approval=approval)
 
     call_id = await tool_calls.claim(

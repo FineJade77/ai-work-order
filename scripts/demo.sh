@@ -8,6 +8,9 @@
 #   scripts/demo.sh printer    nothing in the knowledge base -> ticket straight away
 #   scripts/demo.sh leave      the northwind tenant, an HR/admin desk: answer, "still rejected" -> ticket
 #                              filed under northwind's own category (leave), not an IT one
+#   scripts/demo.sh access     HITL: asks for system access -> the agent's grant_access waits for approval ->
+#                              the handler (it.staff) approves it -> the paused run resumes and grants it.
+#                              DECISION=reject to see a refusal instead
 #
 # The model decides the replies, so wording (and occasionally the path) varies between runs.
 set -euo pipefail
@@ -27,13 +30,16 @@ case "${1:-}" in
   email)   MESSAGES=("邮箱收不到邮件" "照着做了，还是收不到") ;;
   printer) MESSAGES=("打印机无法打印") ;;
   leave)   MESSAGES=("年假怎么申请" "按流程提交了，还是没通过") ;;
-  *) echo "usage: $0 vpn|account|email|printer|leave" >&2; exit 2 ;;
+  access)  MESSAGES=("帮我开通财务系统的只读权限，月底对账要看报表") ;;
+  *) echo "usage: $0 vpn|account|email|printer|leave|access" >&2; exit 2 ;;
 esac
 
-TOKEN="$(curl -sf "$BASE/auth/login" -H 'content-type: application/json' \
-  -d "$(jq -n --arg t "$TENANT" --arg e "$EMAIL" --arg p "$PASSWORD" '{tenant: $t, email: $e, password: $p}')" \
-  | jq -r .access_token)"
-AUTH="Authorization: Bearer $TOKEN"
+login() {
+  curl -sf "$BASE/auth/login" -H 'content-type: application/json' \
+    -d "$(jq -n --arg t "$TENANT" --arg e "$1" --arg p "$PASSWORD" '{tenant: $t, email: $e, password: $p}')" \
+    | jq -r .access_token
+}
+AUTH="Authorization: Bearer $(login "$EMAIL")"
 CONVERSATION="$(curl -sf -X POST "$BASE/conversations" -H "$AUTH" | jq -r .id)"
 echo "conversation $CONVERSATION"
 
@@ -66,6 +72,38 @@ say() {
 for message in "${MESSAGES[@]}"; do
   say "$message"
 done
+
+# The handler's side of HITL: find this conversation's pending approval and decide it. The decision
+# reaches the agent as an event (tool-gateway outbox -> approval_events -> app-service -> agent_tasks),
+# so there is no stream to follow here; poll the history for the resumed run's reply instead.
+if [ "$1" = access ]; then
+  HANDLER="Authorization: Bearer $(login "${HANDLER_EMAIL:-it.staff@example.com}")"
+  approval=""
+  for _ in $(seq 20); do
+    approval="$(curl -sf "$BASE/approvals" -H "$HANDLER" \
+      | jq -c --arg c "$CONVERSATION" '[.items[] | select(.conversation_id == $c)][0] // empty')"
+    [ -n "$approval" ] && break
+    sleep 1
+  done
+  if [ -z "$approval" ]; then
+    echo; echo "没有待审批：模型这次没有调用 grant_access（回复措辞与路径因模型而异，可以再跑一次）"; exit 1
+  fi
+  id="$(jq -r .id <<<"$approval")"
+  echo; echo "处理人> 待审批 $id: $(jq -c '{tool: .tool_name, arguments}' <<<"$approval")"
+  decision="${DECISION:-approve}"
+  seen="$(curl -sf "$BASE/conversations/$CONVERSATION/messages" -H "$AUTH" | jq '.messages | length')"
+  curl -sf -X POST "$BASE/approvals/$id/$decision" -H "$HANDLER" -H 'content-type: application/json' \
+    -d '{"note": "已与部门经理核实"}' | jq -r '"处理人> \(.status)（\(.note)）"'
+  for _ in $(seq 60); do
+    history="$(curl -sf "$BASE/conversations/$CONVERSATION/messages" -H "$AUTH")"
+    if [ "$(jq '.messages | length' <<<"$history")" -gt "$seen" ] && [ "$(jq -r .active_task_id <<<"$history")" = null ]; then
+      echo "助手> $(jq -r '.messages[-1].content' <<<"$history")"
+      break
+    fi
+    sleep 1
+  done
+  exit 0
+fi
 
 echo; echo "我的工单："
 curl -sf "$BASE/tickets" -H "$AUTH" | jq -r '.items[] | "  \(.id)  \(.status)  \(.category)  \(.summary)"'

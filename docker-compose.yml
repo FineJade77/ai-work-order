@@ -22,6 +22,11 @@ services:
     # One container for learning and local use; production runs these as separate components.
     # Data lives in the container: recreating it starts from empty.
     image: grafana/otel-lgtm:0.33.1
+    environment:
+      # A counter series is born at its first increment (value 1), so without a zero sample at its
+      # OTLP start time, increase()/rate() never see that first event: fatal for rare counters
+      # such as approvals. This writes the zero.
+      PROMETHEUS_EXTRA_ARGS: --enable-feature=created-timestamp-zero-ingestion
     ports:
       - "23000:3000"   # Grafana
       - "24317:4317"   # OTLP gRPC

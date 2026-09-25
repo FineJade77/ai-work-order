@@ -126,7 +126,8 @@ ai-work-order/
   - **验收标准**：集成测试（真 tool-gateway、Postgres、Redis）覆盖——批准后同一幂等键再调才执行且只执行一次、之后重放；自批 403；拒绝后再调永远是 `APPROVAL_REJECTED`（附备注）且不执行；无人处理时 relay 置为过期并发事件、之后不能再批准、再调为 `APPROVAL_EXPIRED`；截止时间已过但 relay 还没处理时批准也被拒；另一租户的策略下直接执行；等待中的调用审计为 `pending_approval`；每个决定都出现在 `approval_events`。迁移可降级再升级。
 - **8.2 Agent 动作路径与应用服务审批（已完成）**：agent-runtime——任务新增 `kind=approval`（`approval_id`、`decision`、`note`）；分诊的 `action` 意图；`plan_action`（`tools/list` + 模型选工具与参数，幂等键在此决定并落盘）、`execute_action`、`await_approval`（interrupt）、`report_action`；runner 按任务类型与中断类型分流（等审批时员工消息只回复状态、不恢复；对不上的审批任务回报空结果）；客户端认识 `pending_approval`、`list_tools`。app-service——迁移 0007（审批轮次）；`ApprovalEventConsumer` 消费 `approval_events` 开审批轮次并投递任务（按审批 id 去重，会话有轮次在处理时稍后重试）；审批 BFF 接口（处理人决定、员工看自己的）；空结果不写助手消息；补偿重投覆盖审批轮次；app-service 新增 `TOOL_GATEWAY_URL`/`TOOL_GATEWAY_SERVICE_TOKEN`。
   - **验收标准**：agent-runtime 单测覆盖——需要审批时暂停、批准后恢复且全程同一幂等键、工具只执行一次；等待中员工消息只得到状态回复、不分诊不恢复；拒绝（附审批意见）与过期都不执行、不建单；直接执行的策略下无审批；没有可用计划或执行失败转人工；对不上的审批任务回报空结果。端到端（真 tool-gateway）：请求 → 暂停 → 网关批准 → 审批任务恢复 → 开通记录恰好一条。app-service 集成测试：决定事件开审批轮次并投递带审批字段的任务、重复事件不重复开、会话有轮次在处理时等它结束后再开、空结果不写回复；审批接口的角色与可见性，网关错误透传。真实模型走通：申请 → 已提交审批 → 等待中追问得到状态 → 员工自批被拒 → 处理人批准 → 员工收到"已通过审批并办理完成"。
-- **8.3 可观测性、演示与文档（待做）**：审批的 span、事件与 link，审批指标、看板和告警；`scripts/demo.sh access`。
+- **8.3 可观测性、演示与文档（已完成）**：审批的 span、事件与 link（8.1、8.2 已埋：tool-gateway `expire approval`/`send approval_events` → app-service `process approval_events` → agent-runtime `node await_approval` → `node execute_action`，并 link 回申请那一轮）；tool-gateway 审批指标——申请数、决定数（按结果）、审批耗时直方图，待审批数与最久等待由 relay 每轮采样（决定时同一事务里关闭到期检查记录，"未完成的到期检查"即待审批）；Prometheus 开 `created-timestamp-zero-ingestion`，低频计数器的第一次也能被 `increase()` 看到；总览看板新增"审批（HITL）"一行，告警"审批超过 1 小时没人处理"；`scripts/demo.sh access`（`DECISION=reject` 走拒绝）；README 的 HITL 一节与接口表。
+  - **验收标准**：tool-gateway 测试覆盖决定后到期检查关闭；真实模型跑 `demo.sh access` 批准与拒绝两条路径都走通；Prometheus 里能查到申请、各结果的决定、耗时与待审批数，看板各面板有数据；Grafana 里能看到新告警规则。
 
 ## 工作方式要求
 

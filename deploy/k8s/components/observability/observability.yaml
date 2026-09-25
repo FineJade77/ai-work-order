@@ -22,6 +22,9 @@ spec:
       containers:
         - name: otel-lgtm
           image: grafana/otel-lgtm:0.33.1
+          env:
+            # A zero sample at each counter's OTLP start time, so increase() counts its first event.
+            - {name: PROMETHEUS_EXTRA_ARGS, value: --enable-feature=created-timestamp-zero-ingestion}
           ports:
             - {name: grafana, containerPort: 3000}
             - {name: otlp-grpc, containerPort: 4317}

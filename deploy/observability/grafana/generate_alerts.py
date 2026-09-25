@@ -75,6 +75,14 @@ RULES = [
         "description": f"SLO：{SLO_TARGET:.0%} 的轮次 30 秒内完成。1 小时和 5 分钟窗口都超过 {FAST_BURN} 倍燃烧率（且 1 小时内至少 10 轮）才触发。看板'轮次耗时'和 Tempo 里慢的 trace。",
     },
     {
+        "uid": "ai-work-order-approval-waiting",
+        "title": "有审批超过 1 小时没人处理",
+        "expr": "max by (app_tenant_id) (app_approvals_oldest_pending_age_seconds)",
+        "op": "gt", "threshold": 3600, "for": "0s", "severity": "warning",
+        "summary": "租户 {{ $labels.app_tenant_id }} 最老的待审批已等待 {{ humanizeDuration $values.B.Value }}",
+        "description": "员工的操作卡在 HITL 审批上，处理人还没批准或拒绝；24 小时后会自动过期。GET /v1/approvals?status=pending 查看。",
+    },
+    {
         "uid": "ai-work-order-http-errors",
         "title": "服务 5xx 比例过高",
         "expr": ('sum by (job) (rate(http_server_duration_milliseconds_count{http_status_code=~"5.."}[5m]))'

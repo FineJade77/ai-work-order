@@ -138,6 +138,19 @@ async def decide(tenant_id: str, approval_id: str, *, status: str, decided_by: s
             await session.rollback()
             return False
         session.add(ApprovalOutbox(tenant_id=tenant_id, approval_id=approval_id, kind="publish"))
+        # A handler's decision makes the expiry check moot: close it, so that "open expiry checks"
+        # equals "pending approvals", which the relay counts across tenants for the pending gauges.
+        # Not when expiring: that is the relay handling the check itself, holding its row lock.
+        if status != "expired":
+            await session.execute(
+                update(ApprovalOutbox)
+                .where(
+                    ApprovalOutbox.approval_id == approval_id,
+                    ApprovalOutbox.kind == "expire",
+                    ApprovalOutbox.done_at.is_(None),
+                )
+                .values(done_at=func.now())
+            )
         await session.commit()
     return True
 
