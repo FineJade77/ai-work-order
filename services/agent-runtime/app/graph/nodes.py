@@ -7,10 +7,11 @@ import json
 import logging
 import re
 
+import anyio
 from langgraph.runtime import Runtime
 from langgraph.types import interrupt
 
-from app.clients.tool_gateway import ToolCallFailed
+from app.clients.tool_gateway import classify_failure
 from app.graph import prompts
 from app.graph.state import AgentState, Deps
 
@@ -19,6 +20,9 @@ logger = logging.getLogger("agent_runtime.graph")
 HISTORY_WINDOW = 12  # messages sent to the model; older turns rarely matter for an IT question
 QUERY_MAX_CHARS = 200  # search_knowledge's schema limit
 SUMMARY_MAX_CHARS = 500  # create_ticket's schema limit
+# Pauses between up to three search attempts. Worst case, 3 x the 10s tool-gateway timeout plus
+# these, stays well inside task_timeout_seconds (60s) together with classify_intent.
+SEARCH_RETRY_DELAYS = (0.5, 1.0)
 
 INTENTS = {"in_scope", "out_of_scope", "ticket_request", "chitchat"}
 CATEGORIES = {"vpn", "account", "email", "other"}
@@ -64,16 +68,32 @@ async def classify_intent(state: AgentState, runtime: Runtime[Deps]) -> dict:
 
 
 async def retrieve_knowledge(state: AgentState, runtime: Runtime[Deps]) -> dict:
+    """A failed search is not "no hits": filing a ticket for it would turn an outage (or a tenant
+    missing its tool bindings) into a ticket for every question. Transient failures are retried
+    briefly; if the search still fails, knowledge_error routes to knowledge_unavailable."""
     deps = runtime.context
     await deps.events.publish("retrieving")
     query = _last_user_message(state)[:QUERY_MAX_CHARS]
-    try:
-        result = await deps.tools.call(deps.task, "search_knowledge", {"query": query})
-    except ToolCallFailed as exc:
-        # A failed search means no answer we can stand behind; the ticket path still helps.
-        logger.warning("search_knowledge failed task_id=%s: %s", deps.task.task_id, exc)
-        return {"knowledge": []}
-    return {"knowledge": result["results"]}
+    for attempt, delay in enumerate((*SEARCH_RETRY_DELAYS, None), start=1):
+        try:
+            result = await deps.tools.call(deps.task, "search_knowledge", {"query": query})
+            return {"knowledge": result["results"], "knowledge_error": None}
+        except Exception as exc:
+            failure = classify_failure(exc)
+            if failure is None:
+                raise
+        if not failure.transient or delay is None:
+            break
+        logger.warning(
+            "search_knowledge attempt %d failed task_id=%s code=%s; retrying", attempt, deps.task.task_id, failure.code
+        )
+        await anyio.sleep(delay)
+    # Fixed format, so log-based alerting can match on the leading keyword.
+    logger.error(
+        "knowledge_unavailable tenant_id=%s task_id=%s code=%s attempts=%d",
+        deps.task.tenant_id, deps.task.task_id, failure.code, attempt,
+    )
+    return {"knowledge": None, "knowledge_error": failure.code}
 
 
 async def generate_answer(state: AgentState, runtime: Runtime[Deps]) -> dict:
@@ -113,6 +133,16 @@ async def check_resolution(state: AgentState, runtime: Runtime[Deps]) -> dict:
         "resolution": resolution,
         "outcome": "resolved",
         "messages": [{"role": "assistant", "content": prompts.RESOLVED_REPLY}],
+    }
+
+
+async def knowledge_unavailable(state: AgentState, runtime: Runtime[Deps]) -> dict:
+    # Ends the run without waiting for feedback: the employee's next message is classified afresh,
+    # so asking again searches again and asking for a ticket files one.
+    await runtime.context.events.publish("reply", content=prompts.KNOWLEDGE_UNAVAILABLE_REPLY)
+    return {
+        "outcome": "knowledge_unavailable",
+        "messages": [{"role": "assistant", "content": prompts.KNOWLEDGE_UNAVAILABLE_REPLY}],
     }
 
 
@@ -156,6 +186,8 @@ def route_after_classify(state: AgentState) -> str:
 
 
 def route_after_retrieve(state: AgentState) -> str:
+    if state.get("knowledge_error"):
+        return "knowledge_unavailable"
     # knowledge-service already drops matches below its relevance threshold.
     return "generate_answer" if state["knowledge"] else "summarize_ticket"
 

@@ -19,10 +19,13 @@ class AgentState(TypedDict, total=False):
     intent: str | None  # in_scope | out_of_scope | ticket_request | chitchat
     category: str | None  # vpn | account | email | other (create_ticket's category enum)
     knowledge: list[dict] | None
+    # Set when the search itself failed (vs. succeeding with no hits); the code of the last failure.
+    knowledge_error: str | None
     resolution: str | None  # resolved | unresolved | new_question
     ticket_summary: str | None
     ticket_id: str | None
-    outcome: str | None  # resolved | replied | ticket_created; awaiting_feedback is the interrupt
+    # resolved | replied | ticket_created | knowledge_unavailable; awaiting_feedback is the interrupt
+    outcome: str | None
 
 
 # Per-run fields, cleared when a new run starts on a thread whose previous run has ended.
@@ -30,6 +33,7 @@ RUN_FIELDS_RESET: dict = {
     "intent": None,
     "category": None,
     "knowledge": None,
+    "knowledge_error": None,
     "resolution": None,
     "ticket_summary": None,
     "ticket_id": None,

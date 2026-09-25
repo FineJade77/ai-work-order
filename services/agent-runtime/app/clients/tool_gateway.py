@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -43,6 +44,32 @@ class ToolGatewayClient:
         if body["status"] == "error":
             raise ToolCallFailed(body["error"]["code"], body["error"]["message"])
         return body["result"]
+
+
+@dataclass(frozen=True)
+class CallFailure:
+    code: str
+    transient: bool  # worth retrying: the same call may succeed in a moment
+
+
+# Refusals no retry can change: the tenant's tool bindings or the call itself are wrong.
+_CONFIG_CODES = frozenset({"TOOL_NOT_ALLOWED", "UNKNOWN_TOOL", "INVALID_ARGUMENTS"})
+
+
+def classify_failure(exc: Exception) -> CallFailure | None:
+    """What a failed call() means, or None if exc is not a call failure (e.g. a bug, or RetryLater).
+
+    TOOL_ERROR (the tool's backend failed), timeouts, connection errors and 5xx are transient.
+    Tool refusals and other 4xx mean misconfiguration: the next attempt would fail the same way.
+    """
+    if isinstance(exc, ToolCallFailed):
+        return CallFailure(exc.code, transient=exc.code not in _CONFIG_CODES)
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        return CallFailure(_error_code(exc.response) or f"HTTP_{status}", transient=status >= 500)
+    if isinstance(exc, httpx.TransportError):
+        return CallFailure(type(exc).__name__, transient=True)
+    return None
 
 
 def _error_code(resp: httpx.Response) -> str | None:

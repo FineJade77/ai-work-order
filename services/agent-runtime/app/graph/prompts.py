@@ -29,6 +29,10 @@ SUMMARY = """你是企业 IT 服务台助手。根据对话为 IT 同事写一�
 直接输出描述正文，不超过 300 字，不要寒暄。"""
 
 CHITCHAT_REPLY = "你好，我是 IT 服务台助手，可以帮你处理 VPN、账号密码、邮箱相关的问题。请描述一下你遇到的问题。"
-RESOLVED_REPLY = "很高兴问题已经解决。如果还有其他 IT 问题，随时告诉我。"
+KNOWLEDGE_UNAVAILABLE_REPLY = (
+    "抱歉，知识库暂时无法访问，我没法给出可靠的解决步骤。你可以稍后再问一次；"
+    "如果问题紧急，回复「提工单」，我马上帮你转给 IT 同事。"
+)
+RESOLVED_REPLY ="很高兴问题已经解决。如果还有其他 IT 问题，随时告诉我。"
 TICKET_CREATED_REPLY = "已为你创建 IT 工单（编号 {ticket_id}），IT 同事会尽快处理，处理进展可以在「我的工单」中查看。"
 OUT_OF_SCOPE_MARKER = "[未命中知识库场景] "

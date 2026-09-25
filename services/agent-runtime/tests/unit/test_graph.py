@@ -1,9 +1,11 @@
 import uuid
 
+import httpx
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
-from app.graph import prompts
+from app.clients.tool_gateway import ToolCallFailed
+from app.graph import nodes, prompts
 from app.graph.builder import build_graph
 from app.worker.runner import SUPERSEDED, TaskRunner
 from tests.fakes import FakeModels, FakeTools, RecordingEvents, make_task
@@ -190,3 +192,49 @@ async def test_stale_copy_of_an_older_turn_is_not_taken_as_feedback(env):
     assert (env.events, env.models.calls, env.tools.calls) == seen
     assert (await env.runner._graph.aget_state(config)).values == state_before
     assert state_before["seq"] == second.seq
+
+
+def _http_error(status: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "http://tool-gateway/v1/tools/call")
+    return httpx.HTTPStatusError("gateway error", request=request, response=httpx.Response(status, request=request))
+
+
+@pytest.fixture
+def no_retry_pause(monkeypatch):
+    monkeypatch.setattr(nodes, "SEARCH_RETRY_DELAYS", (0, 0))
+
+
+async def test_transient_search_failures_are_retried_then_answered(env, no_retry_pause):
+    env.tools.search_failures = [ToolCallFailed("TOOL_ERROR", "knowledge-service down"), httpx.ConnectError("refused")]
+    assert await env.runner.run(env.task("VPN 连不上")) == "awaiting_feedback"
+    assert env.tools.names() == ["search_knowledge"] * 3
+
+
+async def test_search_that_keeps_failing_gets_a_reply_instead_of_a_ticket(env, no_retry_pause):
+    env.tools.search_failures = [_http_error(503)] * 3
+    task = env.task("VPN 连不上")
+    assert await env.runner.run(task) == "knowledge_unavailable"
+    assert env.tools.names() == ["search_knowledge"] * 3
+    assert "summary" not in env.models.calls
+    assert env.types(task) == ["retrieving", "reply", "done"]
+    assert _result(env, task) == {
+        "outcome": "knowledge_unavailable", "content": prompts.KNOWLEDGE_UNAVAILABLE_REPLY, "ticket_id": None,
+    }
+
+    # Not left waiting for feedback: the next message is classified afresh, so asking for a ticket files one.
+    env.models.intent = "ticket_request"
+    assert await env.runner.run(env.task("提工单")) == "ticket_created"
+    assert env.tools.names()[-1] == "create_ticket"
+
+
+@pytest.mark.parametrize("failure", [ToolCallFailed("TOOL_NOT_ALLOWED", "no binding"), _http_error(401)])
+async def test_misconfiguration_is_not_retried(env, no_retry_pause, failure):
+    env.tools.search_failures = [failure]
+    assert await env.runner.run(env.task("VPN 连不上")) == "knowledge_unavailable"
+    assert env.tools.names() == ["search_knowledge"]
+
+
+async def test_a_bug_in_the_search_call_is_not_mistaken_for_an_outage(env):
+    env.tools.search_failures = [KeyError("results")]
+    with pytest.raises(KeyError):
+        await env.runner.run(env.task("VPN 连不上"))

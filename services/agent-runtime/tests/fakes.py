@@ -66,6 +66,7 @@ class FakeTools:
 
     def __init__(self, hits: list[dict] | None = None):
         self.hits = [VPN_HIT] if hits is None else hits
+        self.search_failures: list[Exception] = []  # raised by the next searches, in order
         self.crash_on_create = 0  # raise this many times before creating, as if the worker died
         self.calls: list[tuple] = []
         self.tickets: dict[str, str] = {}
@@ -73,6 +74,8 @@ class FakeTools:
     async def call(self, task, tool_name, arguments, *, idempotency_key=None):
         self.calls.append((tool_name, arguments, idempotency_key))
         if tool_name == "search_knowledge":
+            if self.search_failures:
+                raise self.search_failures.pop(0)
             return {"results": self.hits}
         if self.crash_on_create:
             self.crash_on_create -= 1

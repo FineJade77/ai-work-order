@@ -15,6 +15,7 @@ from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
 from app.clients.tool_gateway import ToolGatewayClient
 from app.events import RESULT_STREAM, EventPublisher, event_stream_key
+from app.graph import prompts
 from app.graph.builder import build_graph
 from app.worker.consumer import TaskConsumer
 from app.worker.queue import CONSUMER_GROUP, TASK_STREAM, RedisStreamTaskQueue, floor_key
@@ -126,11 +127,13 @@ def task_fields(task) -> dict[str, str]:
     return {k: str(v) for k, v in task.model_dump().items()}
 
 
-async def send(w: Worker, content: str) -> list[tuple[str, dict]]:
+async def send(w: Worker, content: str, *, tenant_id: uuid.UUID | None = None) -> list[tuple[str, dict]]:
     """Enqueues the conversation's next message the way app-service does (floor raised to its seq
     in the same transaction) and waits for its run's 'done' event."""
     w.seq += 1
     task = make_task(w.conversation, content, user_id=w.user, seq=w.seq)
+    if tenant_id:
+        task = task.model_copy(update={"tenant_id": tenant_id})
     w.last_task = task
     async with w.redis.pipeline(transaction=True) as pipe:
         pipe.set(floor_key(w.conversation), task.seq)
@@ -212,3 +215,15 @@ async def test_stale_copy_of_an_older_turn_is_skipped(worker, floor):
     assert [t for t, _ in events] == ["ticket_created", "done"]
     [(_, _, category, _)] = _tickets(worker.conversation)
     assert category == "email"
+
+
+async def test_tenant_without_tool_bindings_gets_a_reply_not_a_ticket(worker):
+    """The real TOOL_NOT_ALLOWED path: a tenant onboarded without role_tool_bindings must not have
+    every question silently turned into a ticket."""
+    events = await send(worker, "VPN 连不上", tenant_id=uuid.uuid4())
+    assert events == [
+        ("retrieving", {}),
+        ("reply", {"content": prompts.KNOWLEDGE_UNAVAILABLE_REPLY}),
+        ("done", {"outcome": "knowledge_unavailable"}),
+    ]
+    assert _tickets(worker.conversation) == []

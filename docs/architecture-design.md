@@ -114,11 +114,12 @@
 - 用 LangGraph 构建一个**固定状态图**（不做 ReAct 自由调工具：AI Gateway 只有文本流接口，V1 流程固定，固定图更可测），节点：
   1. `classify_intent`：LLM 判断意图（三个场景内 / 场景外 / 明确要求开工单 / 寒暄或描述不清）和类别（`vpn/account/email/other`，即 `create_ticket` 的 category 枚举）。输出解析失败按"描述不清"处理。
   2. `retrieve_knowledge`：调用 Tool Gateway 的 `search_knowledge`；无命中直接转工单，不让模型硬答。
+     - 检索失败不等于无命中：否则知识库故障、或新租户漏配工具绑定，会把每个问题都静默变成工单。临时性故障（`TOOL_ERROR`、连不上/超时、5xx）在节点内最多试 3 次（间隔 0.5s、1s）；配置类错误（`TOOL_NOT_ALLOWED`/`UNKNOWN_TOOL`/`INVALID_ARGUMENTS`、其他 4xx）不重试。仍失败则进入 `knowledge_unavailable`：固定回复"知识库暂时无法访问，可稍后重问或回复「提工单」"，outcome 为 `knowledge_unavailable`，不建单、不等待反馈（下一条消息重新分类）。每次降级记一条 `knowledge_unavailable tenant_id=… code=… attempts=…` 的 ERROR 日志，供告警匹配。
   3. `generate_answer`：调用 AI Gateway 基于检索结果生成回答，流式写出事件。
   4. `await_feedback`：LangGraph `interrupt()`，本轮结束；同一会话的下一条消息作为 resume 值继续。
   5. `check_resolution`：LLM 根据员工回复判断已解决 / 没解决 / 新问题（新问题回到 `classify_intent`）；解析失败按"没解决"处理。
   6. `summarize_ticket` → `create_ticket`：先由 LLM 写工单描述（问题、现象、已尝试的知识库方案），再调用 Tool Gateway 创建工单。两步分开，是为了崩溃重跑时发出的建单请求完全相同。
-  - 场景外、明确要求开工单、检索无命中、反馈没解决，都**自动建单**；寒暄或描述不清回复固定引导语。
+  - 场景外、明确要求开工单、检索无命中、反馈没解决，都**自动建单**；寒暄或描述不清回复固定引导语；检索不可用回复固定说明、不建单。
 - 状态持久化：LangGraph checkpoint 存 **Postgres**（独立的 `agent_runtime` 库，`AsyncPostgresSaver`），`thread_id = conversation_id`，多轮历史就在图状态里，任务里只带最新一条消息。表结构由 langgraph-checkpoint-postgres 管理（迁移任务里跑 `setup()`，不走 Alembic）；表里没有 `tenant_id`，不做 RLS，只有 Agent Runtime 能连这个库。
 - 任务契约：`agent_tasks` 消息字段 `task_id, seq, conversation_id, tenant_id, user_id, content`，由应用服务写入；投递时在同一个 Redis 事务里把会话下限 `agent:floor:{conversation_id}` 提高到这个 `seq`（只升不降，24 小时过期）。调用 Tool Gateway 时 `session_id = conversation_id`，`user_id` 原样透传，`agent_role` 取配置（`it_support_agent`）。
 - 崩溃恢复与不重复建单：

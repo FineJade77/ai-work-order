@@ -11,6 +11,7 @@ def build_graph(checkpointer: BaseCheckpointSaver) -> CompiledStateGraph:
     classify_intent ─┬─ chitchat ─────────────────────────────→ reply → END
                      ├─ out_of_scope / ticket_request ────────→ summarize_ticket → create_ticket → END
                      └─ in_scope → retrieve_knowledge ─┬─ no hits → summarize_ticket
+                                                       ├─ search failed → knowledge_unavailable → END
                                                        └─ hits → generate_answer → await_feedback (interrupt)
     await_feedback → check_resolution ─┬─ resolved → END
                                        ├─ unresolved → summarize_ticket
@@ -24,6 +25,7 @@ def build_graph(checkpointer: BaseCheckpointSaver) -> CompiledStateGraph:
         nodes.await_feedback,
         nodes.check_resolution,
         nodes.reply,
+        nodes.knowledge_unavailable,
         nodes.summarize_ticket,
         nodes.create_ticket,
     ):
@@ -33,7 +35,9 @@ def build_graph(checkpointer: BaseCheckpointSaver) -> CompiledStateGraph:
     graph.add_conditional_edges(
         "classify_intent", nodes.route_after_classify, ["retrieve_knowledge", "reply", "summarize_ticket"]
     )
-    graph.add_conditional_edges("retrieve_knowledge", nodes.route_after_retrieve, ["generate_answer", "summarize_ticket"])
+    graph.add_conditional_edges(
+        "retrieve_knowledge", nodes.route_after_retrieve, ["generate_answer", "summarize_ticket", "knowledge_unavailable"]
+    )
     graph.add_edge("generate_answer", "await_feedback")
     graph.add_edge("await_feedback", "check_resolution")
     graph.add_conditional_edges(
@@ -42,4 +46,5 @@ def build_graph(checkpointer: BaseCheckpointSaver) -> CompiledStateGraph:
     graph.add_edge("summarize_ticket", "create_ticket")
     graph.add_edge("create_ticket", END)
     graph.add_edge("reply", END)
+    graph.add_edge("knowledge_unavailable", END)
     return graph.compile(checkpointer=checkpointer)
