@@ -7,24 +7,26 @@
 ## 架构
 
 ```
-浏览器 ──HTTP/SSE──▶ app-service ──XADD agent_tasks──▶ Redis Streams ──▶ agent-runtime（LangGraph Worker）
-   ▲                   │  ▲                                                    │
-   │                   │  └── agent_results / 每会话事件 Stream ◀──────────────┤
-   │                   │                                                       ├─▶ tool-gateway ─┬─▶ knowledge-service
-   └── 工单页面 ────────┴──────────────────────▶ ticket-service ◀──────────────┤                 └─▶ ticket-service
-                                                                               └─▶ ai-gateway ──▶ DeepSeek
+浏览器 ──HTTP/SSE──▶ app-service
+                       ├─ XADD agent_tasks ──────────────▶ Redis Streams ──▶ agent-runtime（LangGraph Worker）
+                       ├─ 读 agent_results、每会话事件 Stream ◀─ Redis ◀──────── agent-runtime 写入
+                       └─ 工单页面（查询 / 流转）─────────▶ ticket-service
+
+agent-runtime ─┬─▶ tool-gateway ─┬─▶ knowledge-service
+               │                 └─▶ ticket-service（create_ticket）
+               └─▶ ai-gateway ──▶ DeepSeek
 ```
 
 | 服务 | 端口 | 职责 | 数据库 |
 |---|---|---|---|
-| app-service | 8001 | 登录（JWT）、会话与消息、SSE 推送、回复落库、员工/IT 工单页面的 BFF | `app_service` |
+| app-service | 8001 | 登录（JWT）、会话与消息、发消息限流、SSE 推送、回复落库、员工/IT 工单页面的 BFF | `app_service` |
 | agent-runtime | 无对外端口 | 消费任务队列，跑 LangGraph 状态图：分类 → 检索 → 回答 → 等反馈 → 建单 | `agent_runtime`（checkpoint） |
 | tool-gateway | 8003 | 工具策略网关：角色绑定、参数校验、幂等、审计、脱敏 | `tool_gateway` |
-| ai-gateway | 8004 | 模型调用唯一出口（OpenAI 兼容协议，当前接 DeepSeek），记录用量 | `ai_gateway` |
+| ai-gateway | 8004 | 模型调用唯一出口（OpenAI 兼容协议，当前接 DeepSeek），记录用量、每日 token 预算 | `ai_gateway` |
 | knowledge-service | 8005 | 知识检索，V1 为按租户写死的数据 | 无 |
 | ticket-service | 8006 | 工单生命周期：4 状态状态机、乐观锁、处理记录 | `ticket_service` |
 
-一个 Postgres 实例、每个服务一个库，服务之间不共享表和代码；Redis 同时承担任务队列、事件回传和会话锁。
+一个 Postgres 实例、每个服务一个库，服务之间不共享表和代码；Redis 同时承担任务队列、结果与事件回传、会话锁、会话下限（跳过旧轮次的副本）和发消息限流计数。
 
 ## 快速开始
 

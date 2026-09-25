@@ -13,9 +13,9 @@
 - 语言：Python 3.11+，应用服务与 Agent Runtime 统一用 Python，降低集成成本。
 - 应用服务框架：FastAPI。
 - Agent 编排：LangGraph。
-- 队列 + 流式回传：Redis Streams（任务队列）+ Redis Pub/Sub（执行中事件回传），复用同一个 Redis 实例。
+- 队列 + 流式回传：Redis Streams——全局任务队列 `agent_tasks`、全局结果流 `agent_results`、每会话事件流 `conversation:{id}:events`（不用 Pub/Sub：没有订阅者时会丢事件），复用同一个 Redis 实例。
 - 数据库：PostgreSQL，同一实例、每服务独立 database，库内 `tenant_id` 行级隔离（RLS）。
-- 工具协议：Tool Gateway 对 Agent Runtime 暴露 REST 接口（`/v1/tools/list` 返回 OpenAI function 元数据，`/v1/tools/call` 执行），详见架构文档 3.4 节。
+- 工具协议：Tool Gateway 对 Agent Runtime 暴露 REST 接口（`/v1/tools/call` 执行；`/v1/tools/list` 返回 OpenAI function 元数据，V1 的固定状态图不用它），详见架构文档 3.4 节。
 - 模型供应商：AI Gateway v1 通过 OpenAI-compatible 协议接入，具体供应商为 **DeepSeek**（`base_url=https://api.deepseek.com`），用 `ModelProvider` 抽象 + 通用 `OpenAICompatibleProvider` 实现，不要为 DeepSeek 单独写一套适配代码。
 - 容器化：每个服务独立 Dockerfile，提供 `docker-compose.yml` 用于本地一键起环境（Postgres、Redis 与全部服务）。
 
@@ -44,9 +44,9 @@ ai-work-order/
 按顺序执行，每阶段完成后自测通过再进入下一阶段；不要跨阶段并行大改。
 
 ### 阶段 0：仓库脚手架
-- 建立上述目录结构，四个服务各自的 `pyproject.toml`/依赖声明、最小可运行的健康检查端点（`GET /healthz`）。
-- `docker-compose.yml` 拉起 Postgres + Redis + 四个服务，服务间通过 compose 网络互通。
-- **验收标准**：`docker compose up` 后四个服务健康检查均返回 200。
+- 建立上述目录结构，六个服务各自的 `pyproject.toml`/依赖声明、最小可运行的健康检查端点（`GET /healthz`）。（最初是四个服务，knowledge-service、ticket-service 在阶段 2.5 拆出。）
+- `docker-compose.yml` 拉起 Postgres + Redis + 六个服务，服务间通过 compose 网络互通。
+- **验收标准**：`docker compose up` 后六个服务健康检查均返回 200。
 
 ### 阶段 1：数据模型与迁移
 > 最初是一个共享库 + 一套迁移（`libs/shared`），后改为每服务独立 database、各自迁移（架构文档第 4 节）。以下为当前版本。
@@ -73,28 +73,33 @@ ai-work-order/
 - 实现 `ModelProvider` 抽象 + 通用 `OpenAICompatibleProvider` 实现（用 OpenAI SDK 即可，只需把 `base_url` 指向配置项，不要绑定 OpenAI 官方域名），暴露统一的 `generate(messages, tenant_id, system_prompt) -> stream[chunk]` 接口（支持流式）。
 - 配置一个具体供应商实例：DeepSeek（`base_url=https://api.deepseek.com`，模型名走配置项，如 `deepseek-chat`）。
 - 每次调用记录 `tenant_id + 模型名 + 输入/输出 token 数 + 耗时` 到日志或表。
-- API Key（DeepSeek Key）通过环境变量/密钥管理注入，不要硬编码，不要打印到日志。
-- **验收标准**：给定一个测试 prompt，能拿到流式返回的 token，且用量记录可查询。
+- API Key（DeepSeek Key）通过环境变量/密钥管理注入，不要硬编码，不要打印到日志。配置统一走 `app/core/config.py` 的 Settings，缺配置时启动即失败。
+- `POST /v1/generate` 要求 Bearer 服务令牌（`AI_GATEWAY_SERVICE_TOKEN`）。
+- 每日 token 预算：流开始前汇总租户当天（`BUDGET_TIMEZONE`，默认 `Asia/Shanghai`）已用 token，达到预算返回 429 `TOKEN_BUDGET_EXCEEDED`，`Retry-After` 到次日零点。默认值 `DAILY_TOKEN_BUDGET`（1,000,000），迁移 0002 建 `tenant_token_budgets`（按租户覆盖，只开 RLS 不 FORCE，owner 可直接用 SQL 维护）并给 `model_call_logs` 加 `(tenant_id, created_at)` 索引。
+- **验收标准**：给定一个测试 prompt，能拿到流式返回的 token，且用量记录可查询；`tests/unit` 覆盖鉴权、租户校验与预算拒绝都发生在流开始前、预算日按时区划分；`tests/integration`（真 Postgres，运行时账号）覆盖用量达到预算即拒、只算当天、不算别的租户、按租户覆盖默认值。
 
 ### 阶段 4：Agent Runtime
 > 最初计划 checkpoint 存 Redis、事件走 Pub/Sub，后改为 checkpoint 存 Postgres、事件写每会话 Redis Stream（架构文档 3.3 节）。以下为当前版本。
 - 用 LangGraph 实现固定状态图：`classify_intent → retrieve_knowledge → generate_answer → await_feedback(interrupt) → check_resolution → (end | summarize_ticket → create_ticket)`，另有 `reply`（寒暄/描述不清）分支；`new_question` 回到 `classify_intent`。
 - `classify_intent` 判断问题是否属于 V1 的 3 个场景；场景外、明确要求开工单、检索无命中、反馈没解决都自动建单（场景外的工单描述带"未命中知识库场景"标记），不勉强让模型作答。
-- 作为无状态 Worker：通过 Consumer Group 消费 `agent_tasks`（消息字段 `task_id, conversation_id, tenant_id, user_id, content`；`user_id` 原样传给 Tool Gateway 作为提单人）。历史上下文在 checkpoint 里，不随任务传。
+- 检索失败不等于无命中：临时性故障（`TOOL_ERROR`、连不上/超时、5xx）节点内最多试 3 次，配置类错误（`TOOL_NOT_ALLOWED` 等、其他 4xx）不重试；仍失败走 `knowledge_unavailable` 固定回复，不建单，记 `knowledge_unavailable …` ERROR 日志。
+- AI Gateway 返回 429 `TOKEN_BUDGET_EXCEEDED` 时，runner 以固定回复结束这一轮（outcome `budget_exceeded`），任务 ACK、不重试、不建单，记 `budget_exceeded …` ERROR 日志。
+- 作为无状态 Worker：通过 Consumer Group 消费 `agent_tasks`（消息字段 `task_id, seq, conversation_id, tenant_id, user_id, content`；`user_id` 原样传给 Tool Gateway 作为提单人）。历史上下文在 checkpoint 里，不随任务传。
+- 跳过旧轮次的副本：拿到会话锁后，`seq` 低于 Redis 会话下限 `agent:floor:{conversation_id}` 的任务直接 ACK；图状态里记录最近一轮的 `seq`，更小的任务也直接 ACK（Redis 丢下限时兜底）。两种情况都不跑图、不写事件和结果。
 - 执行事件（`retrieving`、`answer_chunk`、`answer`、`reply`、`ticket_created`、`resumed`、`error`、`done`）写入 `conversation:{conversation_id}:events` Stream。
 - checkpoint 存 Postgres `agent_runtime` 库（`agent-runtime-migrate` 任务跑 `setup()` 并授权运行时账号），`durability="sync"`，crash 后从断点续跑。
 - 调用 AI Gateway 带服务令牌。
-- **验收标准**：`tests/unit`（假网关 + 内存 checkpointer，覆盖每条分支、interrupt/resume、解析失败兜底、崩溃续跑）与 `tests/integration`（真 Redis、Postgres、tool-gateway、ticket-service，模型用假实现）全部通过；向 `agent_tasks` 写入测试任务，能在事件 Stream 上看到预期序列；分别在回答输出途中和生成工单摘要途中 `kill -9` Worker 再重启，任务续跑完成且该会话只有一张工单。
+- **验收标准**：`tests/unit`（假网关 + 内存 checkpointer，覆盖每条分支、interrupt/resume、解析失败兜底、崩溃续跑、检索重试与降级、预算拒绝不影响下一轮、旧副本不被当成反馈）与 `tests/integration`（真 Redis、Postgres、tool-gateway、ticket-service，模型用假实现；覆盖旧副本在有 / 没有 Redis 下限时都被跳过、无工具绑定的租户得到降级回复而不是工单、预算拒绝被 ACK 不重试）全部通过；向 `agent_tasks` 写入测试任务，能在事件 Stream 上看到预期序列；分别在回答输出途中和生成工单摘要途中 `kill -9` Worker 再重启，任务续跑完成且该会话只有一张工单。
 
 ### 阶段 5：应用服务
 > 工单数据与接口已在 ticket-service（阶段 2.5）。本阶段的员工"我的工单"和 IT 处理页面由应用服务调用 ticket-service 实现，`start`/`resolve` 的 IT 角色校验在应用服务做。
 - 登录：`POST /v1/auth/login {tenant(slug), email, password}` 签发 HS256 JWT（`sub/tid/role`）；`GET /v1/me`。迁移 0003 加 `tenants.slug`、`users.password_hash`、角色约束（`employee/it_staff`）、`turns` 表、`messages.task_id`。
-- `POST /v1/conversations/{id}/messages`：同一事务写用户消息和 `turns`（同一会话只能有一个 `queued`，否则 409），再 XADD `agent_tasks`，返回 202 `{task_id, message_id}`。
+- `POST /v1/conversations/{id}/messages`：先按员工限流（每分钟 6 条、每天 200 条，Redis 固定窗口，超出 429 `RATE_LIMITED` 带 `Retry-After`，Redis 不可用时放行）；同一事务写用户消息和 `turns`（分配会话内序号 `seq`，迁移 0004；同一会话只能有一个 `queued`，否则 409），再在一个 Redis 事务里提高会话下限并 XADD `agent_tasks`，返回 202 `{task_id, message_id}`。
 - `GET /v1/conversations/{id}/stream?task_id=`（SSE）：从会话事件 Stream 开头读、按 `task_id` 过滤，Stream ID 作为 SSE 的 event id，支持 Last-Event-ID 续读，`done`/`error` 后关闭；事件已过期时用数据库里的结果补发。
-- 回复落库：后台消费 `agent_results`，幂等地写助手消息、关闭轮次。补偿：`queued` 超过 10 分钟的轮次用同一 `task_id`、`seq` 重新入队，最多 2 次后标记失败。每轮带会话内序号 `seq`，Agent Runtime 据此跳过旧轮次的副本（架构文档 3.3 节）。
+- 回复落库：后台消费 `agent_results`，幂等地写助手消息、关闭轮次；已失败的轮次收到晚到的结果时，只在它仍是会话最新一轮时覆盖失败提示。补偿：`queued` 超过 10 分钟的轮次用同一 `task_id`、`seq` 重新入队，最多 2 次后标记失败；阈值配置必须 ≥ 480 秒（Agent Runtime 自身重试的最长时间）。补偿逐个租户扫描，`tenant_scope` 切换租户前先 flush。
 - 工单接口：`GET /v1/tickets`（员工只看自己的）、`GET /v1/tickets/{id}`、`POST /v1/tickets/{id}/transitions`，均转调 ticket-service，租户和用户取自 JWT；`start` 固定指派给自己。
 - seed：两个 demo 租户（slug `demo`、`northwind`）各一个员工和一个 IT，开发密码 `demo-password`。
-- **验收标准**：`tests/unit` 与 `tests/integration`（真 Postgres、Redis、ticket-service）全部通过，覆盖登录失败不可区分、会话私有、并发发消息 409、结果重复投递只存一次、晚到结果覆盖失败提示、SSE 过滤与续读、补偿重投与放弃、工单可见性与角色规则；用 curl 完整跑通"登录 → 提问 → SSE 收到检索中和回答 → 反馈未解决 → 收到 ticket_created → 查询工单 → IT 处理 → 员工关闭"的闭环。
+- **验收标准**：`tests/unit` 与 `tests/integration`（真 Postgres、Redis、ticket-service）全部通过，覆盖登录失败不可区分、会话私有、并发发消息 409、`seq` 递增与会话下限、结果重复投递只存一次、晚到结果仅在最新一轮时覆盖失败提示、SSE 过滤与续读、补偿重投与放弃（含多个租户同时有超时轮次）、发消息限流（分钟/日窗口、被拒请求不落库、Redis 不可用时放行）、工单可见性与角色规则；用 curl 完整跑通"登录 → 提问 → SSE 收到检索中和回答 → 反馈未解决 → 收到 ticket_created → 查询工单 → IT 处理 → 员工关闭"的闭环。
 
 ### 阶段 6：端到端联调与本地部署
 - `docker compose up -d --build` 一条命令完成建库、迁移、写入演示数据（`*-seed` 一次性服务）和启动；`.env.example` 说明所有配置项。

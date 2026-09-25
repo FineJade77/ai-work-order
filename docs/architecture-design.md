@@ -14,67 +14,44 @@
 ## 2. 总体架构
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                              客户端层                                  │
-│   Web 工单/问答前端  │  企业IM机器人(飞书/企业微信/Slack，二期)【假设】     │
-└───────────────────────────────┬──────────────────────────────────────┘
-                                 │ HTTPS
-┌───────────────────────────────▼──────────────────────────────────────┐
-│  API Gateway                                                          │
-│  · 统一入口、TLS 终止、鉴权(JWT/OIDC)、限流、路由、多租户识别(tenant_id)  │
-└───────────────────────────────┬──────────────────────────────────────┘
-                                 │
-┌───────────────────────────────▼──────────────────────────────────────┐
-│  应用服务 (Application Service)                                       │
-│  · 会话管理 / 用户与租户管理 / 权限校验；员工与 IT 页面的 BFF          │
-│  · 编排「问答 → 未解决转工单」的业务流程（工单数据在 ticket-service）  │
-│  · 对下游 Agent Runtime 发起任务，接收结果落库                          │
-└───────┬───────────────────────────────────────────────┬──────────────┘
-        │ 任务入队(Redis Streams)  事件读取(每会话 Stream) │
-┌───────▼────────────────┐                    ┌──────────▼─────────────┐
-│  Redis Streams           │◄──────结果发布─────│   数据层                │
-│  · agent_tasks 队列       │                    │  · PostgreSQL(业务数据) │
-│  · Consumer Group        │                    │  · 向量库(知识库，二期)  │
-└───────┬──────────────────┘                    │  · Redis(会话/缓存/队列)│
-        │ 消费任务                                │  · 对象存储(附件/日志)   │
-┌───────▼────────────────┐                    └─────────────────────────┘
-│  Agent Runtime（Worker，无状态，多副本）              │
-│  (LangGraph)            │
-│  · 意图识别/状态图编排    │
-│  · ReAct 循环调用工具    │
-│  · 会话记忆/上下文管理    │
-│  · 执行事件写入每会话 Stream（供应用服务转 SSE）│
-└───────┬────────────────┘
-        │ REST: /v1/tools/list, /v1/tools/call（OpenAI function 元数据）
-┌───────▼──────────────────────────────────────────────────────────────┐
-│  Tool Gateway（工具策略网关）                                          │
-│  · 角色-工具绑定 / JSON Schema 校验 / 幂等 / 审计 / 服务间令牌鉴权       │
-│  · search_knowledge → knowledge-service                              │
-│  · create_ticket → ticket-service（TicketProvider 接口）               │
-│  · 预留：外部系统工具适配位（Jira/ServiceNow/企业IM，未来可插拔）        │
-└───────┬────────────────────────────────────────────────┬─────────────┘
-        │                                                 │
-┌───────▼─────────────┐                        ┌──────────▼─────────────┐
-│  knowledge-service    │                        │   ticket-service        │
-│  v1: 按租户写死的数据  │                        │  · 工单 + 4 状态状态机   │
-│  只读检索，无数据库    │                        │  · 乐观锁 + 处理记录     │
-│  v2: 向量化+RAG检索   │                        │  · ticket_service 库    │
-└──────────────────────┘                        └──────────────────────┘
+客户端：Web 问答/工单前端【V1 未实现，用 curl / scripts/demo.sh】、企业 IM 机器人（二期）【假设】
+  │ HTTPS
+  ▼
+API Gateway【V1 未部署：JWT 校验和发消息限流由 app-service 自己做】
+  │
+  ▼
+app-service
+  ├─ HTTP：员工"我的工单"、IT 处理（查询 / 状态流转）──────────▶ ticket-service
+  ├─ XADD agent_tasks（同一事务提高会话下限）─────────────────▶ Redis
+  ├─ 消费 agent_results：回复落库、关闭轮次 ◀───────────────── Redis
+  └─ 读 conversation:{id}:events，经 SSE 推给浏览器 ◀───────── Redis
 
-┌──────────────────────────────────────────────────────────────────────┐
-│  AI Gateway                                                            │
-│  · 统一 LLM 调用出口：鉴权、限流、成本与用量审计、Prompt/模型版本管理     │
-│  · 多供应商可插拔路由：v1 通过 OpenAI-compatible 协议适配器接入，        │
-│    首个供应商为 DeepSeek                                              │
-│  · 被 Agent Runtime 唯一依赖，Agent 不直连任何模型 SDK                 │
-└──────────────────────────────────────────────────────────────────────┘
+agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
+  ├─ XREADGROUP / XAUTOCLAIM 取任务；写事件流、结果流 ────────▶ Redis
+  ├─ POST /v1/tools/call ─▶ tool-gateway
+  │                           ├─ search_knowledge ──────────▶ knowledge-service
+  │                           └─ create_ticket（透传幂等键）─▶ ticket-service
+  └─ POST /v1/generate（SSE）─▶ ai-gateway ─▶ DeepSeek（OpenAI 兼容协议）
 ```
 
-**调用关系约束**：Agent Runtime 只能通过 Tool Gateway 调用外部能力、通过 AI Gateway 调用模型，不允许绕过网关直连数据库或第三方 API——这是保证多租户隔权限、审计、限流集中生效的关键约束。
+| 组件 | 存储 | 说明 |
+|---|---|---|
+| app-service | Postgres `app_service` | 登录、会话、轮次、回复落库、补偿重投、工单页面 BFF（3.2 节） |
+| agent-runtime | Postgres `agent_runtime`（LangGraph checkpoint） | 不对外提供接口，只消费队列（3.3 节） |
+| tool-gateway | Postgres `tool_gateway` | 工具策略执行点：角色绑定、Schema、幂等、审计、脱敏（3.4 节） |
+| ai-gateway | Postgres `ai_gateway` | 模型调用唯一出口：服务令牌、每日 token 预算、用量记录（3.5 节） |
+| knowledge-service | 无（随镜像发布的静态 JSON） | 只读检索（3.6 节） |
+| ticket-service | Postgres `ticket_service` | 工单数据与生命周期的唯一所有者（3.7 节） |
+| Redis | — | 任务队列 `agent_tasks`（含死信）、结果流 `agent_results`、每会话事件流、会话锁、会话下限、发消息限流计数；V1 不做会话缓存 |
+
+- 向量库（知识库 V2）、对象存储（附件）【V1 未实现】。
+
+**调用关系约束**：Agent Runtime 只能通过 Tool Gateway 调用外部能力、通过 AI Gateway 调用模型，不允许绕过网关直连数据库或第三方 API——这是保证多租户隔离、权限、审计、限流和预算集中生效的关键约束。
 
 ## 3. 组件职责与接口
 
-### 3.1 API Gateway
+### 3.1 API Gateway【V1 未部署】
+- V1 现状：没有独立的 API Gateway。JWT 签发与校验、按员工的发消息限流都在 app-service 里（3.2 节）；k8s 清单只有 ClusterIP Service、没有 Ingress，dev 环境用 `kubectl port-forward` 访问 app-service。
 - 技术选型：Kong / APISIX / Envoy 均可，云无关方案优先选 **APISIX**（开源、K8s Ingress Controller 生态成熟）。
 - 职责：TLS、JWT 校验、租户识别（从 token 或 header 解析 `tenant_id` 并透传下游）、限流（按租户/用户维度）、请求日志。
 - 不承载业务逻辑。
@@ -87,31 +64,30 @@
   - `Conversation` / `Message`：问答会话
   - `Turn`：一条用户消息及其处理状态（`queued/done/failed`），`id` 就是投递给 Agent Runtime 的 `task_id`，`seq` 是它在会话内的序号（1、2、3…，唯一约束）；部分唯一索引保证同一会话同时只有一轮在处理
   - 工单不在这里：归 ticket-service 所有（见 3.7 节）。员工"我的工单"、IT 人员处理工单的页面由应用服务调用 ticket-service 的内部接口实现，`start`/`resolve` 这类 IT 操作的角色权限也在应用服务里判断。
-- 核心业务流程：
-  1. 接收用户提问 → 创建/追加 `Conversation`。
-  2. 调用 Agent Runtime 执行任务，传入 `tenant_id`、会话上下文。
-  3. 若 Agent 返回「已通过知识库解决」→ 落库回答，结束。
-  4. 若 Agent 返回「需要转工单」或用户主动要求 → 调用 Tool Gateway 的 `create_ticket` 生成工单，返回工单号给用户。
+- 核心业务流程（问答与建单的判断都在 Agent Runtime，应用服务不调用 Tool Gateway）：
+  1. 员工发消息 → 在同一事务里写用户消息和 `Turn`，把任务投递到 `agent_tasks` → 返回 202。
+  2. Agent Runtime 执行状态图：检索知识库并回答、等员工反馈；场景外、要求提单、检索无命中或反馈没解决时，由 Agent 经 Tool Gateway 建单（3.3 节）。
+  3. 应用服务把执行事件经 SSE 转给前端，并从 `agent_results` 把这一轮的回复（回答、固定回复或建单通知）落库、关闭轮次。
 - 登录与鉴权：`POST /v1/auth/login {tenant, email, password}`，先按 slug 查租户（`tenants` 无 RLS），再在租户作用域内查用户；三种失败统一 401，账号不存在时也做一次假校验，耗时一致。签发 HS256 JWT（`sub/tid/role`，8 小时，无刷新），之后所有接口的租户和用户只取自 JWT。scrypt 在线程里执行，并限制同时最多 4 个（每个约 128 MiB）。以后上 API Gateway 时改 RS256。
 - 发消息限流：每个员工每分钟 6 条、每天 200 条（可配置），Redis 固定窗口计数，在写库之前检查，超出返回 429 `RATE_LIMITED` 带 `Retry-After`；只限发消息（每条消息要调 2–3 次模型），建会话不限。Redis 不可用时放行。
 - 会话接口：`POST/GET /v1/conversations`、`GET /v1/conversations/{id}/messages`（含进行中的 `active_task_id`，页面刷新后可重新接上 SSE）、`POST .../messages`（202 `{task_id}`；上一轮未结束返回 409 `TURN_IN_PROGRESS`）、`GET .../stream?task_id=`（SSE）。会话只有本人可见，其他人一律 404。
 - 回复落库：后台消费 `agent_results`（消费组 `app_service`），按轮次 upsert 唯一的助手消息并关闭轮次，可重复投递；不依赖 SSE 连接。晚到的结果只在该轮仍是会话最新一轮时覆盖此前的失败提示；员工已经发了新消息的，丢弃并记日志，免得旧回答插到新消息后面。
 - 补偿：每 30 秒一次（advisory lock 保证只有一个副本在扫），把 `queued` 超过 10 分钟的轮次用同一个 `task_id` 和 `seq` 重新入队，最多 2 次，之后标记失败并写 `error` 事件。阈值必须大于 Agent Runtime 自身重试的最长时间：3 次 ×（接管空闲 90 秒 + 扫描间隔 10 秒 + 任务超时 60 秒）= 480 秒，配置里强制校验；否则只是慢的任务会被复制一份，与原任务赛跑。
 - 工单页面（BFF）：员工的列表固定按本人过滤，看别人的工单返回 404；`start`/`resolve` 只允许 `it_staff`，`start` 固定指派给自己；`actor_id` 总是当前用户。ticket-service 的业务错误（400/403/404/409）原样透传。
-- 对 Agent Runtime 是**异步任务分发**：应用服务不直接同步调用 Agent Runtime，而是把任务（`conversation_id` + 上下文 + `tenant_id`）写入 Redis Streams 队列即返回；随后从该会话的事件 Stream（`conversation:{conversation_id}:events`）读取 Agent Runtime 陆续写入的中间事件（"正在检索知识库…"、增量 token、最终结果）通过 SSE/WebSocket 转发给前端。对前端而言体验仍是"流式返回"，但应用服务与 Agent Runtime 之间是解耦的异步关系，见 3.3 节。
+- 对 Agent Runtime 是**异步任务分发**：应用服务不直接同步调用 Agent Runtime，而是把任务（`task_id`、`seq`、`conversation_id`、`tenant_id`、`user_id` 和这条消息的内容；历史在 Agent 的 checkpoint 里，不随任务传）写入 Redis Streams 队列即返回；随后从该会话的事件 Stream（`conversation:{conversation_id}:events`）读取 Agent Runtime 陆续写入的中间事件（"正在检索知识库…"、增量 token、最终结果）通过 SSE 转发给前端。对前端而言体验仍是"流式返回"，但应用服务与 Agent Runtime 之间是解耦的异步关系，见 3.3 节。
 
 ### 3.3 Agent Runtime（LangGraph）
 
 **部署模型：异步 Worker + 队列，而非同步长连接服务。**
 
-- 应用服务把任务写入 **Redis Streams**（`agent_tasks` 队列，按租户或全局分区均可），Agent Runtime 作为**无状态 Worker** 通过 Consumer Group 消费任务，一个任务对应一次 LangGraph 图的完整执行。
+- 应用服务把任务写入 **Redis Streams**（全局一个 `agent_tasks` 队列），Agent Runtime 作为**无状态 Worker** 通过 Consumer Group 消费任务，一个任务对应一次 LangGraph 图的完整执行。
 - 执行过程中，Worker 把中间事件（检索中、增量回答 token、工单已创建、结束）写入该会话自己的 **Redis Stream**（`conversation:{conversation_id}:events`，约 1000 条上限、24 小时过期），应用服务读取后转发给前端，从而在异步执行的同时保留流式体验。
   - 不用 Pub/Sub：Pub/Sub 发布时没有订阅者就丢，应用服务返回 202 到前端连上 SSE 之间的事件会丢失；Stream 可以从任意位置读，SSE 断线后可用 Last-Event-ID 续读，应用服务也能据此可靠地把回答落库。
 - 选择这个模型而非"应用服务同步调用、Agent Runtime 常驻等待"的原因：
   1. 一次 Agent 执行常包含多次工具调用 + 一次 LLM 生成，耗时数秒到十几秒；同步模型下每个进行中会话都要独占一个连接/线程直到图跑完，扩缩容单位变成"并发连接数"而非"实际计算负载"，HPA 难以精确伸缩。
   2. Worker 无状态、可随时重启，配合 LangGraph 的 checkpoint 机制，任务在 crash 后可从断点恢复，天然具备重试能力；同步模型下 Pod 重启会直接中断并丢失正在处理的会话。
   3. 队列深度是比 CPU/内存更贴合负载本质的扩缩容信号，可用 **KEDA 的 redis-streams scaler** 按 `agent_tasks` 队列长度精确扩缩容 Worker 副本数。
-  4. 代价是多了队列 + Pub/Sub 一跳延迟（通常几十毫秒，相对 LLM 秒级延迟可忽略）和一套需要运维的组件；由于 Redis 已经是会话缓存/checkpoint 的依赖，复用同一 Redis 实例做队列，不新增基础设施种类。
+  4. 代价是多了一跳队列延迟（通常几十毫秒，相对 LLM 秒级延迟可忽略）和一套需要运维的组件；队列、事件流、会话锁都放在同一个 Redis 实例里，不新增基础设施种类。
 - 用 LangGraph 构建一个**固定状态图**（不做 ReAct 自由调工具：AI Gateway 只有文本流接口，V1 流程固定，固定图更可测），节点：
   1. `classify_intent`：LLM 判断意图（三个场景内 / 场景外 / 明确要求开工单 / 寒暄或描述不清）和类别（`vpn/account/email/other`，即 `create_ticket` 的 category 枚举）。输出解析失败按"描述不清"处理。
   2. `retrieve_knowledge`：调用 Tool Gateway 的 `search_knowledge`；无命中直接转工单，不让模型硬答。
@@ -135,18 +111,18 @@
   - 时序约束 `任务超时(60s) < 会话锁 TTL(75s) < 接管空闲阈值(90s)`，配置里强制校验：锁要比任何存活的运行更久；被 kill 的 Worker 留下的锁要在任务被接管前过期，否则接管会白白消耗投递次数。接管阈值同时大于 Tool Gateway 的 running 过期时间（60s）。
 - 预算用完：AI Gateway 返回 429 `TOKEN_BUDGET_EXCEEDED` 时，runner 用固定回复结束这一轮（outcome `budget_exceeded`），任务 ACK 不重试——当天再试也会被拒；不建单（写工单描述要用模型，且额度耗尽时自动建单会冲垮 IT 队列）。线程停在被拒的节点上，同一会话的下一条消息作为新输入会丢弃它。每次记 `budget_exceeded tenant_id=…` 的 ERROR 日志供告警。
 - 进程形态：单进程内按信号量并发跑多个任务（默认 8，都是 IO 等待）；`/healthz` 只给探针用，不建 Service。任务队列放在 `TaskQueue` 接口后面，以后换 RabbitMQ 只改这一层。
-- 多租户：图的运行时上下文携带 `tenant_id`，所有工具调用、模型调用都需透传，Tool Gateway/AI Gateway 侧做租户级配置隔离（如某租户自定义知识库、自定义系统提示词）。
-- 第一期场景范围：通过配置/路由规则限定只处理"部分场景"（如 VPN、账号密码、邮箱），未命中场景直接引导人工提单，而非勉强让模型作答。
+- 多租户：图的运行时上下文携带 `tenant_id`，所有工具调用、模型调用都需透传。租户级差异 V1 只有两处：知识库内容（knowledge-service 按租户分组）和工具绑定（Tool Gateway `role_tool_bindings`）；按租户自定义系统提示词、模型档位【V1 未实现】，提示词写死在 `app/graph/prompts.py`。
+- 第一期场景范围：VPN、账号密码、邮箱三个场景，由 `classify_intent` 的提示词判断（不是配置项），场景外的问题直接转人工工单，而非勉强让模型作答。
 
 ### 3.4 Tool Gateway（工具策略网关）
 - 定位：Agent Runtime 与真实世界之间的**唯一策略执行点**。Agent Runtime 是多副本无状态 Worker，权限、幂等如果放在 Worker 里，每个副本各管一份就失效了，所以集中在这里。
 - 接口（REST，取代早期的 MCP 方案——MCP 端点不经过权限校验，保留它等于留一条绕过策略的后门）：
-  - `GET /v1/tools/list?tenant_id&agent_role`：返回该角色可用工具的 OpenAI function 元数据，**不含密钥、下游地址、handler**。
-  - `POST /v1/tools/call`：入参 `tenant_id, session_id, agent_role, tool_name, arguments`，副作用工具必须带 `Idempotency-Key` 头。返回 `success / error` 信封。
+  - `GET /v1/tools/list?tenant_id&agent_role`：返回该角色可用工具的 OpenAI function 元数据，**不含密钥、下游地址、handler**。V1 的固定状态图按名字直接调用工具，没有调用方；留给以后让模型自己选工具时用。
+  - `POST /v1/tools/call`：入参 `tenant_id, session_id, user_id, agent_role, tool_name, arguments`，副作用工具必须带 `Idempotency-Key` 头。返回 `success / error` 信封。
 - 错误分两类：**模型可处理的**（未知工具、无权限、参数不合法、执行失败）走 200 信封回给模型；**调用方违约的**（非法 tenant、缺幂等键、幂等键冲突、并发执行中）走 HTTP 4xx，只给 Agent Runtime 看。
 - 调用管线：租户校验 → 工具存在 → 角色绑定 → JSON Schema → 只读工具直接执行；副作用工具走幂等重放 / 原子占位 → 执行 → 记录结果 → 审计。
 - 上下文注入：`session_id`（即会话 ID）和幂等键由网关注入给 handler，不出现在给模型看的参数 schema 里，模型没法伪造或写错。
-- 幂等分两层：网关 `tool_calls` 表覆盖普通重试；执行完成但结果未落盘就崩溃的窗口，靠卡住的 `running` 记录超时后可被重新占位、再执行，因此下游也必须幂等（`create_ticket` 把同一个键透传给 app-service 的内部建单接口）。只读工具不写 `tool_calls`。
+- 幂等分两层：网关 `tool_calls` 表覆盖普通重试；执行完成但结果未落盘就崩溃的窗口，靠卡住的 `running` 记录超时后可被重新占位、再执行，因此下游也必须幂等（`create_ticket` 把同一个键透传给 ticket-service 的内部建单接口）。只读工具不写 `tool_calls`。
 - 下游：`search_knowledge` 调 knowledge-service（3.6 节）；`create_ticket` 调 ticket-service（3.7 节），`TicketProvider` 的内部实现和未来的 Jira 实现都是"调用工单系统的 HTTP 接口"，形态一致。
 - 运行时上下文：`/v1/tools/call` 除 `session_id` 外还要求 `user_id`（当前员工），由 Agent Runtime 提供，模型看不到；`create_ticket` 用它作为提单人 `requester_id`，审计日志也记录它，并参与幂等请求指纹。
 - 脱敏：返回体只屏蔽 password/token 等凭据字段（知识库内容里的 IT 值班电话是员工需要的）；审计记录额外对手机号/邮箱/身份证做正则脱敏。
@@ -157,19 +133,21 @@
 - 扩展设计：`TicketProvider` 接口预留多实现（`InternalTicketProvider` 默认启用，未来可加 `JiraTicketProvider`、`FeishuTicketProvider`），通过租户级配置选择实现，不改动 Agent/应用服务代码。
 
 ### 3.5 AI Gateway
-- 职责：模型调用的统一出口——鉴权、限流、成本与 token 用量审计、Prompt 模板/模型版本集中管理、多租户模型配置（不同租户可用不同系统提示词或模型档位）。
+- 职责：模型调用的统一出口——服务令牌鉴权、每日 token 预算、用量记录。
+  - Prompt 模板/模型版本集中管理、多租户模型配置（不同租户用不同系统提示词或模型档位）【V1 未实现】：系统提示词由 Agent Runtime 随请求传入，模型只有一个，由环境变量配置。
+- 接口：`POST /v1/generate {tenant_id, system_prompt, messages}`，返回 `text/event-stream`：若干 `{"delta"}`，最后 `{"done": true, "usage"}`；中途失败时流在 `done` 之前结束，调用方据此判断不完整。租户校验和预算检查都在流开始前完成，失败返回普通的 4xx。
 - **模型接入方式（已确认）**：`ModelProvider` 抽象下实现一个通用的 `OpenAICompatibleProvider`，只需配置 `base_url` + `api_key` + `model` 即可接入任何遵循 OpenAI Chat Completions 接口规范（`/v1/chat/completions`）的供应商，不用为每个供应商单独写适配代码。
-  - v1 首个接入的具体供应商是 **DeepSeek**（`base_url=https://api.deepseek.com`，走同一套 OpenAI-compatible 实现），模型档位、Key 通过租户级/环境配置管理。
-  - 后续如需接入 Anthropic Claude 等非 OpenAI-compatible 供应商，在 `ModelProvider` 抽象下新增一个专用实现（如 `AnthropicProvider`）即可，路由层按租户/模型名分发，不影响已接入的 OpenAI-compatible 供应商。
-- 记录每次调用的 `tenant_id + 模型 + token 数 + 耗时`，为后续按租户计费做准备。
-- 每日 token 预算：流式输出开始前汇总租户当天（`Asia/Shanghai` 自然日）已用 token，达到预算返回 429 `TOKEN_BUDGET_EXCEEDED`（`Retry-After` 到次日零点）。默认值来自配置（1,000,000），`tenant_token_budgets` 表可按租户覆盖（V1 用 SQL 维护）。先检查后计费，并发调用可能共同小幅超出——软上限。客户端中途断开时不记录（写入没有屏蔽取消，有意接受的缺口）。
+  - v1 首个接入的具体供应商是 **DeepSeek**（`base_url=https://api.deepseek.com`，走同一套 OpenAI-compatible 实现），模型名、Key 来自环境变量（`MODEL_BASE_URL`、`MODEL_NAME`、`MODEL_API_KEY`）。
+  - 后续如需接入 Anthropic Claude 等非 OpenAI-compatible 供应商，在 `ModelProvider` 抽象下新增一个专用实现（如 `AnthropicProvider`）即可；按租户/模型名分发的路由层【V1 未实现】，V1 只有一个 provider 实例。
+- 记录每次调用的 `tenant_id + 模型 + token 数 + 耗时`，为后续按租户计费做准备。客户端中途断开时不记录（写入没有屏蔽取消，有意接受的缺口），这部分用量也就不计入预算。
+- 每日 token 预算：流式输出开始前汇总租户当天（`Asia/Shanghai` 自然日）已用 token，达到预算返回 429 `TOKEN_BUDGET_EXCEEDED`（`Retry-After` 到次日零点）。默认值来自配置（1,000,000），`tenant_token_budgets` 表可按租户覆盖（V1 用 SQL 维护）。先检查后计费，并发调用可能共同小幅超出——软上限。
 - 服务间令牌鉴权：`/v1/generate` 要求 Bearer 服务令牌（`AI_GATEWAY_SERVICE_TOKEN`），只有 Agent Runtime 能调用；`tenant_id` 在请求体里，没有令牌任何 pod 都能以任意租户消耗模型额度。
 
 ### 3.6 知识库服务（knowledge-service）
 - 定位：知识检索的唯一出口，V1 **只读、只有检索一个接口**，不做 RAG/向量。
 - 接口：`GET /internal/v1/knowledge/search?tenant_id&q&limit`（服务令牌鉴权）→ `{results: [{id, category, question, answer, score}]}`。
 - 数据：`app/data/knowledge.json`，按租户 ID 分组、随镜像发布，改内容要重新部署。未知租户返回空列表（租户注册表归应用服务）。
-- 匹配：字符二元组覆盖率，问题中包含完整查询词时记 1.0；不需要中文分词，结果确定、可测。
+- 匹配：查询的字符二元组在条目问题中的覆盖率，与在答案中的覆盖率乘以权重取较大者；问题中包含完整查询词时记 1.0；低于 0.3 的丢弃（没有命中就走建单）。不需要中文分词，结果确定、可测。
 - 扩展点：`KnowledgeRepository` 接口，V1 实现是 `StaticKnowledgeRepository`；换成数据库或向量检索时接口不变，Tool Gateway 无感知。
 - 无状态、无数据库，扩容就是加副本。
 
@@ -203,33 +181,34 @@
 
 - 每个服务有两个数据库账号：`<svc>_owner`（建表、迁移、种子数据）和 `<svc>_app`（运行时账号，不是表的所有者，RLS 对它强制生效），且只能连自己的库。本地由 `deploy/postgres/init-databases.sql` 创建，云上由基础设施创建、密码来自密钥管理。
 - 每个服务自带 Alembic 迁移，部署时以独立任务先跑迁移再起服务（compose 用 `<svc>-migrate` 服务，K8s 用 Job/initContainer）。
-- 不做跨库外键：非 app-service 的 `tenant_id` 是普通 UUID 列，租户合法性由 API Gateway 校验 JWT 保证。
-- 多租户隔离：库内仍然用 `tenant_id` + PostgreSQL RLS，每次查询都在租户作用域内执行。
+- 不做跨库外键：非 app-service 的 `tenant_id` 是普通 UUID 列，租户合法性由 app-service 校验 JWT 保证（以后部署 API Gateway 时移过去），下游服务信任服务令牌调用方传来的 `tenant_id`。
+- 多租户隔离：库内仍然用 `tenant_id` + PostgreSQL RLS，每次查询都在租户作用域内执行（`tenant_scope`：事务内 `set_config('app.tenant_id')`；切换租户前先 flush，否则未写入的修改会在新租户的作用域下写入、被 RLS 过滤掉）。注意 `FORCE ROW LEVEL SECURITY` 对表的所有者也生效：迁移里要跨租户回填数据时，需临时关闭 FORCE。
 - 跨服务写数据走 API：Tool Gateway 的 `create_ticket` 调 ticket-service 的内部接口 `POST /internal/v1/tickets`（透传幂等键），不直接写工单表。
 - 代价：跨服务报表（比如把工具调用和工单关联起来）不能再直接写 SQL join，需要时再做数据同步。
 
 ## 5. 部署与云原生方案
 
 - 目标：**云无关，基于标准 Kubernetes**，不绑定具体云厂商托管服务，便于跨云/私有化部署。
-- 组件容器化，每个逻辑组件（API Gateway 除外，用 Ingress Controller）独立部署：`app-service`（Deployment，处理 HTTP/SSE）、`agent-runtime`（Deployment，作为 **无状态 Worker** 消费队列，不对外暴露 HTTP 端口）、`tool-gateway`、`ai-gateway`。
-- 弹性扩缩容：`app-service`/`tool-gateway`/`ai-gateway` 用标准 **HPA**（CPU/内存/QPS）；`agent-runtime` 用 **KEDA 的 redis-streams scaler**，按 `agent_tasks` 队列的 pending 消息数扩缩容 Worker 副本，负载突增（如上班早高峰集中反馈 VPN 问题）时可快速扩容，队列清空后缩容到最小副本数甚至 0。
+- 组件容器化，每个逻辑组件（API Gateway 除外，用 Ingress Controller）独立部署：`app-service`（Deployment，处理 HTTP/SSE）、`agent-runtime`（Deployment，作为 **无状态 Worker** 消费队列，不建 Service）、`tool-gateway`、`ai-gateway`、`knowledge-service`、`ticket-service`。
+- 弹性扩缩容（`deploy/k8s/components/autoscaling`，默认不启用）：五个 HTTP 服务（`app-service`、`tool-gateway`、`ai-gateway`、`knowledge-service`、`ticket-service`）用标准 **HPA**（CPU）；`agent-runtime` 用 **KEDA 的 redis-streams scaler**，按 `agent_tasks` 尚未投递的积压（`lagCount`，而不是 pending 数：每个副本最多同时处理 8 个，pending 会卡在 8 × 副本数）扩缩容 Worker 副本，负载突增（如上班早高峰集中反馈 VPN 问题）时可快速扩容，队列清空后缩回最小副本数（1）。
 - 有状态依赖（PostgreSQL、Redis、向量库）优先使用云无关 Operator（如 CloudNativePG、Redis Operator）或直接对接任意云厂商的托管兼容服务，业务代码只依赖标准协议（Postgres wire protocol / Redis protocol），不绑定专有 SDK。
-- 可观测性：OpenTelemetry 统一埋点（Trace 贯穿 API Gateway → 应用服务 → Agent Runtime → Tool/AI Gateway），Prometheus + Grafana 做指标，日志集中到 Loki/ELK，按 `tenant_id` 打标签便于按租户排查问题和统计用量。
-- CI/CD：镜像构建 + Helm Chart 管理各组件的多环境（dev/staging/prod）部署配置，租户级配置（如启用的工具、模型档位）通过 ConfigMap/数据库配置表管理，不重新部署即可生效。
-- V1 的清单用 Kustomize（`deploy/k8s`：base + overlays + 可选的扩缩容组件），kubectl 自带、没有模板语法；多环境发布和"迁移完成后再更新服务"的顺序以后用 Helm hook 或 Argo CD sync wave 表达。服务容器一律非 root、只读根文件系统。
+- 可观测性【V1 未实现，只有日志】：降级和预算用完各有一条固定格式的 ERROR 日志（`knowledge_unavailable …`、`budget_exceeded …`）可以配告警。目标方案：OpenTelemetry 统一埋点（Trace 贯穿 API Gateway → 应用服务 → Agent Runtime → Tool/AI Gateway），Prometheus + Grafana 做指标，日志集中到 Loki/ELK，按 `tenant_id` 打标签便于按租户排查问题和统计用量。
+- 部署清单：V1 用 Kustomize（`deploy/k8s`：base + overlays + 可选的扩缩容组件），kubectl 自带、没有模板语法；"迁移完成后再更新服务"的顺序由 `apply-dev.sh` 保证，以后用 Helm hook 或 Argo CD sync wave 表达。服务容器一律非 root、只读根文件系统。
+- CI/CD 流水线、多环境（staging/prod）overlay【V1 未实现】。租户级配置里已经能不重新部署就生效的：工具绑定（`role_tool_bindings`）和 token 预算（`tenant_token_budgets`），都是数据库表。
 
 ## 6. 安全与合规要点
 
-- API Gateway 统一做认证；【假设，可调整】v1 用自建账号体系 + JWT，架构预留标准 **OIDC/SAML** 接入点，便于后续对接企业 SSO（Azure AD/Okta/自建 IdP）。
+- 认证：目标是 API Gateway 统一做，V1 由 app-service 做（3.1 节）；【假设，可调整】v1 用自建账号体系 + JWT，架构预留标准 **OIDC/SAML** 接入点，便于后续对接企业 SSO（Azure AD/Okta/自建 IdP）。
 - Tool Gateway 对每次工具调用做审计日志（谁、哪个租户、调用了什么工具、参数摘要），满足事后追溯需求。
-- AI Gateway 层面对发送给模型的内容做基本脱敏（如工号、内部 IP 等敏感信息按需过滤），尤其在使用外部模型供应商时。
+- AI Gateway 层面对发送给模型的内容做基本脱敏（如工号、内部 IP 等敏感信息按需过滤），尤其在使用外部模型供应商时【V1 未实现：员工原话会发给 DeepSeek】。
+- 服务间调用：每个内部服务校验 Bearer 服务令牌（常量时间比较）；V1 一个服务一个令牌、由所有调用方共用，内部端口没有 NetworkPolicy 限制（见评审 P2-5）。
 - 租户间数据隔离通过 RLS + 应用层双重校验，杜绝越权访问。
 
 ## 7. 分阶段路线图
 
 | 阶段 | 范围 | 关键交付 |
 |---|---|---|
-| V1 | 单租户/多租户基础框架跑通；仅覆盖 VPN/账号等 2-3 个高频场景；知识库用简单 QA 表；工单走自建模块 | 端到端可用的问答+转工单闭环 |
+| V1 | 多租户基础框架跑通；覆盖 VPN、账号密码、邮箱 3 个高频场景；知识库为按租户写死的静态 QA 数据；工单走自建模块 | 端到端可用的问答+转工单闭环 |
 | V2 | 知识库升级为向量检索 + RAG；扩大场景覆盖；接入企业 IM 机器人入口 | 检索准确率提升，渠道扩展 |
 | V3 | 多租户强隔离选项（schema级）；AI Gateway 多模型路由与成本优化；对接外部工单系统（Jira/ServiceNow）作为可选 Provider | 面向更大规模企业客户的可售卖能力 |
 
@@ -248,8 +227,8 @@
 - 知识库：独立的 knowledge-service，V1 只提供检索、数据按租户写死；后续在同一接口后面换成数据库/向量检索。
 - 工单：独立的 ticket-service，4 状态状态机 + 乐观锁 + 处理记录；应用服务不再持有工单表。
 - 数据：同一 Postgres 实例、每服务独立 database，库内 `tenant_id` + RLS 隔离；服务间不共享表和模型代码，没有 `libs/shared`（见第 4 节）。
-- Tool Gateway：REST 策略网关；HITL 审批与 Redis 限流 V1 暂不做（见 3.4 节）。
-- 队列服务：Redis Streams（复用会话缓存的同一 Redis 实例）。对比过 RabbitMQ/RocketMQ：规模用不上、事件回传仍需 Redis，V1 不引入；Redis 可能丢消息的问题由应用服务记录任务状态并重新入队弥补（阶段 5）。
+- Tool Gateway：REST 策略网关；HITL 审批与工具调用限流 V1 暂不做（见 3.4 节）。
+- 队列服务：Redis Streams（与事件流、会话锁共用一个 Redis 实例）。对比过 RabbitMQ/RocketMQ：规模用不上、事件回传仍需 Redis，V1 不引入；Redis 可能丢消息的问题由应用服务记录任务状态并重新入队弥补（阶段 5）。
 - AI Gateway：服务令牌鉴权，只有 Agent Runtime 可调用。
 - 成本防护：应用服务按员工限制发消息频率，AI Gateway 按租户设每日 token 预算（软上限，可按租户覆盖）；预算用完固定回复、不建单（见 3.2、3.3、3.5 节）。
 - 部署：V1 用 Kustomize 清单，dev overlay 自带单实例 Postgres/Redis；生产换 Operator 或托管服务（见第 5 节）。
