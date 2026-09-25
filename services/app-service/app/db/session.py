@@ -22,6 +22,11 @@ async def tenant_scope(session: AsyncSession, tenant_id: str) -> AsyncIterator[A
     set_config(..., is_local=true) lasts until the transaction ends, so callers must not
     commit and then keep querying expecting the scope to still apply. It is used instead of
     a literal SET so the tenant id is a bound parameter rather than interpolated SQL.
+
+    Pending changes are flushed first. Switching tenants within one transaction (the requeuer
+    does) would otherwise leave them to the next autoflush, under the new tenant's scope, where
+    RLS hides their rows: a textual statement like this one does not autoflush.
     """
+    await session.flush()
     await session.execute(text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": str(tenant_id)})
     yield session

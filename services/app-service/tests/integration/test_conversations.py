@@ -185,3 +185,34 @@ async def _history_when(client, headers, conversation, predicate):
 
 def _event_types(body: str) -> list[str]:
     return [line.removeprefix("event: ") for line in body.splitlines() if line.startswith("event: ")]
+
+
+async def test_requeuer_handles_stale_turns_in_several_tenants(client, redis, tenant, login, admin_db):
+    """Each tenant's changes must be written under that tenant's RLS scope, not the next one's."""
+    other = uuid.uuid4()
+    admin_db.execute("INSERT INTO tenants (id, name, slug) VALUES (%s, 'Other', %s)", (other, f"it-{other.hex[:12]}"))
+    try:
+        user, conversation, message, turn = uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+        admin_db.execute(
+            "INSERT INTO users (id, tenant_id, name, email) VALUES (%s, %s, 'o', %s)", (user, other, f"{user}@x.example")
+        )
+        admin_db.execute("INSERT INTO conversations (id, tenant_id, user_id) VALUES (%s, %s, %s)", (conversation, other, user))
+        admin_db.execute(
+            "INSERT INTO messages (id, conversation_id, role, content, task_id) VALUES (%s, %s, 'user', '邮箱无法收发邮件', %s)",
+            (message, conversation, turn),
+        )
+        admin_db.execute(
+            "INSERT INTO turns (id, tenant_id, conversation_id, user_message_id, seq, updated_at)"
+            " VALUES (%s, %s, %s, %s, 1, now() - interval '1 hour')",
+            (turn, other, conversation, message),
+        )
+        alice = await login(tenant.alice)
+        mine = (await send(client, alice, await start_conversation(client, alice))).json()["task_id"]
+        admin_db.execute("UPDATE turns SET updated_at = now() - interval '1 hour' WHERE id = %s", (mine,))
+
+        await Requeuer(AgentBus(redis), get_settings()).sweep()
+
+        rows = admin_db.execute("SELECT id::text, enqueue_count FROM turns WHERE id IN (%s, %s)", (turn, mine)).fetchall()
+        assert sorted(rows) == sorted([(str(turn), 2), (mine, 2)])
+    finally:
+        admin_db.execute("DELETE FROM tenants WHERE id = %s", (other,))
