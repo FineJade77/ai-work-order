@@ -8,6 +8,9 @@ from redis.exceptions import ResponseError
 TASK_STREAM = "agent_tasks"
 CONSUMER_GROUP = "agent_runtime"
 DEAD_LETTER_STREAM = "agent_tasks:dead"
+# Owner of handed-back deliveries (see hand_back) until some consumer reclaims them. Not a real
+# consumer, so the one handing back can leave the group right away.
+HANDED_BACK = "handed-back"
 
 
 def floor_key(conversation_id: object) -> str:
@@ -40,6 +43,15 @@ class TaskQueue(ABC):
 
     @abstractmethod
     async def dead_letter(self, delivery: Delivery, reason: str) -> None: ...
+
+    @abstractmethod
+    async def hand_back(self, delivery: Delivery) -> None:
+        """Gives up a delivery this consumer will not finish (it is shutting down), for another
+        consumer to take now rather than after it sits idle; the cut-off attempt is not counted."""
+
+    @abstractmethod
+    async def leave(self) -> bool:
+        """Leaves the consumer group if nothing is pending on this consumer. True if it left."""
 
 
 class RedisStreamTaskQueue(TaskQueue):
@@ -98,6 +110,23 @@ class RedisStreamTaskQueue(TaskQueue):
             pipe.xadd(DEAD_LETTER_STREAM, {**delivery.fields, "source_id": delivery.id, "reason": reason})
             pipe.xack(TASK_STREAM, CONSUMER_GROUP, delivery.id)
             await pipe.execute()
+
+    async def hand_back(self, delivery: Delivery) -> None:
+        # IDLE makes it reclaimable at once (every consumer's next XAUTOCLAIM, within
+        # claim_interval_s). XAUTOCLAIM counts a delivery, so RETRYCOUNT is set one lower than this
+        # attempt: the next consumer sees the same attempt number. JUSTID: this claim counts nothing.
+        await self._redis.xclaim(
+            TASK_STREAM, CONSUMER_GROUP, HANDED_BACK, 0, [delivery.id],
+            idle=self._claim_idle_ms, retrycount=delivery.attempt - 1, justid=True,
+        )
+
+    async def leave(self) -> bool:
+        # A deleted consumer's pending entries could no longer be reclaimed, so only leave when
+        # there are none (a delivery lost in a failed hand-back waits for the claim instead).
+        if await self._redis.xpending_range(TASK_STREAM, CONSUMER_GROUP, "-", "+", 1, consumername=self._consumer):
+            return False
+        await self._redis.xgroup_delconsumer(TASK_STREAM, CONSUMER_GROUP, self._consumer)
+        return True
 
 
 def _stream_entries(response) -> list:

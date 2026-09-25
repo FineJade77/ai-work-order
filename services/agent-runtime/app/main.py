@@ -64,9 +64,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         queue = RedisStreamTaskQueue(
             redis, settings.consumer_name, claim_idle_ms=int(settings.claim_idle_seconds * 1000)
         )
-        consumer = asyncio.create_task(TaskConsumer(queue, runner, redis, settings).run())
+        worker = TaskConsumer(queue, runner, redis, settings)
+        consumer = asyncio.create_task(worker.run())
         consumer.add_done_callback(_log_consumer_exit)
-        app.state.consumer = consumer
+        app.state.worker, app.state.consumer = worker, consumer
         monitor = QueueMonitor(
             redis, {TASK_STREAM: CONSUMER_GROUP, RESULT_STREAM: RESULT_GROUP}, dead_letter_stream=DEAD_LETTER_STREAM
         )
@@ -74,8 +75,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         try:
             yield
         finally:
-            # In-flight tasks are cancelled unacknowledged; another replica resumes them.
-            consumer.cancel()
+            # uvicorn runs this on SIGTERM: drain (see TaskConsumer.stop), then close the clients.
+            await worker.stop()
             sampler.cancel()
             await asyncio.gather(consumer, sampler, return_exceptions=True)
 
@@ -88,12 +89,29 @@ def _log_consumer_exit(task: asyncio.Task) -> None:
 def create_app() -> FastAPI:
     app = FastAPI(title="agent-runtime", lifespan=lifespan)
 
-    @app.get("/healthz")
-    async def healthz(response: Response) -> dict[str, str]:
+    # A worker takes no traffic, so readiness only reports state (kubectl, rollout status); liveness
+    # is what restarts it. A stalled event loop fails both: the probe itself times out.
+    @app.get("/livez")
+    async def livez(response: Response) -> dict[str, str]:
+        """Alive unless the consumer died on its own; draining after SIGTERM is alive (a failing
+        probe then would get it killed mid-drain)."""
+        worker: TaskConsumer | None = getattr(app.state, "worker", None)
+        consumer: asyncio.Task | None = getattr(app.state, "consumer", None)
+        if consumer is not None and consumer.done() and not worker.stopping:
+            response.status_code = 503
+            return {"status": "consumer stopped"}
+        return {"status": "ok"}
+
+    @app.get("/readyz")
+    async def readyz(response: Response) -> dict[str, str]:
+        worker: TaskConsumer | None = getattr(app.state, "worker", None)
         consumer: asyncio.Task | None = getattr(app.state, "consumer", None)
         if consumer is None or consumer.done():
             response.status_code = 503
             return {"status": "consumer stopped"}
+        if worker.stopping:
+            response.status_code = 503
+            return {"status": "draining"}
         return {"status": "ok"}
 
     instrument_app(app)

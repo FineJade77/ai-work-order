@@ -176,7 +176,7 @@ async def test_answer_then_unresolved_feedback_files_one_ticket_across_a_restart
     assert [(r["status"], r["outcome"]) for r in results] == [("done", "awaiting_feedback"), ("done", "ticket_created")]
     assert results[0]["content"] == worker.models.answer and results[0]["ticket_id"] == ""
     assert results[1]["ticket_id"] == str(ticket_id) and results[1]["tenant_id"] == str(TENANT)
-    assert (await worker.redis.xpending(TASK_STREAM, CONSUMER_GROUP))["pending"] == 0
+    await nothing_pending(worker)
 
 
 async def test_crash_after_the_ticket_was_created_does_not_file_a_second_one(worker):
@@ -246,8 +246,15 @@ async def test_budget_refusal_is_acknowledged_not_retried(worker):
         ("reply", {"content": prompts.BUDGET_EXCEEDED_REPLY}),
         ("done", {"outcome": "budget_exceeded"}),
     ]
-    assert (await worker.redis.xpending(TASK_STREAM, CONSUMER_GROUP))["pending"] == 0
+    await nothing_pending(worker)
     assert worker.models.calls == ["classify"]  # refused once, not retried
+
+
+async def nothing_pending(w) -> None:
+    """The task is acknowledged just after its done event is published: wait for it."""
+    with anyio.fail_after(2):
+        while (await w.redis.xpending(TASK_STREAM, CONSUMER_GROUP))["pending"]:
+            await anyio.sleep(0.02)
 
 
 NORTHWIND = uuid.UUID("9b2d6c1a-4e7f-4a3b-8c5d-2f1e0a9b8c7d")  # demo data: an HR/admin knowledge base

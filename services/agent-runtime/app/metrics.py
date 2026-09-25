@@ -22,6 +22,11 @@ TASK_DURATION = meter.create_histogram(
     "app.task.duration", unit="s", description="Handling one delivery of an agent task, by what came of it",
     explicit_bucket_boundaries_advisory=[0.1, 0.5, 1, 2, 5, 10, 20, 30, 45, 60, 90],
 )
+SHUTDOWN_DRAIN = meter.create_histogram(
+    "app.worker.shutdown.drain_duration", unit="s",
+    description="From a stop signal until the tasks in flight finished or were handed back",
+    explicit_bucket_boundaries_advisory=[0.1, 0.5, 1, 2, 5, 10, 20, 30, 45, 60, 90],
+)
 TASK_DELIVERIES = meter.create_counter(
     "app.task.deliveries", description="Deliveries of agent tasks, by what came of them",
 )

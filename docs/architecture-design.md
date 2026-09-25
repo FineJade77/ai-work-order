@@ -124,7 +124,23 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
     2. 图状态里记录最近一轮的 `seq`（与 `task_id` 同时写入），`seq` 更小的任务跳过——Redis 丢了下限时的兜底。
   - 时序约束 `任务超时(60s) < 会话锁 TTL(75s) < 接管空闲阈值(90s)`，配置里强制校验：锁要比任何存活的运行更久；被 kill 的 Worker 留下的锁要在任务被接管前过期，否则接管会白白消耗投递次数。接管阈值同时大于 Tool Gateway 的 running 过期时间（60s）。
 - 预算用完：AI Gateway 返回 429 `TOKEN_BUDGET_EXCEEDED` 时，runner 用固定回复结束这一轮（outcome `budget_exceeded`），任务 ACK 不重试——当天再试也会被拒；不建单（写工单描述要用模型，且额度耗尽时自动建单会冲垮处理人的队列）。线程停在被拒的节点上，同一会话的下一条消息作为新输入会丢弃它。每次记 `budget_exceeded tenant_id=…` 的 ERROR 日志供告警。
-- 进程形态：单进程内按信号量并发跑多个任务（默认 8，都是 IO 等待）；`/healthz` 只给探针用，不建 Service。任务队列放在 `TaskQueue` 接口后面，以后换 RabbitMQ 只改这一层。
+- 进程形态：单进程内按信号量并发跑多个任务（默认 8，都是 IO 等待）；`/livez`、`/readyz` 只给探针用，不建 Service。任务队列放在 `TaskQueue` 接口后面，以后换 RabbitMQ 只改这一层。
+- **优雅停机**（滚动发布、KEDA 缩容、节点排空都会发 SIGTERM）：uvicorn 进入 lifespan 关闭，`TaskConsumer.stop()`：
+  1. 停止取新任务。正在进行的阻塞读不取消（shield），最多 5 秒后返回，它带回、还没开始的任务直接交还；
+  2. 等手上的任务跑完，最多 `SHUTDOWN_DRAIN_SECONDS`（70 秒，从收到信号算起）。它大于任务超时（60 秒），所以正常情况下每个任务都会自己结束，不会被截断；
+  3. 超时还在跑的任务被取消，**交还**：`XCLAIM <id> IDLE <接管阈值> RETRYCOUNT <本次次数-1> JUSTID`，归到伪消费者 `handed-back` 名下。IDLE 让它立刻满足接管条件（别的副本下一次扫描就接走，最长 10 秒，而不是 90 秒）；RETRYCOUNT 让这次被打断的投递不计入 3 次上限；JUSTID 让这次 XCLAIM 本身不计数。接手的副本从最后一个 checkpoint 续跑；
+  4. 会话锁在屏蔽取消的作用域里释放，被截断的任务不会让会话一直锁到 TTL 过期；
+  5. 自己名下没有待确认消息时，执行 `XGROUP DELCONSUMER` 退出消费组，消费者名单不会随着 Pod 更替越积越多。
+- 探针：`/livez` 在停机过程中仍返回 200，否则 kubelet 会在停机中途把它杀掉；只有消费循环自己异常退出时才返回 503。`/readyz` 在停机中或消费循环停止时返回 503；Worker 不接流量，就绪状态只用来展示（kubectl、rollout status）。事件循环卡死时，两个探针的 HTTP 请求本身会超时，不需要另加心跳。
+- 故障演练 `scripts/chaos.py`：3 个副本、20 个会话（每个两轮，用真实模型），注入一种故障，然后检查不变式：每轮恰好一条回复、没有失败或卡住的轮次、每会话最多一张工单、`create_ticket` 不重复执行、没有新死信。实现优雅停机前后的对比：
+
+  | 场景 | 被打断的轮次（前 → 后） | 轮次耗时 p95（前 → 后） | 最大值（前 → 后） |
+  |---|---|---|---|
+  | 滚动重启（逐个 SIGTERM） | 8 → 0 | 93.8s → 9.9s | 94.1s → 11.7s |
+  | 缩容 3 → 1 | 3 → 0 | 92.8s → 11.8s | 93.2s → 12.2s |
+  | 强杀（SIGKILL，对照） | 1 → 2 | 被杀的任务仍要等 90 秒被接管，这是接管机制的正常行为 | |
+
+  停机时间临时设成 1 秒时，任务确实被截断并交还（3 次）：别的副本从 checkpoint 续跑，投递次数不变，最长的一轮 10.6 秒。滚动重启之后的 p95 约 10 秒，来自重启期间少一个副本造成的排队。
 - 多租户：图的运行时上下文携带 `tenant_id`，所有工具调用、模型调用都需透传。租户级差异 V1 只有两处：知识库内容（knowledge-service 按租户分组）和工具绑定（Tool Gateway `role_tool_bindings`）；按租户自定义系统提示词、模型档位【V1 未实现】，提示词写死在 `app/graph/prompts.py`。
 - 助手身份和回复文案是通用的（"员工服务助手"、"已转给相关同事"），不提 IT；按租户自定义助手名称和开场白【V1 未实现】。
 
@@ -149,7 +165,7 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
   - 同一个幂等键再调：还在等 → 仍是 `pending_approval`；已批准 → 条件更新 `pending_approval → running`（只有一个调用方胜出）后执行；已拒绝/已过期 → `APPROVAL_REJECTED`/`APPROVAL_EXPIRED`，并且是**最终结果**：再调也原样返回，不像普通错误那样被重新占位执行。所以工具最多执行一次。
   - 审批接口（服务令牌，应用服务代处理人调用）：`GET /v1/approvals?tenant_id&status&requester_id`、`GET /v1/approvals/{id}`、`POST /v1/approvals/{id}/decision {decision, approver_id, note}`。只有 `pending` 且未过期的能决定（否则 409 `APPROVAL_NOT_PENDING`/`APPROVAL_EXPIRED`），审批人不能是申请人（403 `SELF_APPROVAL`，四眼原则）；角色由应用服务判断。
   - 决定通过**事务性发件箱**发出：状态变更和一条 `approval_outbox` 记录同一事务提交，后台 relay 用 `FOR UPDATE SKIP LOCKED` 逐条取出、发到 Redis Stream `approval_events`（审批 id、租户、会话、申请人、状态、审批人、备注、`approval_traceparent`，外加 relay span 的 `traceparent`），再标记完成。发布后、标记前崩溃会再发一次，所以是至少一次投递，消费方按审批 id 去重。到期也是一条发件箱记录（到期时间即 due），relay 到点把仍在 `pending` 的审批改成 `expired` 并发出事件，不用跨租户扫描审批表。处理人决定时同一事务里把这条到期检查标记完成（relay 自己执行到期时不动它：那一行正被它锁着，由它自己标记），所以"未完成的到期检查"就是"待审批"，指标直接数它。
-  - `approval_outbox` 不开 RLS：relay 要服务所有租户，表里只有路由用的 id（租户、审批 id、类型、到期时间），不含内容；读审批时再切到该租户的作用域。relay 的轮询本身不追踪，只追踪处理的那一条。relay 停了 `/healthz` 返回 503。
+  - `approval_outbox` 不开 RLS：relay 要服务所有租户，表里只有路由用的 id（租户、审批 id、类型、到期时间），不含内容；读审批时再切到该租户的作用域。relay 的轮询本身不追踪，只追踪处理的那一条。relay 停了 tool-gateway 的 `/healthz` 返回 503。
 - **V1 暂不做**：
   - Redis 令牌桶限流：V1 工具都是 PG 查询、量小；按用户限流 V1 在应用服务的发消息接口（3.2 节），部署 API Gateway 后可移过去；Agent 死循环靠 LangGraph `recursion_limit`。
 - 扩展设计：`TicketProvider` 接口预留多实现（`InternalTicketProvider` 默认启用，未来可加 `JiraTicketProvider`、`FeishuTicketProvider`），通过租户级配置选择实现，不改动 Agent/应用服务代码。
@@ -212,7 +228,8 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
 
 - 目标：**云无关，基于标准 Kubernetes**，不绑定具体云厂商托管服务，便于跨云/私有化部署。
 - 组件容器化，每个逻辑组件（API Gateway 除外，用 Ingress Controller）独立部署：`app-service`（Deployment，处理 HTTP/SSE）、`agent-runtime`（Deployment，作为 **无状态 Worker** 消费队列，不建 Service）、`tool-gateway`、`ai-gateway`、`knowledge-service`、`ticket-service`。
-- 弹性扩缩容（`deploy/k8s/components/autoscaling`，默认不启用）：五个 HTTP 服务（`app-service`、`tool-gateway`、`ai-gateway`、`knowledge-service`、`ticket-service`）用标准 **HPA**（CPU）；`agent-runtime` 用 **KEDA 的 redis-streams scaler**，按 `agent_tasks` 尚未投递的积压（`lagCount`，而不是 pending 数：每个副本最多同时处理 8 个，pending 会卡在 8 × 副本数）扩缩容 Worker 副本，负载突增（如上班早高峰集中反馈 VPN 问题）时可快速扩容，队列清空后缩回最小副本数（1）。
+- 弹性扩缩容（`deploy/k8s/components/autoscaling`，默认不启用）：五个 HTTP 服务（`app-service`、`tool-gateway`、`ai-gateway`、`knowledge-service`、`ticket-service`）用标准 **HPA**（CPU）；`agent-runtime` 用 **KEDA 的 redis-streams scaler**，按 `agent_tasks` 尚未投递的积压（`lagCount`，而不是 pending 数：每个副本最多同时处理 8 个，pending 会卡在 8 × 副本数）扩缩容 Worker 副本，负载突增（如上班早高峰集中反馈 VPN 问题）时可快速扩容，队列清空后缩回最小副本数（1）。缩容放慢：稳定窗口 300 秒、每分钟最多减 2 个，因为每减一个 Pod 都要先等它手上的任务跑完，积压短暂回落时也不必先缩再扩。
+- agent-runtime 的发布与中断（清单在 `deploy/k8s/base/agent-runtime.yaml`）：滚动发布 `maxSurge: 1, maxUnavailable: 0`（新 Pod 先接活，旧 Pod 再停）；`terminationGracePeriodSeconds: 90`，大于停机等待时间；PodDisruptionBudget 用 `maxUnavailable: 1`（节点排空时一次只驱逐一个；用 `minAvailable: 1` 的话，单副本时会让所有节点排空都卡住）；startupProbe 覆盖启动时连接 Redis 和 Postgres 的时间。compose 里对应的是 `stop_grace_period: 90s`（默认 10 秒会在停机中途 SIGKILL）。
 - 有状态依赖（PostgreSQL、Redis、向量库）优先使用云无关 Operator（如 CloudNativePG、Redis Operator）或直接对接任意云厂商的托管兼容服务，业务代码只依赖标准协议（Postgres wire protocol / Redis protocol），不绑定专有 SDK。
 - 可观测性：全部基于 OpenTelemetry，业务代码只依赖 OTel API，后端可换（Jaeger、SigNoz、云厂商）只改 Collector。分三个阶段：
   - **阶段 1（已完成）追踪与日志**：

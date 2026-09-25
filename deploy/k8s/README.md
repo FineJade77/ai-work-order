@@ -51,7 +51,8 @@ kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/k8s/overlays/dev
 ## 所有服务 Pod 的约束
 
 - 以 uid 10001 运行（`runAsNonRoot`），只读根文件系统，丢弃全部 capabilities，`/tmp` 挂 emptyDir。
-- 探针：readiness 和 liveness 都用 `/healthz`。agent-runtime 的 `/healthz` 在消费循环停止时返回 503。
+- 探针：HTTP 服务的 readiness 和 liveness 都用 `/healthz`。agent-runtime 分开：`/livez`（停机过程中仍返回 200，消费循环自己异常退出时返回 503）、`/readyz`（停机中返回 503），另有 startupProbe。
+- agent-runtime 的停机与中断：收到 SIGTERM 后最多等 70 秒让手上的任务跑完，所以 `terminationGracePeriodSeconds: 90`；滚动发布时先起新 Pod（`maxSurge: 1, maxUnavailable: 0`）；PodDisruptionBudget 为 `maxUnavailable: 1`，节点排空时一次只驱逐一个。
 - 资源：app-service 内存上限 1Gi（登录时的 scrypt 每次约 128 MiB，最多同时 4 个），agent-runtime 512Mi，其余 256Mi；只设 CPU 请求，不设 CPU 上限。
 - 不挂载 ServiceAccount token（服务不访问 Kubernetes API）。
 
@@ -61,7 +62,7 @@ kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/k8s/overlays/dev
 - **Postgres / Redis**：换成 Operator（CloudNativePG、Redis Operator）或托管服务，修改连接串和 `REDIS_URL`；建库建账号交给基础设施，不用 db-init Job。Redis 至少开启 AOF，否则主从切换可能丢任务（app-service 的补偿机制会在 10 分钟后重新投递）。
 - **部署顺序**：用 Helm hook 或 Argo CD sync wave 表达"迁移完成后再更新服务"，替代 apply-dev.sh。
 - **扩缩容**：在 overlay 里启用 `components/autoscaling`，需要 metrics-server，agent-runtime 还需要 KEDA。
-  - agent-runtime 按队列积压（`lagCount`）扩缩容，而不是 CPU，因为它的任务大部分时间在等模型。
+  - agent-runtime 按队列积压（`lagCount`）扩缩容，而不是 CPU，因为它的任务大部分时间在等模型。缩容有 300 秒稳定窗口、每分钟最多减 2 个：被缩掉的 Pod 要先等手上的任务跑完。
   - 数值只是起点，按架构文档第 5 节调优。
 - **入口**：清单只有 ClusterIP Service。对外只应暴露 app-service，经 API Gateway（架构文档 3.1 节）或 Ingress；其余服务都是内部接口。
 - **可观测性**：`components/observability` 只适合开发集群（一体化容器、数据在 Pod 里、不记录提示词内容）。生产环境用 OTel Operator 或独立的 Collector，Tempo/Loki/Prometheus（或 Mimir）/Grafana 各自持久化部署，把 `otel-env` 里的 `OTEL_EXPORTER_OTLP_ENDPOINT` 指向 Collector，在 Collector 做尾部采样，告警接值班系统。访问开发集群里的 Grafana：`kubectl -n ai-work-order port-forward svc/observability 3000:3000`。

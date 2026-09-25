@@ -1,0 +1,9 @@
+# Overrides for scripts/chaos.py: many concurrent conversations from one employee would trip the
+# per-employee message limit, so the drill raises it. Not for normal use.
+#
+#   docker compose -f docker-compose.yml -f scripts/chaos.compose.yml up -d --scale agent-runtime=3
+services:
+  app-service:
+    environment:
+      MESSAGE_RATE_PER_MINUTE: "1000"
+      MESSAGE_RATE_PER_DAY: "100000"

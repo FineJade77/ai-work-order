@@ -129,9 +129,12 @@ services:
       db-init:
         condition: service_completed_successfully
 
-  # A queue worker: no published port. /healthz on 8002 is for probes only.
+  # A queue worker: no published port. /livez and /readyz on 8002 are for probes only.
   agent-runtime:
     build: ./services/agent-runtime
+    # SIGTERM starts a drain of up to SHUTDOWN_DRAIN_SECONDS (70 s); compose's default 10 s would
+    # SIGKILL it partway.
+    stop_grace_period: 90s
     environment:
       <<: *otel-env
       OTEL_SERVICE_NAME: agent-runtime

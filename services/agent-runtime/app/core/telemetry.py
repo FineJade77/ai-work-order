@@ -74,5 +74,5 @@ def instrument_app(app: FastAPI, tracer_provider: TracerProvider | None = None) 
     per message, noise for a JSON API and one span per event on an SSE stream. Probes are left
     out too."""
     FastAPIInstrumentor.instrument_app(
-        app, excluded_urls="healthz", exclude_spans=["receive", "send"], tracer_provider=tracer_provider
+        app, excluded_urls="livez,readyz", exclude_spans=["receive", "send"], tracer_provider=tracer_provider
     )

@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     conversation_lock_seconds: float = 75
     claim_idle_seconds: float = 90
     max_deliveries: int = 3
+    # On SIGTERM, how long the runs in flight may take to finish before they are cut off and handed
+    # back. Above task_timeout_seconds, so a run is only ever cut off if it is stuck past its own
+    # timeout. The orchestrator must wait longer than this before SIGKILL (compose
+    # stop_grace_period, k8s terminationGracePeriodSeconds: both 90s).
+    shutdown_drain_seconds: float = 70
     consumer_name: str = Field(default_factory=socket.gethostname)
 
     @model_validator(mode="after")

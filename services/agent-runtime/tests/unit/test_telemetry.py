@@ -51,11 +51,13 @@ def test_instrumented_app_records_one_span_per_request_and_skips_probes():
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     app = FastAPI()
-    app.get("/healthz")(lambda: {"status": "ok"})
+    app.get("/livez")(lambda: {"status": "ok"})
+    app.get("/readyz")(lambda: {"status": "ok"})
     app.get("/items/{item_id}")(lambda item_id: {"id": item_id})
     instrument_app(app, tracer_provider=provider)
 
     client = TestClient(app)
-    client.get("/healthz")
+    client.get("/livez")
+    client.get("/readyz")
     client.get("/items/7")
     assert [s.name for s in exporter.get_finished_spans()] == ["GET /items/{item_id}"]  # no send/receive

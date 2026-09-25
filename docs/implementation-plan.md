@@ -129,6 +129,28 @@ ai-work-order/
 - **8.3 可观测性、演示与文档（已完成）**：审批的 span、事件与 link（8.1、8.2 已埋：tool-gateway `expire approval`/`send approval_events` → app-service `process approval_events` → agent-runtime `node await_approval` → `node execute_action`，并 link 回申请那一轮）；tool-gateway 审批指标——申请数、决定数（按结果）、审批耗时直方图，待审批数与最久等待由 relay 每轮采样（决定时同一事务里关闭到期检查记录，"未完成的到期检查"即待审批）；Prometheus 开 `created-timestamp-zero-ingestion`，低频计数器的第一次也能被 `increase()` 看到；总览看板新增"审批（HITL）"一行，告警"审批超过 1 小时没人处理"；`scripts/demo.sh access`（`DECISION=reject` 走拒绝）；README 的 HITL 一节与接口表。
   - **验收标准**：tool-gateway 测试覆盖决定后到期检查关闭；真实模型跑 `demo.sh access` 批准与拒绝两条路径都走通；Prometheus 里能查到申请、各结果的决定、耗时与待审批数，看板各面板有数据；Grafana 里能看到新告警规则。
 
+### 阶段 9：Worker 优雅停机与故障演练
+
+> 设计见架构文档 3.3 节（优雅停机、探针、故障演练结果）和第 5 节（滚动发布、PDB、KEDA 缩容）。
+
+- **9.1 优雅停机（已完成）**：
+  - `TaskConsumer.stop()`：停止取新任务、在时限内等手上的任务跑完、截断后交还（`XCLAIM IDLE RETRYCOUNT JUSTID`，归到 `handed-back`）、退出消费组；会话锁在屏蔽取消的作用域里释放；
+  - 配置 `SHUTDOWN_DRAIN_SECONDS`，默认 70 秒；
+  - 探针拆成 `/livez`、`/readyz`；
+  - 指标：`app.worker.shutdown.drain_duration`，投递结果新增 `handed_back`，span 上记 `handed_back` 事件；
+  - compose 加 `stop_grace_period: 90s`；
+  - k8s：`terminationGracePeriodSeconds: 90`、滚动发布策略、PDB、startupProbe、KEDA 缩容稳定窗口。
+  - **验收标准**：
+    - 集成测试（真 Redis）覆盖：停机时手上的任务跑完并确认、之后退出消费组；被截断的任务交还后，别的消费者立刻能接走，投递次数不变，会话锁已释放，并计为 `handed_back`；停机过程中读到的任务不开始执行，直接交还；
+    - 单元测试覆盖四种状态下的探针；
+    - 真实演练中滚动重启和缩容都不再打断任何一轮。
+- **9.2 多副本故障演练（已完成）**：
+  - `scripts/chaos.py`（只用标准库，走 docker compose 和各服务的数据库）：场景 `rolling`、`kill`、`scale-in`；检查不变式、统计耗时、重投、续跑和各次投递的结果；
+  - `scripts/chaos.compose.yml` 在演练时调高每个员工的发消息限额；
+  - 顺手修掉端到端测试里"收到 `done` 就检查待确认数"的竞态：任务是在 `done` 事件之后才确认的。
+  - **验收标准**：先在旧代码上跑出基线，实现 9.1 后三个场景的不变式全部成立，前后对比写进架构文档。
+- 下游中断（停掉 ai-gateway）的演练留给后面的过载保护阶段。
+
 ## 工作方式要求
 
 - 每个阶段先给出接口/数据结构定义（可以是简短的代码骨架或类型声明），确认结构合理后再补全实现逻辑，不要一次性输出整个阶段的完整代码而不做中间检查点。

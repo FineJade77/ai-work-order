@@ -267,6 +267,20 @@ scripts/test-all.sh app-service     # 只跑指定服务
 
 每个服务在自己的 `.venv` 里跑。集成测试需要 `docker compose up -d --build` 起来的环境，用独立的 Redis 库和一次性租户，测完自动清理；环境没起来时集成测试会被跳过，不算失败。集成测试不调用真实模型。
 
+## 故障演练
+
+`scripts/chaos.py` 用 3 个 agent-runtime 副本、20 个并发会话（每个两轮，走真实模型，每次约 100 次调用），在它们运行时注入故障，然后检查：每轮恰好一条回复、没有失败或卡住的轮次、每会话最多一张工单、`create_ticket` 不重复执行、没有新死信；还会统计耗时、重投和从 checkpoint 续跑的次数。
+
+```bash
+docker compose -f docker-compose.yml -f scripts/chaos.compose.yml up -d --scale agent-runtime=3   # 演练时调高发消息限额
+scripts/chaos.py rolling     # 逐个重启副本（SIGTERM，相当于滚动发布）
+scripts/chaos.py kill        # SIGKILL 手上任务最多的副本（崩溃）
+scripts/chaos.py scale-in    # 从 3 个副本缩到 1 个（相当于 KEDA 缩容）
+scripts/chaos.py all
+```
+
+agent-runtime 收到 SIGTERM 会先停止取新任务，等手上的任务跑完（最多 70 秒），跑不完的交还给其他副本，所以滚动重启和缩容不会打断正在进行的对话。强杀没有机会做这些，被杀副本的任务约 90 秒后由其他副本接管，从 checkpoint 续跑。结果对比见架构设计文档 3.3 节。
+
 ## 部署到 Kubernetes
 
 见 [deploy/k8s/README.md](deploy/k8s/README.md)：Kustomize 清单（base + dev overlay），可选的 HPA / KEDA 扩缩容组件，以及按依赖顺序部署的脚本。

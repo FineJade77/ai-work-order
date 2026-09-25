@@ -15,6 +15,17 @@ spec:
     name: agent-runtime
   minReplicaCount: 1
   maxReplicaCount: 20
+  # Scale out at once, scale in slowly: every pod removed drains its tasks first, and a backlog
+  # that dips for a minute should not cost a scale-in and a scale-out.
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+            - type: Pods
+              value: 2
+              periodSeconds: 60
   triggers:
     - type: redis-streams
       metadata:
