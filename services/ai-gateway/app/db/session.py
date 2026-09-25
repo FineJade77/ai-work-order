@@ -1,4 +1,3 @@
-import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from functools import lru_cache
@@ -6,11 +5,13 @@ from functools import lru_cache
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from app.core.config import get_settings
+
 
 @lru_cache
 def session_factory() -> async_sessionmaker[AsyncSession]:
     """Runtime sessions, as the non-owner app account, so RLS policies apply."""
-    engine = create_async_engine(os.environ["DATABASE_URL"], pool_pre_ping=True)
+    engine = create_async_engine(get_settings().database_url, pool_pre_ping=True)
     return async_sessionmaker(engine, expire_on_commit=False)
 
 

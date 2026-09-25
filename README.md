@@ -183,6 +183,18 @@ docker compose exec postgres psql -U work_order -d app_service -c \
   "SELECT created_at, status, outcome, ticket_id, enqueue_count FROM turns ORDER BY created_at DESC LIMIT 10"
 ```
 
+### 调整限额
+
+- 每个租户每天的 token 预算默认 1,000,000（prompt + completion，按 `Asia/Shanghai` 的自然日），用完后 ai-gateway 返回 429，员工收到"今日额度已用完"的固定回复。默认值用 ai-gateway 的 `DAILY_TOKEN_BUDGET`、`BUDGET_TIMEZONE` 环境变量改；单个租户在 `tenant_token_budgets` 表里设置，立即生效：
+
+  ```bash
+  docker compose exec postgres psql -U ai_gateway_owner -d ai_gateway -c \
+    "INSERT INTO tenant_token_budgets (tenant_id, daily_tokens) VALUES ('<租户 ID>', 5000000)
+     ON CONFLICT (tenant_id) DO UPDATE SET daily_tokens = EXCLUDED.daily_tokens, updated_at = now()"
+  ```
+
+- 每个员工每分钟最多发 6 条消息、每天 200 条，超出返回 429 `RATE_LIMITED`（带 `Retry-After`）。用 app-service 的 `MESSAGE_RATE_PER_MINUTE`、`MESSAGE_RATE_PER_DAY` 调整。
+
 ## 运行测试
 
 ```bash
@@ -201,6 +213,8 @@ scripts/test-all.sh app-service     # 只跑指定服务
 - **端口被占用**：compose 用到 8001、8003–8006、25432（Postgres）、26379（Redis）。
 - **发消息后迟迟没有回复，或收到 `error` 事件**：多半是模型调用失败。检查 `.env` 里的 `DEEPSEEK_API_KEY`，看 `docker compose logs ai-gateway agent-runtime`。Worker 会自动重试，每次间隔约 90 秒，3 次都失败后任务进入死信：
   `docker compose exec redis redis-cli XRANGE agent_tasks:dead - +`
+- **收到"今天 AI 助手的使用额度已经用完"**：租户当天的 token 预算用完了，agent-runtime 日志里有 `budget_exceeded tenant_id=…`。按"调整限额"一节提高预算，不用重启。
+- **429 `RATE_LIMITED`**：这个员工发消息太频繁，按 `Retry-After` 等待。
 - **409 `TURN_IN_PROGRESS`**：同一会话上一条消息还没处理完。等它的 `done`；如果任务丢了，app-service 最多 10 分钟后会自动重新投递。
 - **改了 `.env` 不生效**：`docker compose up -d` 会用新配置重建相关容器。
 - **重置所有本地数据**：`docker compose down -v`（会删除数据库和 Redis 的数据卷），再 `docker compose up -d --build`。

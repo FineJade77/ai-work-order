@@ -1,15 +1,29 @@
 import json
-from contextlib import aclosing
+import logging
+from collections.abc import AsyncIterator
+from contextlib import aclosing, asynccontextmanager
+from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
-from app.providers import provider
+from app import budget
+from app.core.config import Settings, get_settings
+from app.providers import ModelProvider, get_provider
 from app.schemas import GenerateRequest
 from app.security import require_service_token
 from app.tenancy import parse_tenant_id
 
-app = FastAPI(title="ai-gateway")
+logger = logging.getLogger("ai_gateway")
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    get_provider()  # fail at startup, not on the first request, if config is missing
+    yield
+
+
+app = FastAPI(title="ai-gateway", lifespan=lifespan)
 
 
 @app.get("/healthz")
@@ -17,14 +31,27 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/v1/generate", dependencies=[Depends(require_service_token)])
-async def generate(req: GenerateRequest) -> StreamingResponse:
-    # Validated here (not just inside the provider) so a bad tenant_id gets a clean 400
-    # instead of aborting an already-started text/event-stream response mid-flight.
+@app.post("/v1/generate", dependencies=[Depends(require_service_token)], response_model=None)
+async def generate(
+    req: GenerateRequest,
+    settings: Annotated[Settings, Depends(get_settings)],
+    provider: Annotated[ModelProvider, Depends(get_provider)],
+) -> StreamingResponse | JSONResponse:
+    # Both checks happen here, before the response starts: once the text/event-stream is under
+    # way, a refusal could only abort it mid-flight instead of returning a clean status.
     try:
         parse_tenant_id(req.tenant_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        await budget.check_budget(req.tenant_id, settings)
+    except budget.BudgetExceeded as exc:
+        logger.warning("token budget exceeded tenant_id=%s used=%d limit=%d", req.tenant_id, exc.used, exc.limit)
+        return JSONResponse(
+            status_code=429,
+            content={"error": {"code": "TOKEN_BUDGET_EXCEEDED", "message": "the tenant's daily token budget is used up"}},
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        )
 
     async def event_stream():
         # aclosing: `async for` alone never closes the provider's generator, so its usage write

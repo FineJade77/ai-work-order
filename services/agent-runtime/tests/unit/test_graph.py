@@ -7,7 +7,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from app.clients.tool_gateway import ToolCallFailed
 from app.graph import nodes, prompts
 from app.graph.builder import build_graph
-from app.worker.runner import SUPERSEDED, TaskRunner
+from app.worker.runner import BUDGET_EXCEEDED, SUPERSEDED, TaskRunner
 from tests.fakes import FakeModels, FakeTools, RecordingEvents, make_task
 
 pytestmark = pytest.mark.anyio
@@ -238,3 +238,34 @@ async def test_a_bug_in_the_search_call_is_not_mistaken_for_an_outage(env):
     env.tools.search_failures = [KeyError("results")]
     with pytest.raises(KeyError):
         await env.runner.run(env.task("VPN 连不上"))
+
+
+async def test_budget_refused_at_classification_ends_the_turn_with_a_reply(env):
+    env.models.over_budget = {"classify"}
+    task = env.task("VPN 连不上")
+    assert await env.runner.run(task) == BUDGET_EXCEEDED
+    assert env.types(task) == ["reply", "done"]
+    assert _result(env, task) == {
+        "outcome": "budget_exceeded", "content": prompts.BUDGET_EXCEEDED_REPLY, "ticket_id": None,
+    }
+    assert env.tools.calls == []  # no search, and no ticket
+
+
+async def test_budget_refused_mid_turn_does_not_leak_into_the_next_turn(env):
+    env.models.over_budget = {"answer"}
+    refused = env.task("VPN 连不上")
+    assert await env.runner.run(refused) == BUDGET_EXCEEDED
+    assert env.types(refused) == ["retrieving", "reply", "done"]
+
+    # Budget back (next day): the new message starts afresh instead of resuming the refused answer.
+    env.models.over_budget = set()
+    env.models.calls.clear()
+    assert await env.runner.run(env.task("邮箱无法收发邮件")) == "awaiting_feedback"
+    assert env.models.calls == ["classify", "answer"]
+
+
+async def test_budget_refused_while_checking_feedback(env):
+    await env.runner.run(env.task("VPN 连不上"))
+    env.models.over_budget = {"resolution"}
+    assert await env.runner.run(env.task("还是不行")) == BUDGET_EXCEEDED
+    assert "create_ticket" not in env.tools.names()

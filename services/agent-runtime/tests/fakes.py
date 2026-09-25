@@ -3,6 +3,7 @@
 import json
 import uuid
 
+from app.clients.ai_gateway import BudgetExceeded
 from app.graph import prompts
 from app.schemas.tasks import AgentTask
 
@@ -34,6 +35,7 @@ class FakeModels:
         self.answer = "请先重启 VPN 客户端，再重新登录。问题解决了吗？"
         self.summary = "员工 VPN 无法连接，已按知识库重启客户端，仍然失败。"
         self.fail_answer_after_chunks: int | None = None  # simulate a crash mid-stream, once
+        self.over_budget: set[str] = set()  # prompt kinds ai-gateway refuses with TOKEN_BUDGET_EXCEEDED
         self.calls: list[str] = []
 
     def _kind(self, system_prompt: str) -> str:
@@ -45,6 +47,8 @@ class FakeModels:
     async def stream(self, task, *, system_prompt, messages):
         kind = self._kind(system_prompt)
         self.calls.append(kind)
+        if kind in self.over_budget:
+            raise BudgetExceeded("daily token budget used up")
         text = {
             "classify": self.classify_raw or json.dumps({"intent": self.intent, "category": self.category}),
             "resolution": f'好的：{{"resolution": "{self.resolution}"}}',

@@ -33,6 +33,10 @@ KNOWLEDGE_UNAVAILABLE_REPLY = (
     "抱歉，知识库暂时无法访问，我没法给出可靠的解决步骤。你可以稍后再问一次；"
     "如果问题紧急，回复「提工单」，我马上帮你转给 IT 同事。"
 )
-RESOLVED_REPLY ="很高兴问题已经解决。如果还有其他 IT 问题，随时告诉我。"
+BUDGET_EXCEEDED_REPLY = (
+    "抱歉，今天 AI 助手的使用额度已经用完，暂时无法处理你的问题。额度会在次日恢复；"
+    "如果问题紧急，请直接联系 IT 同事。"
+)
+RESOLVED_REPLY = "很高兴问题已经解决。如果还有其他 IT 问题，随时告诉我。"
 TICKET_CREATED_REPLY = "已为你创建 IT 工单（编号 {ticket_id}），IT 同事会尽快处理，处理进展可以在「我的工单」中查看。"
 OUT_OF_SCOPE_MARKER = "[未命中知识库场景] "

@@ -227,3 +227,14 @@ async def test_tenant_without_tool_bindings_gets_a_reply_not_a_ticket(worker):
         ("done", {"outcome": "knowledge_unavailable"}),
     ]
     assert _tickets(worker.conversation) == []
+
+
+async def test_budget_refusal_is_acknowledged_not_retried(worker):
+    worker.models.over_budget = {"classify"}
+    events = await send(worker, "VPN 连不上")
+    assert events == [
+        ("reply", {"content": prompts.BUDGET_EXCEEDED_REPLY}),
+        ("done", {"outcome": "budget_exceeded"}),
+    ]
+    assert (await worker.redis.xpending(TASK_STREAM, CONSUMER_GROUP))["pending"] == 0
+    assert worker.models.calls == ["classify"]  # refused once, not retried

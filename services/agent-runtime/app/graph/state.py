@@ -24,7 +24,8 @@ class AgentState(TypedDict, total=False):
     resolution: str | None  # resolved | unresolved | new_question
     ticket_summary: str | None
     ticket_id: str | None
-    # resolved | replied | ticket_created | knowledge_unavailable; awaiting_feedback is the interrupt
+    # resolved | replied | ticket_created | knowledge_unavailable; awaiting_feedback is the interrupt,
+    # and budget_exceeded is reported by the runner without reaching the graph's state
     outcome: str | None
 
 

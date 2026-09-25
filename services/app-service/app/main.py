@@ -13,6 +13,7 @@ from app.clients.agent_bus import AgentBus
 from app.clients.ticket_service import TicketServiceClient
 from app.core.config import get_settings
 from app.core.errors import ApiError
+from app.services.rate_limit import MessageRateLimiter
 from app.services.stream_service import READ_BLOCK_MS
 from app.services.ticket_access import TicketAccess
 from app.workers.requeuer import Requeuer
@@ -36,6 +37,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
         )
         app.state.bus = AgentBus(redis)
+        app.state.rate_limiter = MessageRateLimiter(
+            redis,
+            per_minute=settings.message_rate_per_minute,
+            per_day=settings.message_rate_per_day,
+            timezone=settings.rate_limit_timezone,
+        )
         app.state.ticket_access = TicketAccess(TicketServiceClient(tickets_http))
         app.state.workers = [
             asyncio.create_task(ResultCollector(redis, settings.consumer_name).run(), name="result-collector"),
@@ -57,7 +64,9 @@ def _log_worker_exit(task: asyncio.Task) -> None:
 
 
 async def api_error_handler(_: Request, exc: ApiError) -> JSONResponse:
-    return JSONResponse(status_code=exc.http_status, content={"error": {"code": exc.code, "message": exc.message}})
+    return JSONResponse(
+        status_code=exc.http_status, content={"error": {"code": exc.code, "message": exc.message}}, headers=exc.headers
+    )
 
 
 def create_app() -> FastAPI:

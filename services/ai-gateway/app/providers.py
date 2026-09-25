@@ -1,10 +1,11 @@
-import os
 import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
+from functools import lru_cache
 
 from openai import AsyncOpenAI
 
+from app.core.config import get_settings
 from app.tenancy import parse_tenant_id
 from app.usage import record_usage
 
@@ -68,8 +69,9 @@ class OpenAICompatibleProvider(ModelProvider):
         yield {"done": True, "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}}
 
 
-provider: ModelProvider = OpenAICompatibleProvider(
-    base_url=os.environ.get("MODEL_BASE_URL", "https://api.deepseek.com"),
-    api_key=os.environ["MODEL_API_KEY"],
-    model=os.environ.get("MODEL_NAME", "deepseek-chat"),
-)
+@lru_cache
+def get_provider() -> ModelProvider:
+    settings = get_settings()
+    return OpenAICompatibleProvider(
+        base_url=settings.model_base_url, api_key=settings.model_api_key, model=settings.model_name
+    )

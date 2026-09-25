@@ -4,8 +4,9 @@ from collections.abc import Callable
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 
-from app.clients.ai_gateway import AIGatewayClient
+from app.clients.ai_gateway import AIGatewayClient, BudgetExceeded
 from app.clients.tool_gateway import ToolGatewayClient
+from app.graph import prompts
 from app.graph.state import RUN_FIELDS_RESET, Deps, Events
 from app.schemas.tasks import AgentTask
 
@@ -15,6 +16,7 @@ logger = logging.getLogger("agent_runtime.runner")
 RECURSION_LIMIT = 25
 # run()'s return for a stale task that was skipped; not an outcome, so never published.
 SUPERSEDED = "superseded"
+BUDGET_EXCEEDED = "budget_exceeded"
 
 
 class TaskRunner:
@@ -69,10 +71,27 @@ class TaskRunner:
             }
 
         deps = Deps(task=task, tools=self._tools, models=self._models, events=events)
-        # durability="sync": each completed node is checkpointed before the next starts, so a
-        # crash never re-runs a node that already finished (e.g. create_ticket after success).
-        await self._graph.ainvoke(graph_input, config, context=deps, durability="sync")
+        try:
+            # durability="sync": each completed node is checkpointed before the next starts, so a
+            # crash never re-runs a node that already finished (e.g. create_ticket after success).
+            await self._graph.ainvoke(graph_input, config, context=deps, durability="sync")
+        except BudgetExceeded:
+            return await self._refuse_over_budget(task, events)
         return await self._finish(config, events)
+
+    async def _refuse_over_budget(self, task: AgentTask, events: Events) -> str:
+        """Ends the turn with a fixed reply instead of retrying: until the budget day rolls over,
+        every model call would be refused again. No ticket either: that needs the model for its
+        summary, and filing tickets on a budget outage would flood the IT queue.
+
+        The thread is left at the node that was refused. The conversation's next message is a
+        new graph input, which discards that pending node, so nothing resumes it by accident.
+        The reply is therefore not in the thread's history, only in app-service's."""
+        # Fixed format, so log-based alerting can match on the leading keyword.
+        logger.error("budget_exceeded tenant_id=%s task_id=%s", task.tenant_id, task.task_id)
+        await events.publish("reply", content=prompts.BUDGET_EXCEEDED_REPLY)
+        await events.finish(outcome=BUDGET_EXCEEDED, content=prompts.BUDGET_EXCEEDED_REPLY, ticket_id=None)
+        return BUDGET_EXCEEDED
 
     async def _finish(self, config: dict, events: Events) -> str:
         snapshot = await self._graph.aget_state(config)

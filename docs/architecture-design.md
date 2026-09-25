@@ -93,6 +93,7 @@
   3. 若 Agent 返回「已通过知识库解决」→ 落库回答，结束。
   4. 若 Agent 返回「需要转工单」或用户主动要求 → 调用 Tool Gateway 的 `create_ticket` 生成工单，返回工单号给用户。
 - 登录与鉴权：`POST /v1/auth/login {tenant, email, password}`，先按 slug 查租户（`tenants` 无 RLS），再在租户作用域内查用户；三种失败统一 401，账号不存在时也做一次假校验，耗时一致。签发 HS256 JWT（`sub/tid/role`，8 小时，无刷新），之后所有接口的租户和用户只取自 JWT。scrypt 在线程里执行，并限制同时最多 4 个（每个约 128 MiB）。以后上 API Gateway 时改 RS256。
+- 发消息限流：每个员工每分钟 6 条、每天 200 条（可配置），Redis 固定窗口计数，在写库之前检查，超出返回 429 `RATE_LIMITED` 带 `Retry-After`；只限发消息（每条消息要调 2–3 次模型），建会话不限。Redis 不可用时放行。
 - 会话接口：`POST/GET /v1/conversations`、`GET /v1/conversations/{id}/messages`（含进行中的 `active_task_id`，页面刷新后可重新接上 SSE）、`POST .../messages`（202 `{task_id}`；上一轮未结束返回 409 `TURN_IN_PROGRESS`）、`GET .../stream?task_id=`（SSE）。会话只有本人可见，其他人一律 404。
 - 回复落库：后台消费 `agent_results`（消费组 `app_service`），按轮次 upsert 唯一的助手消息并关闭轮次，可重复投递；不依赖 SSE 连接。晚到的结果只在该轮仍是会话最新一轮时覆盖此前的失败提示；员工已经发了新消息的，丢弃并记日志，免得旧回答插到新消息后面。
 - 补偿：每 30 秒一次（advisory lock 保证只有一个副本在扫），把 `queued` 超过 10 分钟的轮次用同一个 `task_id` 和 `seq` 重新入队，最多 2 次，之后标记失败并写 `error` 事件。阈值必须大于 Agent Runtime 自身重试的最长时间：3 次 ×（接管空闲 90 秒 + 扫描间隔 10 秒 + 任务超时 60 秒）= 480 秒，配置里强制校验；否则只是慢的任务会被复制一份，与原任务赛跑。
@@ -132,6 +133,7 @@
     1. 拿到会话锁后，`seq` 低于 Redis 会话下限的任务跳过——挡住"旧副本先于新任务拿到锁"的情况；
     2. 图状态里记录最近一轮的 `seq`（与 `task_id` 同时写入），`seq` 更小的任务跳过——Redis 丢了下限时的兜底。
   - 时序约束 `任务超时(60s) < 会话锁 TTL(75s) < 接管空闲阈值(90s)`，配置里强制校验：锁要比任何存活的运行更久；被 kill 的 Worker 留下的锁要在任务被接管前过期，否则接管会白白消耗投递次数。接管阈值同时大于 Tool Gateway 的 running 过期时间（60s）。
+- 预算用完：AI Gateway 返回 429 `TOKEN_BUDGET_EXCEEDED` 时，runner 用固定回复结束这一轮（outcome `budget_exceeded`），任务 ACK 不重试——当天再试也会被拒；不建单（写工单描述要用模型，且额度耗尽时自动建单会冲垮 IT 队列）。线程停在被拒的节点上，同一会话的下一条消息作为新输入会丢弃它。每次记 `budget_exceeded tenant_id=…` 的 ERROR 日志供告警。
 - 进程形态：单进程内按信号量并发跑多个任务（默认 8，都是 IO 等待）；`/healthz` 只给探针用，不建 Service。任务队列放在 `TaskQueue` 接口后面，以后换 RabbitMQ 只改这一层。
 - 多租户：图的运行时上下文携带 `tenant_id`，所有工具调用、模型调用都需透传，Tool Gateway/AI Gateway 侧做租户级配置隔离（如某租户自定义知识库、自定义系统提示词）。
 - 第一期场景范围：通过配置/路由规则限定只处理"部分场景"（如 VPN、账号密码、邮箱），未命中场景直接引导人工提单，而非勉强让模型作答。
@@ -151,7 +153,7 @@
 - 核心工具（v1）：`search_knowledge(query)`、`create_ticket(summary, category)`。
 - **V1 暂不做、已有设计可恢复**（实现见提交 `f36530d`）：
   - HITL 审批：`pending_approval` 状态、审批接口、`tool_approvals` 表、Redis Stream 恢复事件。等出现重置密码/解锁账号/开通权限这类高风险工具时再加。
-  - Redis 令牌桶限流：V1 工具都是 PG 查询、量小；按用户限流放在 API Gateway，Agent 死循环靠 LangGraph `recursion_limit`。
+  - Redis 令牌桶限流：V1 工具都是 PG 查询、量小；按用户限流 V1 在应用服务的发消息接口（3.2 节），部署 API Gateway 后可移过去；Agent 死循环靠 LangGraph `recursion_limit`。
 - 扩展设计：`TicketProvider` 接口预留多实现（`InternalTicketProvider` 默认启用，未来可加 `JiraTicketProvider`、`FeishuTicketProvider`），通过租户级配置选择实现，不改动 Agent/应用服务代码。
 
 ### 3.5 AI Gateway
@@ -159,7 +161,8 @@
 - **模型接入方式（已确认）**：`ModelProvider` 抽象下实现一个通用的 `OpenAICompatibleProvider`，只需配置 `base_url` + `api_key` + `model` 即可接入任何遵循 OpenAI Chat Completions 接口规范（`/v1/chat/completions`）的供应商，不用为每个供应商单独写适配代码。
   - v1 首个接入的具体供应商是 **DeepSeek**（`base_url=https://api.deepseek.com`，走同一套 OpenAI-compatible 实现），模型档位、Key 通过租户级/环境配置管理。
   - 后续如需接入 Anthropic Claude 等非 OpenAI-compatible 供应商，在 `ModelProvider` 抽象下新增一个专用实现（如 `AnthropicProvider`）即可，路由层按租户/模型名分发，不影响已接入的 OpenAI-compatible 供应商。
-- 记录每次调用的 `tenant_id + 模型 + token 数 + 耗时`，为后续按租户计费/限额做准备。客户端中途断开时不记录（写入没有屏蔽取消，有意接受的缺口）。
+- 记录每次调用的 `tenant_id + 模型 + token 数 + 耗时`，为后续按租户计费做准备。
+- 每日 token 预算：流式输出开始前汇总租户当天（`Asia/Shanghai` 自然日）已用 token，达到预算返回 429 `TOKEN_BUDGET_EXCEEDED`（`Retry-After` 到次日零点）。默认值来自配置（1,000,000），`tenant_token_budgets` 表可按租户覆盖（V1 用 SQL 维护）。先检查后计费，并发调用可能共同小幅超出——软上限。客户端中途断开时不记录（写入没有屏蔽取消，有意接受的缺口）。
 - 服务间令牌鉴权：`/v1/generate` 要求 Bearer 服务令牌（`AI_GATEWAY_SERVICE_TOKEN`），只有 Agent Runtime 能调用；`tenant_id` 在请求体里，没有令牌任何 pod 都能以任意租户消耗模型额度。
 
 ### 3.6 知识库服务（knowledge-service）
@@ -194,7 +197,7 @@
 | `app_service` | 应用服务 | `tenants`、`users`、`conversations`、`messages`、`turns` |
 | `tool_gateway` | Tool Gateway | `role_tool_bindings`、`tool_calls`、`tool_call_logs` |
 | `ticket_service` | 工单服务 | `tickets`（含幂等键局部唯一索引、版本号）、`ticket_events`（只追加） |
-| `ai_gateway` | AI Gateway | `model_call_logs` |
+| `ai_gateway` | AI Gateway | `model_call_logs`、`tenant_token_budgets`（租户预算覆盖；只开 RLS 不 FORCE，owner 可直接维护） |
 | `agent_runtime` | Agent Runtime | LangGraph checkpoint 表（`checkpoints`、`checkpoint_blobs`、`checkpoint_writes`，由库自身管理，无 RLS） |
 | （无） | 知识库服务 | V1 为代码仓库里按租户写死的 JSON，不需要数据库 |
 
@@ -248,5 +251,6 @@
 - Tool Gateway：REST 策略网关；HITL 审批与 Redis 限流 V1 暂不做（见 3.4 节）。
 - 队列服务：Redis Streams（复用会话缓存的同一 Redis 实例）。对比过 RabbitMQ/RocketMQ：规模用不上、事件回传仍需 Redis，V1 不引入；Redis 可能丢消息的问题由应用服务记录任务状态并重新入队弥补（阶段 5）。
 - AI Gateway：服务令牌鉴权，只有 Agent Runtime 可调用。
+- 成本防护：应用服务按员工限制发消息频率，AI Gateway 按租户设每日 token 预算（软上限，可按租户覆盖）；预算用完固定回复、不建单（见 3.2、3.3、3.5 节）。
 - 部署：V1 用 Kustomize 清单，dev overlay 自带单实例 Postgres/Redis；生产换 Operator 或托管服务（见第 5 节）。
 - **AI Gateway 模型接入：v1 通过 OpenAI-compatible 协议适配器接入，首个供应商为 DeepSeek；`ModelProvider` 抽象支持后续接入非 OpenAI-compatible 供应商。**

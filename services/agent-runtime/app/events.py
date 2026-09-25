@@ -8,12 +8,13 @@ Event types (the `type` field; `data` is a JSON object):
   retrieving        searching the knowledge base
   answer_chunk      {"delta"}                 incremental answer text
   answer            {"content"}               the complete answer
-  reply             {"content"}               a fixed assistant message (greeting, resolved ack, search down)
+  reply             {"content"}               a fixed assistant message (greeting, resolved ack, search down,
+                                              token budget used up)
   ticket_created    {"ticket_id", "content"}
   resumed           a crashed run of this task restarted; discard its partial answer_chunks
   error             {"code", "message"}       the task was given up on
   done              {"outcome"}               awaiting_feedback | resolved | replied | ticket_created
-                                              | knowledge_unavailable
+                                              | knowledge_unavailable | budget_exceeded
 
 Every task also ends with one entry on the global agent_results stream, written in the same
 transaction as its done/error event. app-service consumes it with a consumer group to store the

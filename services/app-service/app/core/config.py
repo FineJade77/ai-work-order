@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     max_requeues: int = 2
     requeue_interval_seconds: float = 30
     sse_max_seconds: float = 300
+    # Messages one user may send; each costs two or three model calls. Days start at midnight here.
+    message_rate_per_minute: int = Field(default=6, ge=1)
+    message_rate_per_day: int = Field(default=200, ge=1)
+    rate_limit_timezone: str = "Asia/Shanghai"
     consumer_name: str = Field(default_factory=socket.gethostname)
 
 

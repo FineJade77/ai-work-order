@@ -4,7 +4,7 @@ import uuid
 import httpx
 import pytest
 
-from app.clients.ai_gateway import AIGatewayClient, ModelStreamIncomplete
+from app.clients.ai_gateway import AIGatewayClient, BudgetExceeded, ModelStreamIncomplete
 from app.clients.tool_gateway import ToolCallFailed, ToolGatewayClient
 from app.core.errors import RetryLater
 from tests.fakes import make_task
@@ -84,3 +84,16 @@ async def test_in_progress_means_retry_later_but_other_conflicts_are_errors():
         await ToolGatewayClient(client(in_progress), "r").call(TASK, "create_ticket", {}, idempotency_key="k")
     with pytest.raises(httpx.HTTPStatusError):
         await ToolGatewayClient(client(conflict), "r").call(TASK, "create_ticket", {}, idempotency_key="k")
+
+
+async def test_budget_refusal_raises_budget_exceeded_but_other_429s_stay_http_errors():
+    def over_budget(request):
+        return httpx.Response(429, json={"error": {"code": "TOKEN_BUDGET_EXCEEDED", "message": "used up"}})
+
+    def throttled(request):
+        return httpx.Response(429, text="slow down")
+
+    with pytest.raises(BudgetExceeded):
+        await AIGatewayClient(client(over_budget)).complete(TASK, system_prompt="", messages=[])
+    with pytest.raises(httpx.HTTPStatusError):
+        await AIGatewayClient(client(throttled)).complete(TASK, system_prompt="", messages=[])

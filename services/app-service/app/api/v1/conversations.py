@@ -4,7 +4,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Header, Query, status
 from fastapi.responses import StreamingResponse
 
-from app.api.deps import get_bus
+from app.api.deps import get_bus, get_rate_limiter
 from app.clients.agent_bus import AgentBus
 from app.core.config import Settings, get_settings
 from app.core.security import CurrentUser, current_user
@@ -17,6 +17,7 @@ from app.schemas.conversations import (
     SendMessageResponse,
 )
 from app.services import conversation_service, stream_service
+from app.services.rate_limit import MessageRateLimiter
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 User = Annotated[CurrentUser, Depends(current_user)]
@@ -41,8 +42,13 @@ async def history(conversation_id: uuid.UUID, user: User) -> History:
 
 @router.post("/{conversation_id}/messages", status_code=status.HTTP_202_ACCEPTED)
 async def send_message(
-    conversation_id: uuid.UUID, req: SendMessageRequest, user: User, bus: Annotated[AgentBus, Depends(get_bus)]
+    conversation_id: uuid.UUID,
+    req: SendMessageRequest,
+    user: User,
+    bus: Annotated[AgentBus, Depends(get_bus)],
+    limiter: Annotated[MessageRateLimiter, Depends(get_rate_limiter)],
 ) -> SendMessageResponse:
+    await limiter.check(user.id)  # before anything is stored: a refused message leaves no trace
     task_id, message_id = await conversation_service.send_message(user, conversation_id, req.content, bus)
     return SendMessageResponse(task_id=task_id, message_id=message_id)
 
