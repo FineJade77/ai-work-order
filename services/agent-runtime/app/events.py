@@ -33,6 +33,8 @@ from app.tracing import inject_into
 EVENT_STREAM_MAXLEN = 1000
 EVENT_STREAM_TTL_SECONDS = 24 * 3600
 RESULT_STREAM = "agent_results"
+# app-service consumes the results with this group; only watched from here (queue metrics).
+RESULT_GROUP = "app_service"
 # Far above any realistic consumer backlog; trimming only bounds memory if app-service is down for long.
 RESULT_STREAM_MAXLEN = 100_000
 

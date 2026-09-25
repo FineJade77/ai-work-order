@@ -13,6 +13,8 @@ from langgraph.errors import GraphInterrupt
 from opentelemetry import propagate, trace
 from opentelemetry.context import Context
 
+from app.metrics import NODE_DURATION
+
 tracer = trace.get_tracer("agent_runtime")
 
 
@@ -54,8 +56,8 @@ _DECISION_KEYS = ("intent", "resolution", "outcome", "category", "knowledge_erro
 
 
 def traced_node(node: Callable[..., Awaitable[dict]]) -> Callable[..., Awaitable[dict]]:
-    """Runs a graph node in a span named after it. functools.wraps keeps the signature, which
-    LangGraph inspects to decide what to pass (state, runtime).
+    """Runs a graph node in a span named after it, and records its duration. functools.wraps
+    keeps the signature, which LangGraph inspects to decide what to pass (state, runtime).
 
     An interrupt (await_feedback pausing the run for the employee's reply) is how the graph waits,
     not a failure: it is recorded as an event and the span is not marked as an error.
@@ -63,6 +65,8 @@ def traced_node(node: Callable[..., Awaitable[dict]]) -> Callable[..., Awaitable
 
     @functools.wraps(node)
     async def run(state, runtime):
+        started = time.monotonic()
+        failed = False
         with tracer.start_as_current_span(
             f"node {node.__name__}", attributes={"app.node": node.__name__}, record_exception=False,
             set_status_on_exception=False,
@@ -73,9 +77,12 @@ def traced_node(node: Callable[..., Awaitable[dict]]) -> Callable[..., Awaitable
                 span.add_event("interrupt", {"app.awaiting": "feedback"})
                 raise
             except Exception as exc:
+                failed = True
                 span.record_exception(exc)
                 span.set_status(trace.StatusCode.ERROR, str(exc))
                 raise
+            finally:
+                NODE_DURATION.record(time.monotonic() - started, {"app.node": node.__name__, "app.failed": failed})
             for key in _DECISION_KEYS:
                 if result.get(key) is not None:
                     span.set_attribute(f"app.{key}", str(result[key]))

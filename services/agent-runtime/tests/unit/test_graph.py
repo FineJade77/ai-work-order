@@ -9,6 +9,7 @@ from app.clients.tool_gateway import ToolCallFailed
 from app.graph import nodes, prompts
 from app.graph.builder import build_graph
 from app.worker.runner import BUDGET_EXCEEDED, SUPERSEDED, TaskRunner
+from tests.conftest import metric_total
 from tests.fakes import LEAVE_HIT, VPN_HIT, FakeModels, FakeTools, RecordingEvents, make_task
 
 pytestmark = pytest.mark.anyio
@@ -323,3 +324,19 @@ async def test_a_failing_node_is_an_error_span(spans):
     create = _finished(spans)["node create_ticket"]
     assert create.status.status_code == StatusCode.ERROR
     assert [e.name for e in create.events] == ["exception"]
+
+
+async def test_node_durations_intents_and_searches_are_counted(env):
+    tenant = str(env.task("x").tenant_id)
+    before = (
+        metric_total("app.node.duration", app__node="classify_intent", app__failed=False),
+        metric_total("app.agent.intents", app__intent="question", app__tenant_id=tenant),
+        metric_total("app.knowledge.searches", app__result="hit", app__tenant_id=tenant),
+    )
+    await env.runner.run(env.task("VPN 连不上"))
+    after = (
+        metric_total("app.node.duration", app__node="classify_intent", app__failed=False),
+        metric_total("app.agent.intents", app__intent="question", app__tenant_id=tenant),
+        metric_total("app.knowledge.searches", app__result="hit", app__tenant_id=tenant),
+    )
+    assert [a - b for a, b in zip(after, before)] == [1, 1, 1]

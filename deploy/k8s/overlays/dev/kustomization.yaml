@@ -13,6 +13,7 @@ resources:
   - seed-jobs.yaml
 # components:
 #   - ../../components/autoscaling   # needs metrics-server, and KEDA for agent-runtime
+#   - ../../components/observability # OpenTelemetry on, plus an all-in-one Grafana stack
 
 # What `docker compose build` produces. Load them into the cluster's nodes first (e.g. `kind load
 # docker-image`), or push them to a registry the cluster can pull from and change newName.

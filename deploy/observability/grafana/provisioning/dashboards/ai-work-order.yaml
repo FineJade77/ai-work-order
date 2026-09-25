@@ -1,0 +1,11 @@
+# Loads the committed dashboards (deploy/observability/grafana/dashboards, mounted into the
+# observability container) into a Grafana folder of their own.
+apiVersion: 1
+providers:
+  - name: ai-work-order
+    folder: ai-work-order
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    options:
+      path: /otel-lgtm/ai-work-order/dashboards

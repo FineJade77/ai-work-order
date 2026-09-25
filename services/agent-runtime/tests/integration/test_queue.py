@@ -8,10 +8,12 @@ from opentelemetry.trace import SpanKind
 
 from app.core.errors import RetryLater
 from app.events import RESULT_STREAM, EventPublisher, event_stream_key
+from app.metrics import QueueMonitor
 from app.tracing import inject_into
 from app.worker.consumer import TaskConsumer
 from app.worker.locks import ConversationLock
 from app.worker.queue import CONSUMER_GROUP, DEAD_LETTER_STREAM, TASK_STREAM, RedisStreamTaskQueue, floor_key
+from tests.conftest import metric_total
 from tests.fakes import make_task
 
 pytestmark = pytest.mark.anyio
@@ -186,3 +188,32 @@ async def test_a_result_carries_the_trace_of_the_run_that_sent_it(redis):
     _, trace_id, span_id, _ = result["traceparent"].split("-")
     context = run.get_span_context()
     assert (trace_id, span_id) == (format(context.trace_id, "032x"), format(context.span_id, "016x"))
+
+
+async def test_each_delivery_is_counted_by_what_came_of_it(redis, settings):
+    q = queue(redis)
+    await q.setup()
+    task = make_task(uuid.uuid4(), "hi")
+    await redis.xadd(TASK_STREAM, task_fields(task))
+    [delivery] = await q.receive(1, block_ms=100)
+    labels = {"app__result": "replied", "app__tenant_id": str(task.tenant_id)}
+    before = (metric_total("app.task.deliveries", **labels), metric_total("app.task.duration", **labels))
+    await TaskConsumer(q, FakeRunner(), redis, settings).handle(delivery)  # FakeRunner's outcome: replied
+    after = (metric_total("app.task.deliveries", **labels), metric_total("app.task.duration", **labels))
+    assert (after[0] - before[0], after[1] - before[1]) == (1, 1)
+
+
+async def test_queue_monitor_reports_backlog_pending_and_dead_letters(redis):
+    q = queue(redis)
+    await q.setup()
+    for content in ("a", "b", "c"):
+        await redis.xadd(TASK_STREAM, task_fields(make_task(uuid.uuid4(), content)))
+    await q.receive(1, block_ms=100)  # one delivered and left unacknowledged
+    await redis.xadd(DEAD_LETTER_STREAM, {"reason": "test"})
+
+    monitor = QueueMonitor(redis, {TASK_STREAM: CONSUMER_GROUP}, dead_letter_stream=DEAD_LETTER_STREAM)
+    await monitor.sample()
+    tasks = monitor.latest[TASK_STREAM]
+    assert (tasks["lag"], tasks["pending"]) == (2, 1)
+    assert 0 <= tasks["oldest_pending_age"] < 60
+    assert monitor.latest[DEAD_LETTER_STREAM] == {"dead_letters": 1}

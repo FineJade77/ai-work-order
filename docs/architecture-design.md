@@ -212,8 +212,16 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
     - 事件：会话锁冲突、跳过旧副本（Redis 下限或 checkpoint）、续跑、检索失败与降级、预算拒绝、死信、RetryLater 都记在对应 span 上。
     - ai-gateway：每次模型调用一个 `chat <模型>` span（CLIENT），按 GenAI 约定记录 `gen_ai.provider.name`、`gen_ai.request/response.model`、`gen_ai.usage.input/output_tokens`、`gen_ai.response.finish_reasons`、首个 token 事件和 `app.time_to_first_token_ms`；SDK 发出的 HTTP 请求是它的子 span。提示词和回复由 `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` 控制（compose 开、默认关），记录时截断并对手机号/邮箱/身份证号脱敏。span 是手动开始和结束的：调用在异步生成器里跨 yield，用上下文管理器会在别处恢复上下文。
     - `scripts/show-trace.py` 把一条 trace 打印成缩进的调用树，方便不开 Grafana 时查看。
-  - **阶段 3（待做）指标、看板、告警**：队列、任务、Agent、LLM、入口的指标（`tenant_id` 可做标签，`user_id`/`task_id` 不做），Grafana 看板和告警规则放进仓库，示例 SLO"95% 的轮次 30 秒内完成"。
-  - 生产环境：Collector 用 OTel Operator 或独立 Deployment，后端各自部署（Tempo、Loki、Prometheus/Mimir、Grafana），在 Collector 做尾部采样（错误和慢请求全留）；k8s 的可选组件 `components/observability` 在阶段 3 加。
+  - **阶段 3（已完成）指标、看板、告警**：
+    - 指标都用 OTel metrics API，经同一条 OTLP 管道进 Prometheus（名字转换：点变下划线、单位成后缀、计数器加 `_total`）。标签只用低基数的：租户、结果、节点、意图、工具；`user_id`/`task_id`/`conversation_id` 只放 trace 和日志。直方图用显式分桶（advisory），SDK 默认分桶是给毫秒用的。
+    - agent-runtime：`app.task.deliveries`/`app.task.duration`（按 `app.result`：run 的 outcome，或 conversation_busy、skipped_stale、retry_later、dead_letter、error）、`app.queue.wait`、`app.node.duration`、`app.agent.intents`、`app.knowledge.searches`（hit/miss/unavailable）；队列 gauge（`app.queue.lag`/`pending`/`oldest_pending_age`/`dead_letters`）由 `QueueMonitor` 每 15 秒采样 Redis（XINFO/XPENDING/XLEN），每个副本报同样的值，查询用 max。
+    - ai-gateway：GenAI 标准指标 `gen_ai.client.token.usage`（按 `gen_ai.token.type`）、`gen_ai.client.operation.duration`，加 `app.genai.time_to_first_token`；`app.budget.refusals`、`app.budget.utilization`（每次预算检查时更新的 gauge）。
+    - app-service：`app.turn.duration`——从存下员工消息到存下回复，中间的排队、重试、重投全算在内，SLO 就算在它上面（分桶含 30 秒边界）；只在一轮第一次完成时记录，重复投递的结果不重复计。另有 `app.turn.requeues`、`app.rate_limit.refusals`、`app.sse.connections`。
+    - tool-gateway：`app.tool.calls`/`app.tool.call.duration`，标签同审计行（工具、状态、错误码）。
+    - 看板与告警都是代码：`deploy/observability/grafana/` 下的生成脚本产出看板 JSON 和告警 YAML（提交的是产物，改脚本再生成），compose 挂载进容器、k8s 组件做成 ConfigMap，Grafana 启动时 provisioning。看板：`ai-work-order 系统总览`（轮次与 SLO、队列、Agent、LLM、入口与工具，可按租户过滤）、`ai-work-order 单轮排查`（输入会话 id 找各轮 trace，输入 trace id 看调用树和所有服务的日志）。
+    - 告警（Grafana 管理，每分钟评估；没有数据不算告警）：任务积压（>20 持续 5 分钟）、任务长时间未确认（>300 秒）、新死信（15 分钟内）、检索降级（10 分钟内有）、租户预算 >80%、SLO 快速燃烧（1 小时和 5 分钟窗口都超过 14.4 倍，且 1 小时内至少 10 轮）、服务 5xx >5%。
+    - SLO：95% 的轮次 30 秒内完成。
+  - 生产环境：Collector 用 OTel Operator 或独立 Deployment，后端各自部署（Tempo、Loki、Prometheus/Mimir、Grafana），在 Collector 做尾部采样（错误和慢请求全留），告警接到值班系统。k8s 的可选组件 `components/observability` 部署和 compose 一样的一体化容器（数据在 Pod 里），只适合开发集群。
 - 部署清单：V1 用 Kustomize（`deploy/k8s`：base + overlays + 可选的扩缩容组件），kubectl 自带、没有模板语法；"迁移完成后再更新服务"的顺序由 `apply-dev.sh` 保证，以后用 Helm hook 或 Argo CD sync wave 表达。服务容器一律非 root、只读根文件系统。
 - CI/CD 流水线、多环境（staging/prod）overlay【V1 未实现】。租户级配置里已经能不重新部署就生效的：工具绑定（`role_tool_bindings`）和 token 预算（`tenant_token_budgets`），都是数据库表。
 

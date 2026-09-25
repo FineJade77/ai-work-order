@@ -14,6 +14,7 @@ from langgraph.types import interrupt
 from app.clients.tool_gateway import classify_failure
 from app.graph import prompts
 from app.graph.state import AgentState, Deps
+from app.metrics import CLASSIFIED_INTENTS, KNOWLEDGE_SEARCHES
 from app.tracing import event
 
 logger = logging.getLogger("agent_runtime.graph")
@@ -62,6 +63,7 @@ async def classify_intent(state: AgentState, runtime: Runtime[Deps]) -> dict:
         # Unreadable output: ask the employee to describe the problem rather than guess.
         logger.warning("unparseable classification task_id=%s output=%r", deps.task.task_id, raw[:200])
         intent = "chitchat"
+    CLASSIFIED_INTENTS.add(1, {"app.intent": intent, "app.tenant_id": str(deps.task.tenant_id)})
     # A new question within the same run (check_resolution -> new_question) must not inherit the
     # previous question's search results or the category taken from them.
     return {"intent": intent, "category": None, "knowledge": None, "knowledge_error": None}
@@ -78,6 +80,8 @@ async def retrieve_knowledge(state: AgentState, runtime: Runtime[Deps]) -> dict:
         try:
             result = await deps.tools.call(deps.task, "search_knowledge", {"query": query})
             hits = result["results"]
+            tenant = str(deps.task.tenant_id)
+            KNOWLEDGE_SEARCHES.add(1, {"app.result": "hit" if hits else "miss", "app.tenant_id": tenant})
             return {"knowledge": hits, "knowledge_error": None, "category": _category_of(hits)}
         except Exception as exc:
             failure = classify_failure(exc)
@@ -91,6 +95,7 @@ async def retrieve_knowledge(state: AgentState, runtime: Runtime[Deps]) -> dict:
         )
         await anyio.sleep(delay)
     event("knowledge_unavailable", code=failure.code, attempts=attempt)
+    KNOWLEDGE_SEARCHES.add(1, {"app.result": "unavailable", "app.tenant_id": str(deps.task.tenant_id)})
     # Fixed format, so log-based alerting can match on the leading keyword.
     logger.error(
         "knowledge_unavailable tenant_id=%s task_id=%s code=%s attempts=%d",

@@ -29,6 +29,11 @@ services:
       - "23200:3200"   # Tempo query API
       - "23100:3100"   # Loki query API
       - "29090:9090"   # Prometheus
+    volumes:
+      # Dashboards and alert rules as code (deploy/observability/grafana), provisioned at startup.
+      - ./deploy/observability/grafana/dashboards:/otel-lgtm/ai-work-order/dashboards:ro
+      - ./deploy/observability/grafana/provisioning/dashboards/ai-work-order.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/ai-work-order.yaml:ro
+      - ./deploy/observability/grafana/provisioning/alerting/ai-work-order.yaml:/otel-lgtm/grafana/conf/provisioning/alerting/ai-work-order.yaml:ro
 
   postgres:
     image: postgres:16-alpine

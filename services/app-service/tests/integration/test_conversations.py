@@ -8,6 +8,7 @@ from opentelemetry.trace import SpanKind
 from app.clients.agent_bus import RESULT_STREAM, TASK_STREAM, AgentBus, event_stream_key, floor_key
 from app.core.config import get_settings
 from app.workers.requeuer import NO_RESULT_MESSAGE, Requeuer
+from tests.conftest import metric_total
 from tests.integration.env import PASSWORD
 
 pytestmark = pytest.mark.anyio
@@ -270,3 +271,17 @@ async def test_storing_a_result_is_linked_to_the_run_that_sent_it(client, redis,
     [link] = stored.links
     assert (format(link.context.trace_id, "032x"), format(link.context.span_id, "016x")) == ("ab" * 16, "cd" * 8)
     assert stored.context.trace_id != link.context.trace_id  # its own trace, linked, not a child
+
+
+async def test_a_turn_duration_is_recorded_once_when_it_completes(client, redis, tenant, login):
+    alice = await login(tenant.alice)
+    conversation = await start_conversation(client, alice)
+    task_id = (await send(client, alice, conversation)).json()["task_id"]
+    labels = {"app__status": "done", "app__outcome": "replied", "app__tenant_id": str(tenant.id)}
+    for _ in range(2):  # a redelivered result must not count again
+        await report(
+            redis, tenant, conversation, task_id, status="done", outcome="replied", content="你好", ticket_id=""
+        )
+    await wait_for(lambda: _history_when(client, alice, conversation, lambda h: h["active_task_id"] is None))
+    await anyio.sleep(0.5)  # let the redelivered copy be handled too
+    assert metric_total("app.turn.duration", **labels) == 1

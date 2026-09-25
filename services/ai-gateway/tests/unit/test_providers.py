@@ -7,6 +7,7 @@ from opentelemetry.trace import SpanKind, StatusCode
 
 from app import providers
 from app.providers import OpenAICompatibleProvider
+from tests.conftest import metric_total
 
 pytestmark = pytest.mark.anyio
 
@@ -141,3 +142,18 @@ async def test_a_failed_model_call_is_an_error_span(recorded, spans):
     with pytest.raises(RuntimeError):
         [e async for e in generate(make_provider(FakeCompletions([_chunk("partial")], then_fail=True)))]
     assert _chat_span(spans).status.status_code == StatusCode.ERROR
+
+
+async def test_token_usage_and_duration_are_recorded_as_genai_metrics(recorded):
+    labels = {"gen_ai__request__model": "test-model", "app__tenant_id": TENANT}
+    before = (
+        metric_total("gen_ai.client.token.usage", gen_ai__token__type="input", **labels),
+        metric_total("gen_ai.client.operation.duration", **labels),
+    )
+    usage = SimpleNamespace(prompt_tokens=7, completion_tokens=2)
+    [e async for e in generate(make_provider(FakeCompletions([_chunk("hi"), _chunk(usage=usage)])))]
+    after = (
+        metric_total("gen_ai.client.token.usage", gen_ai__token__type="input", **labels),
+        metric_total("gen_ai.client.operation.duration", **labels),
+    )
+    assert (after[0] - before[0], after[1] - before[1]) == (1, 1)

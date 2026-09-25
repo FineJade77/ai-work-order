@@ -7,6 +7,7 @@ from app.core.errors import CallerError
 from app.repositories.tool_calls import CallRecord
 from app.services import tool_call_service as svc
 from app.tools.registry import REGISTRY
+from tests.conftest import metric_total
 
 TENANT = str(uuid.uuid4())
 SESSION = str(uuid.uuid4())
@@ -224,3 +225,14 @@ async def test_handler_receives_the_user_as_context(env, monkeypatch):
     monkeypatch.setitem(REGISTRY, "create_ticket", dataclasses.replace(REGISTRY["create_ticket"], handler=handler))
     await call()
     assert seen == [USER]
+
+
+@pytest.mark.anyio
+async def test_every_attempt_is_counted_like_its_audit_row(env):
+    success = {"app__tool": "create_ticket", "app__status": "success", "app__tenant_id": TENANT}
+    rejected = {"app__tool": "create_ticket", "app__status": "rejected", "app__error_code": "TOOL_NOT_ALLOWED"}
+    before = (metric_total("app.tool.calls", **success), metric_total("app.tool.calls", **rejected))
+    await call(key=str(uuid.uuid4()))
+    await call(role="guest", key=str(uuid.uuid4()))
+    after = (metric_total("app.tool.calls", **success), metric_total("app.tool.calls", **rejected))
+    assert (after[0] - before[0], after[1] - before[1]) == (1, 1)

@@ -1,4 +1,5 @@
-"""One span per model call, following the OTel GenAI semantic conventions (gen_ai.*).
+"""One span, and the standard GenAI metrics, per model call, following the OTel GenAI semantic
+conventions (gen_ai.*).
 
 Message content (system prompt, messages, reply) is recorded only when
 OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT is true, the switch OTel's own GenAI
@@ -12,10 +13,25 @@ import re
 import time
 from urllib.parse import urlparse
 
-from opentelemetry import trace
+from opentelemetry import metrics, trace
 from opentelemetry.trace import Span, SpanKind, StatusCode
 
 tracer = trace.get_tracer("ai_gateway.genai")
+meter = metrics.get_meter("ai_gateway.genai")
+
+# Names and units from the GenAI semantic conventions, so standard dashboards understand them.
+TOKEN_USAGE = meter.create_histogram(
+    "gen_ai.client.token.usage", unit="{token}", description="Tokens used per model call, by gen_ai.token.type",
+    explicit_bucket_boundaries_advisory=[1, 4, 16, 64, 256, 1024, 4096, 16384, 65536],
+)
+OPERATION_DURATION = meter.create_histogram(
+    "gen_ai.client.operation.duration", unit="s", description="Model call duration, until the stream ends",
+    explicit_bucket_boundaries_advisory=[0.1, 0.25, 0.5, 1, 2, 4, 8, 16, 32, 64],
+)
+TIME_TO_FIRST_TOKEN = meter.create_histogram(
+    "app.genai.time_to_first_token", unit="s", description="Model call start to first streamed token",
+    explicit_bucket_boundaries_advisory=[0.1, 0.25, 0.5, 1, 2, 4, 8, 16],
+)
 
 CONTENT_MAX_CHARS = 4000
 
@@ -55,16 +71,17 @@ class ChatSpan:
         self._first_token_at: float | None = None
         self._reply: list[str] = []
         self._finish_reason: str | None = None
+        # Low-cardinality labels for the metrics; the span gets these plus more.
+        self._labels = {
+            "gen_ai.operation.name": "chat",
+            "gen_ai.provider.name": provider,
+            "gen_ai.request.model": model,
+            "app.tenant_id": tenant_id,
+        }
         self._span: Span = tracer.start_span(
             f"chat {model}",
             kind=SpanKind.CLIENT,
-            attributes={
-                "gen_ai.operation.name": "chat",
-                "gen_ai.provider.name": provider,
-                "gen_ai.request.model": model,
-                "server.address": urlparse(base_url).hostname or "",
-                "app.tenant_id": tenant_id,
-            },
+            attributes={**self._labels, "server.address": urlparse(base_url).hostname or ""},
         )
         if capture_content:
             self._span.set_attribute("gen_ai.system_instructions", _content(_text_parts(system_prompt)))
@@ -110,3 +127,10 @@ class ChatSpan:
             span.record_exception(error)
             span.set_status(StatusCode.ERROR, str(error))
         span.end()
+        labels = dict(self._labels, **({"error.type": type(error).__name__} if error is not None else {}))
+        OPERATION_DURATION.record(time.monotonic() - self._started, labels)
+        if error is None:
+            TOKEN_USAGE.record(input_tokens, dict(labels, **{"gen_ai.token.type": "input"}))
+            TOKEN_USAGE.record(output_tokens, dict(labels, **{"gen_ai.token.type": "output"}))
+        if self._first_token_at is not None:
+            TIME_TO_FIRST_TOKEN.record(self._first_token_at - self._started, labels)

@@ -1,0 +1,127 @@
+{
+  "uid": "ai-work-order-turn",
+  "title": "ai-work-order 单轮排查",
+  "tags": [
+    "ai-work-order"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "editable": true,
+  "description": "输入会话 id 找到它的各轮 trace；再输入 trace id 看这一轮在所有服务里的日志。",
+  "templating": {
+    "list": [
+      {
+        "name": "conversation_id",
+        "label": "会话 id",
+        "type": "textbox",
+        "query": "",
+        "current": {
+          "text": "",
+          "value": ""
+        }
+      },
+      {
+        "name": "trace_id",
+        "label": "trace id",
+        "type": "textbox",
+        "query": "",
+        "current": {
+          "text": "",
+          "value": ""
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "table",
+      "title": "这个会话的每一轮（点 trace id 打开调用树）",
+      "id": 1,
+      "datasource": {
+        "type": "tempo",
+        "uid": "tempo"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "tempo",
+            "uid": "tempo"
+          },
+          "queryType": "traceql",
+          "refId": "A",
+          "limit": 50,
+          "tableType": "traces",
+          "query": "{span.\"app.conversation_id\"=\"$conversation_id\"}"
+        }
+      ]
+    },
+    {
+      "type": "traces",
+      "title": "调用树",
+      "id": 2,
+      "datasource": {
+        "type": "tempo",
+        "uid": "tempo"
+      },
+      "gridPos": {
+        "h": 14,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "tempo",
+            "uid": "tempo"
+          },
+          "queryType": "traceql",
+          "refId": "A",
+          "query": "$trace_id"
+        }
+      ]
+    },
+    {
+      "type": "logs",
+      "title": "这一轮在所有服务里的日志",
+      "id": 3,
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "h": 12,
+        "w": 24,
+        "x": 0,
+        "y": 23
+      },
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "sortOrder": "Ascending",
+        "enableLogDetails": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "refId": "A",
+          "expr": "{service_name=~\".+\"} | trace_id=\"$trace_id\""
+        }
+      ]
+    }
+  ]
+}

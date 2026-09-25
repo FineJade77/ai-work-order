@@ -8,6 +8,7 @@ from redis.asyncio import Redis
 from app.clients.agent_bus import TASK_STREAM
 from app.core.errors import ApiError
 from app.services.rate_limit import MessageRateLimiter
+from tests.conftest import metric_total
 from tests.integration.test_conversations import history, send, start_conversation
 
 pytestmark = pytest.mark.anyio
@@ -68,3 +69,11 @@ async def test_a_refused_message_is_not_stored_or_enqueued(app, client, redis, t
     assert int(resp.headers["Retry-After"]) >= 1
     assert await history(client, alice, conversation) == before
     assert len(await redis.xrange(TASK_STREAM)) == 1
+
+
+async def test_refusals_are_counted_by_window(redis):
+    before = metric_total("app.rate_limit.refusals", app__window="minute")
+    user, limit = uuid.uuid4(), limiter(redis, per_minute=1)
+    await limit.check(user, now=NOW)
+    await refused(limit.check(user, now=NOW))
+    assert metric_total("app.rate_limit.refusals", app__window="minute") - before == 1

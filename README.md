@@ -222,7 +222,16 @@ docker compose exec postgres psql -U work_order -d app_service -c \
   ```
 - 结果落库是另一条 trace（`process agent_results`），用 link 指回 Agent 的那次运行。
 - 服务的标准输出也是一行一个 JSON：`docker compose logs app-service`。
-- 现阶段的缺口：还没有业务指标看板和告警，见 `docs/implementation-plan.md` 阶段 7。
+- **看板**（Grafana → Dashboards → ai-work-order）：
+  - **系统总览**：轮次与 SLO（30 秒内完成的比例、p95）、任务队列（积压、待确认、最老待确认、死信、每次投递的结果）、Agent（节点耗时、意图、检索命中）、大模型（token、调用耗时、首 token、各租户预算使用率）、入口与工具（HTTP、5xx、限流、SSE、工具调用）。顶部可按租户过滤。
+  - **单轮排查**：填会话 id 列出它的各轮 trace；填 trace id 看调用树和这一轮在所有服务里的日志。
+- **告警**（Grafana → Alerting）：任务积压、任务长时间未确认、新死信、检索降级、预算超过 80%、SLO 快速燃烧、5xx 过高。本地没有接通知渠道，在 Alerting 页面看状态。想看它们触发，可以：
+  ```bash
+  docker compose exec redis redis-cli XADD agent_tasks '*' task_id not-a-uuid content broken   # 死信
+  docker compose stop knowledge-service && scripts/demo.sh vpn; docker compose start knowledge-service   # 检索降级
+  ```
+  告警每分钟评估一次，一两分钟后变成 Alerting。
+- 看板和告警是代码：改 `deploy/observability/grafana/generate_dashboards.py` / `generate_alerts.py`，再生成 JSON/YAML；告警改动要重建 `observability` 容器才生效（`docker compose up -d --force-recreate observability`，数据会清空，Grafana 首次初始化要等几分钟）。
 
 ## 运行测试
 

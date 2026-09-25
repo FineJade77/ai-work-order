@@ -117,8 +117,8 @@ ai-work-order/
   - **验收标准**：每个服务的 `tests/unit/test_telemetry.py`（JSON 字段、span 内带 id、重复配置幂等、一次请求只有一个服务端 span 且不记探针）全部通过；跑一次演示后 Tempo 里六个服务都有 trace，agent-runtime → tool-gateway → knowledge-service / ticket-service 在同一条 trace 里且带数据库 span；Loki 能按 `trace_id` 查到这条 trace 的日志。
 - **7.2 跨队列与 Agent/LLM（已完成）**：任务和结果消息携带 `traceparent`，一轮对话一条 trace（`turns.traceparent`，app-service 迁移 0006，让补偿重投接回原 trace；扫描本身不追踪）；结果落库用 link；LangGraph 节点 span；ai-gateway 的 GenAI span（内容记录由 `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` 控制，compose 打开）；锁冲突、跳过旧副本、续跑、降级、预算拒绝、死信记为 span 事件；`scripts/show-trace.py`。
   - **验收标准**：内存 exporter 测试覆盖——agent-runtime：消费端 span 是生产端的子 span、跳过旧副本的事件、结果带运行的 `traceparent`、节点 span 的名字与决定属性、`interrupt` 不算错误、检索失败事件、失败节点为错误；app-service：生产端 span 挂在请求下且消息和 `turns` 带同一条 trace、重投留在原 trace、结果落库 span 有 link；ai-gateway：GenAI 属性、内容只在开关打开时记录且已脱敏、失败为错误。真实环境（真实模型）跑一次演示后，用 `scripts/show-trace.py` 确认一轮对话是一条 trace，覆盖 app-service、agent-runtime、ai-gateway、tool-gateway 以及 knowledge-service 或 ticket-service，含队列生产/消费、节点和 GenAI span。
-- **7.3 指标、看板、告警（待做）**：OTel metrics 覆盖队列、任务、Agent、LLM、入口；Grafana 看板与告警规则放进仓库（provisioning）；示例 SLO；k8s 可选组件 `components/observability`。
-  - **验收标准**：看板在演示流量下有数据；人为制造死信和降级时对应告警触发。
+- **7.3 指标、看板、告警（已完成）**：OTel metrics 覆盖队列（含 `QueueMonitor` 采样的积压/待确认/最老待确认/死信 gauge）、任务、Agent、LLM（GenAI 标准指标）、预算、轮次耗时（SLO）、限流、SSE、工具调用；看板与告警规则由 `deploy/observability/grafana/generate_*.py` 生成并提交，compose 挂载、k8s 组件用 ConfigMap；SLO 95% 的轮次 30 秒内完成，带多窗口燃烧率告警；k8s 可选组件 `components/observability`（otel-lgtm + 给六个服务打开 OTel 的 patch）。
+  - **验收标准**：内存 metric reader 测试覆盖——agent-runtime：节点耗时、意图、检索结果计数，每次投递按结果计数和计时，`QueueMonitor` 读出积压、待确认、最老待确认和死信；app-service：一轮只在第一次完成时记一次耗时，限流拒绝按窗口计数；ai-gateway：token 用量和调用耗时；tool-gateway：每次调用按工具和状态计数。真实环境：看板每个面板的查询在演示流量下都有数据（没有发生的事显示 0 而不是无数据）；人为制造死信、停掉 knowledge-service、把租户预算调到约 90% 后，对应的三条告警进入 Alerting，其余保持正常；k8s 组件本地渲染后六个服务都带上 OTel 配置、所有 ConfigMap 引用都能解析。
 
 ## 工作方式要求
 

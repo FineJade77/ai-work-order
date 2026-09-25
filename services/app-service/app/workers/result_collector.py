@@ -1,6 +1,7 @@
 import logging
 import time
 import uuid
+from datetime import datetime, timezone
 
 import anyio
 from opentelemetry import trace
@@ -11,6 +12,7 @@ from sqlalchemy import func
 
 from app.clients.agent_bus import RESULT_GROUP, RESULT_STREAM, link_to, messaging_attributes
 from app.db.session import session_factory, tenant_scope
+from app.metrics import TURN_DURATION
 from app.repositories import conversations as repo
 
 logger = logging.getLogger("app_service.results")
@@ -107,6 +109,7 @@ class ResultCollector:
                 logger.warning("dropping late %s result for superseded task_id=%s", status, task_id)
                 return
             await repo.upsert_assistant_reply(session, turn, fields["content"])
+            first_completion = turn.status == "queued"  # not a late answer replacing a failure notice
             turn.status = status
             if status == "done":
                 turn.outcome = fields["outcome"]
@@ -116,6 +119,12 @@ class ResultCollector:
                 turn.error_code = fields.get("error_code") or "TASK_FAILED"
             turn.completed_at = turn.updated_at = func.now()
             await session.commit()
+        if first_completion:
+            outcome = turn.outcome or turn.error_code or ""
+            TURN_DURATION.record(
+                (datetime.now(timezone.utc) - turn.created_at).total_seconds(),
+                {"app.status": status, "app.outcome": outcome, "app.tenant_id": str(tenant_id)},
+            )
 
 
 def _mark_failed(exc: Exception) -> None:

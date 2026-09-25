@@ -14,10 +14,11 @@ from app.clients.ai_gateway import AIGatewayClient
 from app.clients.tool_gateway import ToolGatewayClient
 from app.core.config import get_settings
 from app.core.telemetry import configure_logging, instrument_app
-from app.events import EventPublisher
+from app.events import RESULT_GROUP, RESULT_STREAM, EventPublisher
+from app.metrics import QueueMonitor
 from app.graph.builder import build_graph
 from app.worker.consumer import POLL_BLOCK_MS, TaskConsumer
-from app.worker.queue import RedisStreamTaskQueue
+from app.worker.queue import CONSUMER_GROUP, DEAD_LETTER_STREAM, TASK_STREAM, RedisStreamTaskQueue
 from app.worker.runner import TaskRunner
 
 logger = logging.getLogger("agent_runtime")
@@ -66,12 +67,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         consumer = asyncio.create_task(TaskConsumer(queue, runner, redis, settings).run())
         consumer.add_done_callback(_log_consumer_exit)
         app.state.consumer = consumer
+        monitor = QueueMonitor(
+            redis, {TASK_STREAM: CONSUMER_GROUP, RESULT_STREAM: RESULT_GROUP}, dead_letter_stream=DEAD_LETTER_STREAM
+        )
+        sampler = asyncio.create_task(monitor.run())
         try:
             yield
         finally:
             # In-flight tasks are cancelled unacknowledged; another replica resumes them.
             consumer.cancel()
-            await asyncio.gather(consumer, return_exceptions=True)
+            sampler.cancel()
+            await asyncio.gather(consumer, sampler, return_exceptions=True)
 
 
 def _log_consumer_exit(task: asyncio.Task) -> None:

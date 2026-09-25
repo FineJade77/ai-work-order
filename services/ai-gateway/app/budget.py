@@ -9,11 +9,30 @@ import math
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from opentelemetry import metrics
+from opentelemetry.metrics import CallbackOptions, Observation
 from sqlalchemy import func, select
 
 from app.core.config import Settings
 from app.db.models import ModelCallLog, TenantTokenBudget
 from app.db.session import session_factory, tenant_scope
+
+
+meter = metrics.get_meter("ai_gateway.budget")
+REFUSALS = meter.create_counter("app.budget.refusals", description="Model calls refused: daily token budget used up")
+# Share of today's budget each tenant had used at its latest check, reported as a gauge.
+_utilization: dict[str, float] = {}
+
+
+def _observe_utilization(_: CallbackOptions):
+    for tenant_id, ratio in list(_utilization.items()):
+        yield Observation(ratio, {"app.tenant_id": tenant_id})
+
+
+meter.create_observable_gauge(
+    "app.budget.utilization", callbacks=[_observe_utilization],
+    description="Share of the daily token budget used, as of the tenant's latest model call (1 = used up)",
+)
 
 
 class BudgetExceeded(Exception):
@@ -48,5 +67,7 @@ async def check_budget(tenant_id: str, settings: Settings, *, now: datetime | No
             )
         )
     limit = settings.daily_token_budget if override is None else override
+    _utilization[tenant_id] = used / limit if limit else 1.0
     if used >= limit:
+        REFUSALS.add(1, {"app.tenant_id": tenant_id})
         raise BudgetExceeded(used=used, limit=limit, retry_after_seconds=math.ceil((end - now).total_seconds()))

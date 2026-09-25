@@ -9,6 +9,7 @@ from app.clients.agent_bus import AgentBus, context_from
 from app.core.config import Settings
 from app.db.models import Conversation, Message, Tenant, Turn
 from app.db.session import session_factory, tenant_scope
+from app.metrics import TURN_REQUEUES
 from app.repositories import conversations as repo
 
 logger = logging.getLogger("app_service.requeuer")
@@ -66,6 +67,7 @@ class Requeuer:
                             turn.status, turn.error_code = "failed", NO_RESULT_CODE
                             turn.completed_at = turn.updated_at = func.now()
                             gave_up.append(turn)
+                            TURN_REQUEUES.add(1, {"app.gave_up": True, "app.tenant_id": str(tenant_id)})
                             continue
                         # Enqueued before commit: if the commit then fails, the next sweep enqueues it
                         # again, and a duplicate task is harmless.
@@ -74,6 +76,7 @@ class Requeuer:
                             user_id=user_id, content=content, parent=context_from(turn.traceparent),
                             requeue=turn.enqueue_count,
                         )
+                        TURN_REQUEUES.add(1, {"app.gave_up": False, "app.tenant_id": str(tenant_id)})
                         turn.enqueue_count += 1
                         turn.updated_at = func.now()
                         logger.warning("requeued task_id=%s (enqueue #%d)", turn.id, turn.enqueue_count)

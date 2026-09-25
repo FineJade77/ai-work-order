@@ -6,6 +6,7 @@ Kustomize 清单，`kubectl` 自带 kustomize，不需要额外工具。
 base/                      与环境无关：命名空间、ConfigMap（服务地址）、各服务 Deployment/Service、迁移 Job
 overlays/dev/              开发集群用：单实例 Postgres/Redis、db-init Job、seed Job、开发凭据、本地镜像名
 components/autoscaling/    可选：HTTP 服务的 HPA，agent-runtime 的 KEDA redis-streams ScaledObject
+components/observability/  可选：打开六个服务的 OpenTelemetry，部署 grafana/otel-lgtm（看板和告警规则与 compose 同源）
 apply-dev.sh               按依赖顺序部署 dev overlay
 ```
 
@@ -63,4 +64,5 @@ kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/k8s/overlays/dev
   - agent-runtime 按队列积压（`lagCount`）扩缩容，而不是 CPU，因为它的任务大部分时间在等模型。
   - 数值只是起点，按架构文档第 5 节调优。
 - **入口**：清单只有 ClusterIP Service。对外只应暴露 app-service，经 API Gateway（架构文档 3.1 节）或 Ingress；其余服务都是内部接口。
+- **可观测性**：`components/observability` 只适合开发集群（一体化容器、数据在 Pod 里、不记录提示词内容）。生产环境用 OTel Operator 或独立的 Collector，Tempo/Loki/Prometheus（或 Mimir）/Grafana 各自持久化部署，把 `otel-env` 里的 `OTEL_EXPORTER_OTLP_ENDPOINT` 指向 Collector，在 Collector 做尾部采样，告警接值班系统。访问开发集群里的 Grafana：`kubectl -n ai-work-order port-forward svc/observability 3000:3000`。
 - **NetworkPolicy**：建议只允许既定的调用方向：app-service → ticket-service；agent-runtime → tool-gateway、ai-gateway；tool-gateway → knowledge-service、ticket-service。

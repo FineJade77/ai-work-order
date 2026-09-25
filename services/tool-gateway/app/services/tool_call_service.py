@@ -9,6 +9,7 @@ from typing import Any
 from app.core.errors import CallerError
 from app.core.redaction import mask_secret_fields
 from app.core.tenancy import parse_tenant_id
+from app.metrics import TOOL_CALL_DURATION, TOOL_CALLS
 from app.repositories import audit, bindings, tool_calls
 from app.tools.base import ToolContext, ToolError, ToolSpec
 from app.tools.registry import REGISTRY, validate_arguments
@@ -122,6 +123,12 @@ async def call_tool(
         audit_status, error_code = "rejected", exc.code
         raise
     finally:
+        labels = {
+            "app.tool": tool_name, "app.status": audit_status, "app.error_code": error_code or "",
+            "app.tenant_id": tenant_id,
+        }
+        TOOL_CALLS.add(1, labels)
+        TOOL_CALL_DURATION.record(time.monotonic() - start, labels)
         await audit.write(
             tenant_id=tenant_id,
             session_id=session_id,

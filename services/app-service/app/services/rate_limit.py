@@ -9,6 +9,7 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from app.core.errors import ApiError
+from app.metrics import RATE_LIMIT_REFUSALS
 
 logger = logging.getLogger("app_service.rate_limit")
 
@@ -50,8 +51,10 @@ class MessageRateLimiter:
             return
 
         if day_count > self._per_day:
+            RATE_LIMIT_REFUSALS.add(1, {"app.window": "day"})
             raise _limited("daily", self._per_day, next_midnight - now)
         if minute_count > self._per_minute:
+            RATE_LIMIT_REFUSALS.add(1, {"app.window": "minute"})
             raise _limited("per-minute", self._per_minute, next_minute - now)
 
 

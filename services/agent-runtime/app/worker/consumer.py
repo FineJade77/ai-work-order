@@ -1,4 +1,5 @@
 import logging
+import time
 
 import anyio
 from opentelemetry.trace import SpanKind
@@ -9,6 +10,7 @@ from redis.exceptions import RedisError
 from app.core.config import Settings
 from app.core.errors import RetryLater
 from app.events import EventPublisher
+from app.metrics import QUEUE_WAIT, TASK_DELIVERIES, TASK_DURATION
 from app.schemas.tasks import AgentTask
 from app.tracing import context_of, event, messaging_attributes, queue_wait_ms, tracer
 from app.worker.locks import ConversationLock
@@ -79,31 +81,42 @@ class TaskConsumer:
             "app.delivery_attempt": delivery.attempt,
             "app.queue_wait_ms": queue_wait_ms(delivery.id),
         }
+        QUEUE_WAIT.record(attributes["app.queue_wait_ms"] / 1000)
+        started = time.monotonic()
+        result = "error"
         with tracer.start_as_current_span(
             f"process {TASK_STREAM}", context=context_of(fields), kind=SpanKind.CONSUMER, attributes=attributes
-        ):
-            await self._handle(delivery)
+        ) as span:
+            try:
+                result = await self._handle(delivery)
+            finally:
+                span.set_attribute("app.result", result)
+                labels = {"app.result": result, "app.tenant_id": fields.get("tenant_id", "")}
+                TASK_DELIVERIES.add(1, labels)
+                TASK_DURATION.record(time.monotonic() - started, labels)
 
-    async def _handle(self, delivery: Delivery) -> None:
+    async def _handle(self, delivery: Delivery) -> str:
+        """Returns what came of the delivery: the run's outcome (awaiting_feedback, ticket_created,
+        superseded...) or dead_letter, conversation_busy, skipped_stale, retry_later."""
         try:
             task = AgentTask.model_validate(delivery.fields)
         except ValidationError as exc:
             # Retrying cannot fix a malformed message.
             event("dead_letter", reason="invalid task")
             await self._queue.dead_letter(delivery, f"invalid task: {exc.error_count()} validation errors")
-            return
+            return "dead_letter"
 
         if delivery.attempt > self._settings.max_deliveries:
             event("dead_letter", reason="max deliveries", attempts=delivery.attempt - 1)
             await self._queue.dead_letter(delivery, f"gave up after {delivery.attempt - 1} attempts")
             await EventPublisher(self._redis, task).fail(code="TASK_FAILED", message=FAILED_MESSAGE)
-            return
+            return "dead_letter"
 
         lock = ConversationLock(self._redis, task.conversation_id, self._settings.conversation_lock_seconds)
         if not await lock.acquire():
             event("conversation_busy")
             logger.info("conversation %s is busy; task_id=%s will be redelivered", task.conversation_id, task.task_id)
-            return
+            return "conversation_busy"
         try:
             # Checked under the lock, so a newer turn cannot start between this check and the run.
             if await self._below_floor(task):
@@ -113,13 +126,15 @@ class TaskConsumer:
                     task.task_id, task.seq, task.conversation_id,
                 )
                 await self._queue.ack(delivery)
-                return
+                return "skipped_stale"
             with anyio.fail_after(self._settings.task_timeout_seconds):
-                await self._runner.run(task)
+                outcome = await self._runner.run(task)
             await self._queue.ack(delivery)
+            return outcome
         except RetryLater as exc:
             event("retry_later", reason=exc)
             logger.info("task_id=%s retry later: %s", task.task_id, exc)
+            return "retry_later"
         finally:
             await lock.release()
 

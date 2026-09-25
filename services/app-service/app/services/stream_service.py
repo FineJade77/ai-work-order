@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 
 from app.clients.agent_bus import TERMINAL_EVENTS, AgentBus, event_stream_key
 from app.db.models import Turn
+from app.metrics import SSE_CONNECTIONS
 
 READ_BLOCK_MS = 15_000  # also the keepalive interval while nothing happens
 
@@ -19,6 +20,15 @@ async def relay(bus: AgentBus, turn: Turn, last_event_id: str | None, max_second
     Reads from the start of the stream (or after Last-Event-ID), so events written before the
     browser connected are not lost. Ends after the turn's done/error event.
     """
+    SSE_CONNECTIONS.add(1)
+    try:
+        async for frame in _relay(bus, turn, last_event_id, max_seconds):
+            yield frame
+    finally:  # also when the browser goes away and the response is cancelled
+        SSE_CONNECTIONS.add(-1)
+
+
+async def _relay(bus: AgentBus, turn: Turn, last_event_id: str | None, max_seconds: float) -> AsyncIterator[str]:
     key, task_id = event_stream_key(turn.conversation_id), str(turn.id)
     cursor = last_event_id or "0-0"
     finished = turn.status != "queued"
