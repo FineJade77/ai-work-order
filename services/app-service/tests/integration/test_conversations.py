@@ -5,7 +5,7 @@ import anyio
 import pytest
 from opentelemetry.trace import SpanKind
 
-from app.clients.agent_bus import RESULT_STREAM, TASK_STREAM, AgentBus, event_stream_key, floor_key
+from app.clients.agent_bus import RESULT_STREAM, AgentBus, event_stream_key, floor_key, task_stream
 from app.core.config import get_settings
 from app.workers.requeuer import NO_RESULT_MESSAGE, Requeuer
 from tests.conftest import metric_total
@@ -71,7 +71,7 @@ async def test_send_enqueues_a_task_and_refuses_a_second_while_one_is_in_flight(
     assert resp.status_code == 202
     task_id = resp.json()["task_id"]
 
-    [(_, task)] = await redis.xrange(TASK_STREAM)
+    [(_, task)] = await redis.xrange(task_stream(tenant.id))
     assert task.pop("traceparent").startswith("00-")  # trace context; see the tracing tests below
     assert task == {
         "task_id": task_id, "seq": "1", "conversation_id": conversation, "tenant_id": str(tenant.id),
@@ -97,7 +97,7 @@ async def test_result_is_stored_once_and_frees_the_conversation(client, redis, t
         ("assistant", "请重启 VPN 客户端。", task_id),
     ]
     assert (await send(client, alice, conversation, "还是不行")).status_code == 202
-    [_, (_, second)] = await redis.xrange(TASK_STREAM)
+    [_, (_, second)] = await redis.xrange(task_stream(tenant.id))
     assert second["seq"] == "2" and await redis.get(floor_key(conversation)) == "2"
 
 
@@ -169,12 +169,12 @@ async def test_requeuer_re_enqueues_a_lost_task_then_gives_up(client, redis, ten
 
     age_turn()
     await requeuer.sweep()
-    tasks = [(fields["task_id"], fields["seq"]) for _, fields in await redis.xrange(TASK_STREAM)]
+    tasks = [(fields["task_id"], fields["seq"]) for _, fields in await redis.xrange(task_stream(tenant.id))]
     assert tasks == [(task_id, "1"), (task_id, "1")]  # same task: agent-runtime treats it idempotently
 
     age_turn()
     await requeuer.sweep()
-    assert len(await redis.xrange(TASK_STREAM)) == 2  # gave up instead of enqueuing a third time
+    assert len(await redis.xrange(task_stream(tenant.id))) == 2  # gave up instead of enqueuing a third time
     h = await history(client, alice, conversation)
     assert h["active_task_id"] is None and h["messages"][-1]["content"] == NO_RESULT_MESSAGE
     [(_, event)] = await redis.xrange(event_stream_key(conversation))
@@ -236,7 +236,7 @@ async def test_a_turn_and_its_task_carry_the_senders_trace(client, redis, tenant
     assert producer.kind == SpanKind.PRODUCER and producer.parent.span_id == request.context.span_id
     assert producer.attributes["app.task_id"] == task_id
     # agent-runtime's consumer span will be a child of the producer span.
-    [(message_id, task)] = await redis.xrange(TASK_STREAM)
+    [(message_id, task)] = await redis.xrange(task_stream(tenant.id))
     assert task["traceparent"].split("-")[2] == format(producer.context.span_id, "016x")
     assert producer.attributes["messaging.message.id"] == message_id
     # Stored with the turn, so a requeue can continue the same trace.
@@ -252,7 +252,7 @@ async def test_a_requeued_task_stays_in_the_turns_trace(client, redis, tenant, l
     spans.clear()
 
     await Requeuer(AgentBus(redis), get_settings()).sweep()
-    first, requeued = [fields for _, fields in await redis.xrange(TASK_STREAM)]
+    first, requeued = [fields for _, fields in await redis.xrange(task_stream(tenant.id))]
     assert _trace_id(requeued["traceparent"]) == _trace_id(first["traceparent"])
     # The sweep's own queries are not traced; the requeue is, and says so.
     [producer] = spans.get_finished_spans()

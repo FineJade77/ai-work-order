@@ -13,7 +13,7 @@
 - 语言：Python 3.11+，应用服务与 Agent Runtime 统一用 Python，降低集成成本。
 - 应用服务框架：FastAPI。
 - Agent 编排：LangGraph。
-- 队列 + 流式回传：Redis Streams——全局任务队列 `agent_tasks`、全局结果流 `agent_results`、每会话事件流 `conversation:{id}:events`（不用 Pub/Sub：没有订阅者时会丢事件），复用同一个 Redis 实例。
+- 队列 + 流式回传：Redis Streams——任务队列（每租户一条 `agent_tasks:t:{tenant}`，文中统称 `agent_tasks`；阶段 10 之前是全局一条）、全局结果流 `agent_results`、每会话事件流 `conversation:{id}:events`（不用 Pub/Sub：没有订阅者时会丢事件），复用同一个 Redis 实例。
 - 数据库：PostgreSQL，同一实例、每服务独立 database，库内 `tenant_id` 行级隔离（RLS）。
 - 工具协议：Tool Gateway 对 Agent Runtime 暴露 REST 接口（`/v1/tools/call` 执行；`/v1/tools/list` 返回 OpenAI function 元数据，V1 的固定状态图不用它），详见架构文档 3.4 节。
 - 模型供应商：AI Gateway v1 通过 OpenAI-compatible 协议接入，具体供应商为 **DeepSeek**（`base_url=https://api.deepseek.com`），用 `ModelProvider` 抽象 + 通用 `OpenAICompatibleProvider` 实现，不要为 DeepSeek 单独写一套适配代码。
@@ -97,7 +97,7 @@ ai-work-order/
 ### 阶段 5：应用服务
 > 工单数据与接口已在 ticket-service（阶段 2.5）。本阶段的员工"我的工单"和处理人页面由应用服务调用 ticket-service 实现，`start`/`resolve` 的处理人角色校验在应用服务做。
 - 登录：`POST /v1/auth/login {tenant(slug), email, password}` 签发 HS256 JWT（`sub/tid/role`）；`GET /v1/me`。迁移 0003 加 `tenants.slug`、`users.password_hash`、角色约束、`turns` 表、`messages.task_id`。角色为 `employee` / `handler`（迁移 0005 由 `it_staff` 改名，临时关闭 FORCE；改名前签发的令牌失效）；非处理人执行 `start`/`resolve` 返回 403 `NOT_HANDLER`。
-- `POST /v1/conversations/{id}/messages`：先按员工限流（每分钟 6 条、每天 200 条，Redis 固定窗口，超出 429 `RATE_LIMITED` 带 `Retry-After`，Redis 不可用时放行）；同一事务写用户消息和 `turns`（分配会话内序号 `seq`，迁移 0004；同一会话只能有一个 `queued`，否则 409），再在一个 Redis 事务里提高会话下限并 XADD `agent_tasks`，返回 202 `{task_id, message_id}`。
+- `POST /v1/conversations/{id}/messages`：先按员工限流（每分钟 6 条、每天 200 条，Redis 固定窗口，超出 429 `RATE_LIMITED` 带 `Retry-After`，Redis 不可用时放行）；同一事务写用户消息和 `turns`（分配会话内序号 `seq`，迁移 0004；同一会话只能有一个 `queued`，否则 409），再用一个 Redis 脚本提高会话下限并把任务写进租户的任务队列（阶段 10），返回 202 `{task_id, message_id}`。
 - `GET /v1/conversations/{id}/stream?task_id=`（SSE）：从会话事件 Stream 开头读、按 `task_id` 过滤，Stream ID 作为 SSE 的 event id，支持 Last-Event-ID 续读，`done`/`error` 后关闭；事件已过期时用数据库里的结果补发。
 - 回复落库：后台消费 `agent_results`，幂等地写助手消息、关闭轮次；已失败的轮次收到晚到的结果时，只在它仍是会话最新一轮时覆盖失败提示。补偿：`queued` 超过 10 分钟的轮次用同一 `task_id`、`seq` 重新入队，最多 2 次后标记失败；阈值配置必须 ≥ 480 秒（Agent Runtime 自身重试的最长时间）。补偿逐个租户扫描，`tenant_scope` 切换租户前先 flush。
 - 工单接口：`GET /v1/tickets`（员工只看自己的）、`GET /v1/tickets/{id}`、`POST /v1/tickets/{id}/transitions`，均转调 ticket-service，租户和用户取自 JWT；`start` 固定指派给自己。
@@ -151,6 +151,21 @@ ai-work-order/
   - **验收标准**：先在旧代码上跑出基线，实现 9.1 后三个场景的不变式全部成立，前后对比写进架构文档。
 - 下游中断（停掉 ai-gateway）的演练留给后面的过载保护阶段。
 
+### 阶段 10：租户公平调度
+
+> 设计见架构文档 3.3 节「租户公平调度」和第 5 节（KEDA）。
+
+- **10.1 每租户队列、公平选取与并发租约（已完成）**：
+  - app-service：投递改成一个 Lua 脚本——提高会话下限、写入租户的 Stream `agent_tasks:t:{tenant}`、把租户加入活跃集合（虚拟时间取 `max(全局, 上次被服务到的)`）、发唤醒信号；补偿重投和审批轮次走同一个入口；
+  - agent-runtime：`RedisStreamTaskQueue` 用 Lua 脚本 `pick` 按 SFQ 选租户并取任务，每租户并发上限用带到期时间的租约（`TENANT_MAX_CONCURRENCY` 默认 8、`TENANT_LEASE_SECONDS` 默认 75，必须大于任务超时）；空闲时阻塞在唤醒 Stream 上；接管、交还、退出消费组按租户进行；`TaskQueue` 接口新增 `release`，消费循环在每次投递处理完后调用；
+  - 权重和上限按租户覆盖：Redis hash `agent_sched:weight`、`agent_sched:max_concurrency`；
+  - 指标：队列 gauge 按租户上报，新增 `app.queue.tenant_slots`，`app.queue.wait` 加租户标签；看板加各租户的积压、并发名额、排队 p95；积压告警改为各租户之和；
+  - KEDA 改用 Prometheus 触发器，`components/observability` 的 Service 暴露 9090。
+  - **验收标准**：集成测试（真 Redis）覆盖——一个租户积压 50 条时另一个租户的任务不排在它后面；权重 2 的租户被服务的次数是权重 1 的两倍；空闲后回来的租户不能连续插队；达到上限的租户等待、其他租户照常，释放名额后继续；按租户覆盖上限；被杀的消费者的名额在租约到期后释放；投递和释放名额都能唤醒空闲的消费者；每个租户被遗弃的任务都能被接管并占用名额；退出消费组覆盖每个租户；消费循环跑完一次投递就归还名额。原有的队列、停机、端到端测试改为走租户队列后全部通过。
+- **10.2 吵闹邻居演练（已完成）**：
+  - `scripts/chaos.py noisy`：demo 租户在 2 秒内发 80 条消息，northwind 租户随后每 1.5 秒发 1 条、共 8 条；检查每轮恰好一条回复、没有失败的轮次、没有新死信、安静租户的排队 p95 低于 2 秒，并报告两个租户各自的排队时间和轮次耗时。
+  - **验收标准**：先在旧代码上跑出基线，实现 10.1 后检查项全部成立，前后对比写进架构文档；三个故障场景（`rolling`、`kill`、`scale-in`）仍然通过。
+
 ## 待办（未排期）
 
 > 每一项的现状和做法见架构文档第 10 节。这里给出建议顺序和验收要点。每开始一项，先出方案和问题，确认后再实现。
@@ -166,33 +181,31 @@ ai-work-order/
 3. **图版本与 checkpoint 兼容**：
    - 内容：checkpoint 记图版本、兼容规则、用旧版本 checkpoint 做恢复测试。
    - 验收：停在 interrupt 上的会话，在不兼容发布前后都能正确恢复，或者被明确地迁移或结束。
-4. **租户公平调度**（方案已出，暂缓）：
-   - 验收：一个租户积压几百条时，另一个租户的新消息仍然在秒级被处理；各租户的处理量接近权重比，且不超过并发上限。
-5. **延迟任务与周期任务**：
+4. **延迟任务与周期任务**：
    - 内容：会话提醒和自动结束、已解决工单自动关闭（CronJob）。
-6. **队列运维**：死信查看和重放工具、发件箱通用化。
-7. **连接与存储**：PgBouncer、`durability` 取舍的测量、checkpoint 清理（与数据保留一起做）。
+5. **队列运维**：死信查看和重放工具、发件箱通用化。
+6. **连接与存储**：PgBouncer、`durability` 取舍的测量、checkpoint 清理（与数据保留一起做）。
 
 **二、数据与安全**
 
-8. 数据保留（P2-4）。
-9. 服务间信任（P2-5）、NetworkPolicy、工具调用限流、API Gateway。
+7. 数据保留（P2-4）。
+8. 服务间信任（P2-5）、NetworkPolicy、工具调用限流、API Gateway。
 
 **三、部署与交付**（需要真实集群）
 
-10. CI/CD、GitOps（Argo CD）、多环境 overlay、在真实集群上验证 KEDA 和优雅停机、生产可观测（OTel Operator、尾部采样）。
+9. CI/CD、GitOps（Argo CD）、多环境 overlay、在真实集群上验证 KEDA 和优雅停机、生产可观测（OTel Operator、尾部采样）。
 
 **四、业务功能**（按需要挑选）
 
-11. 前端：员工问答页和工单页、处理人工作台。
-12. 知识库：存数据库并加管理接口、向量检索加 RAG、检索质量评估。
-13. 工单：评论和附件、SLA 与超时升级、通知、按类别分派到处理组、自动关闭、满意度评价、外部工单系统 Provider。
-14. 审批：通知与到期提醒、审批人组与多级审批、真实 IAM、更多带副作用的工具。
-15. 租户配置与管理后台：提示词、助手名称和模型档位按租户配置，用量报表和计费。
-16. 认证：OIDC/SAML SSO、刷新令牌和吊销。
-17. 发给外部模型前按租户规则脱敏。
-18. 企业 IM 入口。
-19. Agent 质量：评测集、离线评估、提示词和模型的版本管理。
+10. 前端：员工问答页和工单页、处理人工作台。
+11. 知识库：存数据库并加管理接口、向量检索加 RAG、检索质量评估。
+12. 工单：评论和附件、SLA 与超时升级、通知、按类别分派到处理组、自动关闭、满意度评价、外部工单系统 Provider。
+13. 审批：通知与到期提醒、审批人组与多级审批、真实 IAM、更多带副作用的工具。
+14. 租户配置与管理后台：提示词、助手名称和模型档位按租户配置，用量报表和计费。
+15. 认证：OIDC/SAML SSO、刷新令牌和吊销。
+16. 发给外部模型前按租户规则脱敏。
+17. 企业 IM 入口。
+18. Agent 质量：评测集、离线评估、提示词和模型的版本管理。
 
 ## 工作方式要求
 

@@ -28,6 +28,13 @@ class Settings(BaseSettings):
     conversation_lock_seconds: float = 75
     claim_idle_seconds: float = 90
     max_deliveries: int = 3
+    # Tenants are served in turn (worker/queue.py). At most this many tasks of one tenant run at
+    # once, across all replicas, so a tenant whose tasks are slow cannot occupy every worker; 0 for
+    # no limit. A tenant's own limit and weight are set in Redis (agent_sched:max_concurrency,
+    # agent_sched:weight). A slot is a lease: it must outlive any run (checked below), and it is how
+    # the slots of a killed worker come back.
+    tenant_max_concurrency: int = Field(default=8, ge=0)
+    tenant_lease_seconds: float = 75
     # On SIGTERM, how long the runs in flight may take to finish before they are cut off and handed
     # back. Above task_timeout_seconds, so a run is only ever cut off if it is stuck past its own
     # timeout. The orchestrator must wait longer than this before SIGKILL (compose
@@ -39,6 +46,8 @@ class Settings(BaseSettings):
     def _check_timing(self) -> "Settings":
         if not self.task_timeout_seconds < self.conversation_lock_seconds < self.claim_idle_seconds:
             raise ValueError("need task_timeout_seconds < conversation_lock_seconds < claim_idle_seconds")
+        if not self.task_timeout_seconds < self.tenant_lease_seconds:
+            raise ValueError("need task_timeout_seconds < tenant_lease_seconds")
         return self
 
 

@@ -18,7 +18,7 @@ from app.events import RESULT_GROUP, RESULT_STREAM, EventPublisher
 from app.metrics import QueueMonitor
 from app.graph.builder import build_graph
 from app.worker.consumer import POLL_BLOCK_MS, TaskConsumer
-from app.worker.queue import CONSUMER_GROUP, DEAD_LETTER_STREAM, TASK_STREAM, RedisStreamTaskQueue
+from app.worker.queue import DEAD_LETTER_STREAM, RedisStreamTaskQueue
 from app.worker.runner import TaskRunner
 
 logger = logging.getLogger("agent_runtime")
@@ -62,15 +62,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             lambda task: EventPublisher(redis, task),
         )
         queue = RedisStreamTaskQueue(
-            redis, settings.consumer_name, claim_idle_ms=int(settings.claim_idle_seconds * 1000)
+            redis,
+            settings.consumer_name,
+            claim_idle_ms=int(settings.claim_idle_seconds * 1000),
+            max_concurrency=settings.tenant_max_concurrency,
+            lease_ms=int(settings.tenant_lease_seconds * 1000),
         )
         worker = TaskConsumer(queue, runner, redis, settings)
         consumer = asyncio.create_task(worker.run())
         consumer.add_done_callback(_log_consumer_exit)
         app.state.worker, app.state.consumer = worker, consumer
-        monitor = QueueMonitor(
-            redis, {TASK_STREAM: CONSUMER_GROUP, RESULT_STREAM: RESULT_GROUP}, dead_letter_stream=DEAD_LETTER_STREAM
-        )
+        monitor = QueueMonitor(redis, {RESULT_STREAM: RESULT_GROUP}, dead_letter_stream=DEAD_LETTER_STREAM)
         sampler = asyncio.create_task(monitor.run())
         try:
             yield

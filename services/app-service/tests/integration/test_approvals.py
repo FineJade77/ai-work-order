@@ -8,7 +8,7 @@ import httpx
 import psycopg
 import pytest
 
-from app.clients.agent_bus import TASK_STREAM
+from app.clients.agent_bus import task_stream
 from tests.integration.env import GATEWAY_ADMIN_DB_URL, TOOL_GATEWAY_TOKEN, TOOL_GATEWAY_URL
 from tests.integration.test_conversations import history, report, send, start_conversation, wait_for
 
@@ -29,7 +29,8 @@ async def decision_event(redis, tenant, conversation, *, status="approved", appr
 
 
 async def approval_tasks(redis) -> list[dict]:
-    return [f for _, f in await redis.xrange(TASK_STREAM) if f.get("kind") == "approval"]
+    streams = await redis.keys(task_stream("*"))  # the dedicated test database: only this test's tenant
+    return [f for stream in streams for _, f in await redis.xrange(stream) if f.get("kind") == "approval"]
 
 
 async def test_a_decision_opens_an_approval_turn_that_resumes_the_run(client, redis, tenant, login, admin_db):

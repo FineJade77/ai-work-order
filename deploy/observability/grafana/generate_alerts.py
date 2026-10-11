@@ -26,10 +26,11 @@ RULES = [
     {
         "uid": "ai-work-order-queue-backlog",
         "title": "任务队列积压",
-        "expr": 'max(app_queue_lag{messaging_destination_name="agent_tasks"})',
+        # One stream per tenant, and every replica reports the same values: max per tenant, then sum.
+        "expr": 'sum(max by (app_tenant_id) (app_queue_lag{messaging_destination_name="agent_tasks"}))',
         "op": "gt", "threshold": 20, "for": "5m", "severity": "warning",
         "summary": "agent_tasks 有 {{ printf \"%.0f\" $values.B.Value }} 条任务还没投递，持续 5 分钟",
-        "description": "worker 处理不过来或者没在消费：看 agent-runtime 副本数、KEDA 扩容，以及看板的'单次投递处理耗时'。",
+        "description": "worker 处理不过来或者没在消费：看 agent-runtime 副本数、KEDA 扩容，以及看板的'单次投递处理耗时'。如果积压集中在一个租户、它的并发名额贴着上限，那是它被自己的上限限住了（看板'各租户的积压'）。",
     },
     {
         "uid": "ai-work-order-stuck-task",

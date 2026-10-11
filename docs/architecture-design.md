@@ -23,7 +23,7 @@ API Gateway【V1 未部署：JWT 校验和发消息限流由 app-service 自己�
 app-service
   ├─ HTTP：员工"我的工单"、处理人处理（查询 / 状态流转）────────▶ ticket-service
   ├─ HTTP：处理人审批（列表 / 批准 / 拒绝）───────────────────▶ tool-gateway
-  ├─ XADD agent_tasks（同一事务提高会话下限）─────────────────▶ Redis
+  ├─ XADD agent_tasks:t:{租户}（同一脚本提高会话下限）────────▶ Redis
   ├─ 消费 agent_results：回复落库、关闭轮次 ◀───────────────── Redis
   ├─ 消费 approval_events：开审批轮次、投递恢复任务 ◀────────── Redis
   └─ 读 conversation:{id}:events，经 SSE 推给浏览器 ◀───────── Redis
@@ -47,7 +47,7 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
 | knowledge-service | 无（随镜像发布的静态 JSON） | 只读检索（3.6 节） |
 | ticket-service | Postgres `ticket_service` | 工单数据与生命周期的唯一所有者（3.7 节） |
 | observability | 容器内（重建即清空） | `grafana/otel-lgtm`：OTel Collector + Tempo + Prometheus + Loki + Grafana，各服务经 OTLP 上报（5 节） |
-| Redis | — | 任务队列 `agent_tasks`（含死信）、结果流 `agent_results`、每会话事件流、会话锁、会话下限、发消息限流计数；V1 不做会话缓存 |
+| Redis | — | 任务队列（每租户一条 `agent_tasks:t:{tenant}`，死信 `agent_tasks:dead`）、租户调度状态 `agent_sched:*`、结果流 `agent_results`、每会话事件流、会话锁、会话下限、发消息限流计数；V1 不做会话缓存 |
 
 - 向量库（知识库 V2）、对象存储（附件）【V1 未实现】。
 
@@ -70,7 +70,7 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
   - `Turn`：一条用户消息及其处理状态（`queued/done/failed`），`id` 就是投递给 Agent Runtime 的 `task_id`，`seq` 是它在会话内的序号（1、2、3…，唯一约束），`traceparent` 是创建它的请求的追踪上下文（补偿重投时接回同一条 trace）；部分唯一索引保证同一会话同时只有一轮在处理
   - 工单不在这里：归 ticket-service 所有（见 3.7 节）。员工"我的工单"、处理人处理工单的页面由应用服务调用 ticket-service 的内部接口实现，`start`/`resolve` 这类处理人操作的角色权限也在应用服务里判断。
 - 核心业务流程（问答、建单与办理的判断都在 Agent Runtime；应用服务只为处理人的审批操作调用 Tool Gateway）：
-  1. 员工发消息 → 在同一事务里写用户消息和 `Turn`，把任务投递到 `agent_tasks` → 返回 202。
+  1. 员工发消息 → 在同一事务里写用户消息和 `Turn`，把任务投递到该租户的任务队列 → 返回 202。
   2. Agent Runtime 执行状态图：检索知识库并回答、等员工反馈；要求提单、检索无命中或反馈没解决时，由 Agent 经 Tool Gateway 建单（3.3 节）。
   3. 应用服务把执行事件经 SSE 转给前端，并从 `agent_results` 把这一轮的回复（回答、固定回复或建单通知）落库、关闭轮次。
 - 登录与鉴权：`POST /v1/auth/login {tenant, email, password}`，先按 slug 查租户（`tenants` 无 RLS），再在租户作用域内查用户；三种失败统一 401，账号不存在时也做一次假校验，耗时一致。签发 HS256 JWT（`sub/tid/role`，8 小时，无刷新），之后所有接口的租户和用户只取自 JWT。scrypt 在线程里执行，并限制同时最多 4 个（每个约 128 MiB）。以后上 API Gateway 时改 RS256。
@@ -87,13 +87,13 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
 
 **部署模型：异步 Worker + 队列，而非同步长连接服务。**
 
-- 应用服务把任务写入 **Redis Streams**（全局一个 `agent_tasks` 队列），Agent Runtime 作为**无状态 Worker** 通过 Consumer Group 消费任务，一个任务对应一次 LangGraph 图的完整执行。
+- 应用服务把任务写入 **Redis Streams**（每个租户一条 `agent_tasks:t:{tenant}`，下文和 span、指标里统称 `agent_tasks`），Agent Runtime 作为**无状态 Worker** 通过 Consumer Group 消费任务，一个任务对应一次 LangGraph 图的完整执行。下一个任务取哪个租户的，由公平调度决定（见本节「租户公平调度」）。
 - 执行过程中，Worker 把中间事件（检索中、增量回答 token、工单已创建、结束）写入该会话自己的 **Redis Stream**（`conversation:{conversation_id}:events`，约 1000 条上限、24 小时过期），应用服务读取后转发给前端，从而在异步执行的同时保留流式体验。
   - 不用 Pub/Sub：Pub/Sub 发布时没有订阅者就丢，应用服务返回 202 到前端连上 SSE 之间的事件会丢失；Stream 可以从任意位置读，SSE 断线后可用 Last-Event-ID 续读，应用服务也能据此可靠地把回答落库。
 - 选择这个模型而非"应用服务同步调用、Agent Runtime 常驻等待"的原因：
   1. 一次 Agent 执行常包含多次工具调用 + 一次 LLM 生成，耗时数秒到十几秒；同步模型下每个进行中会话都要独占一个连接/线程直到图跑完，扩缩容单位变成"并发连接数"而非"实际计算负载"，HPA 难以精确伸缩。
   2. Worker 无状态、可随时重启，配合 LangGraph 的 checkpoint 机制，任务在 crash 后可从断点恢复，天然具备重试能力；同步模型下 Pod 重启会直接中断并丢失正在处理的会话。
-  3. 队列深度是比 CPU/内存更贴合负载本质的扩缩容信号，可用 **KEDA 的 redis-streams scaler** 按 `agent_tasks` 队列长度精确扩缩容 Worker 副本数。
+  3. 队列深度是比 CPU/内存更贴合负载本质的扩缩容信号，可用 **KEDA** 按 `agent_tasks` 的积压精确扩缩容 Worker 副本数（第 5 节）。
   4. 代价是多了一跳队列延迟（通常几十毫秒，相对 LLM 秒级延迟可忽略）和一套需要运维的组件；队列、事件流、会话锁都放在同一个 Redis 实例里，不新增基础设施种类。
 - 用 LangGraph 构建一个**固定状态图**（不做 ReAct 自由调工具：AI Gateway 只有文本流接口，V1 流程固定，固定图更可测），节点：
   1. `classify_intent`：LLM 只判断意图：`question`（求助/咨询）、`action`（要求直接替他办一件事，走下面的动作路径）、`ticket_request`（明确要求提单或转人工）、`chitchat`（寒暄或描述不清）。不判断领域和类别，提示词里不出现任何具体业务。输出解析失败按"描述不清"处理。进入分诊时清空上一个问题的检索结果和类别（同一轮里提出新问题时不继承）。
@@ -112,7 +112,7 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
   - 能自助解答的范围由租户的知识库决定，没有"场景内/场景外"清单：知识库没有的问题检索不到，就转人工。
   - 工单类别：来自命中条目的 `category`（租户自己的标签，如 `vpn`、`leave`、`expense`）；没检索过（直接要求提单）、没命中、或条目的类别为空/超过 50 字时用 `other`。检索过却没命中的工单，描述前加 `[知识库未命中]`。
 - 状态持久化：LangGraph checkpoint 存 **Postgres**（独立的 `agent_runtime` 库，`AsyncPostgresSaver`），`thread_id = conversation_id`，多轮历史就在图状态里，任务里只带最新一条消息。表结构由 langgraph-checkpoint-postgres 管理（迁移任务里跑 `setup()`，不走 Alembic）；表里没有 `tenant_id`，不做 RLS，只有 Agent Runtime 能连这个库。
-- 任务契约：`agent_tasks` 消息字段 `task_id, seq, conversation_id, tenant_id, user_id, content`；审批任务另有 `kind=approval, approval_id, decision, note`（`content` 为空）；没用到的字段不写；外加 W3C 追踪上下文 `traceparent`（有时还有 `tracestate`），由应用服务写入；`agent_results` 同样带上 Agent 运行的 `traceparent`；投递时在同一个 Redis 事务里把会话下限 `agent:floor:{conversation_id}` 提高到这个 `seq`（只升不降，24 小时过期）。调用 Tool Gateway 时 `session_id = conversation_id`，`user_id` 原样透传，`agent_role` 取配置（`service_agent`）。
+- 任务契约：`agent_tasks` 消息字段 `task_id, seq, conversation_id, tenant_id, user_id, content`；审批任务另有 `kind=approval, approval_id, decision, note`（`content` 为空）；没用到的字段不写；外加 W3C 追踪上下文 `traceparent`（有时还有 `tracestate`），由应用服务写入；`agent_results` 同样带上 Agent 运行的 `traceparent`；投递是一个 Lua 脚本：把会话下限 `agent:floor:{conversation_id}` 提高到这个 `seq`（只升不降，24 小时过期）、写入租户的 Stream、把租户登记为活跃、发唤醒信号。调用 Tool Gateway 时 `session_id = conversation_id`，`user_id` 原样透传，`agent_role` 取配置（`service_agent`）。
 - 崩溃恢复与不重复建单：
   - 每个任务结束时，在写 `done`/`error` 事件的同一个 Redis 事务里，向全局 `agent_results` Stream 写一条结果（状态、outcome、这一轮唯一的助手消息、ticket_id），应用服务用消费组消费并落库，不依赖浏览器是否还连着。
   - 图跑到结束或 interrupt、并写出 `done` 事件后才 XACK；未确认的消息空闲超过阈值后由任一 Worker 用 XAUTOCLAIM 接管，投递超过 3 次进死信 `agent_tasks:dead` 并写 `error` 事件。
@@ -124,6 +124,27 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
     2. 图状态里记录最近一轮的 `seq`（与 `task_id` 同时写入），`seq` 更小的任务跳过——Redis 丢了下限时的兜底。
   - 时序约束 `任务超时(60s) < 会话锁 TTL(75s) < 接管空闲阈值(90s)`，配置里强制校验：锁要比任何存活的运行更久；被 kill 的 Worker 留下的锁要在任务被接管前过期，否则接管会白白消耗投递次数。接管阈值同时大于 Tool Gateway 的 running 过期时间（60s）。
 - 预算用完：AI Gateway 返回 429 `TOKEN_BUDGET_EXCEEDED` 时，runner 用固定回复结束这一轮（outcome `budget_exceeded`），任务 ACK 不重试——当天再试也会被拒；不建单（写工单描述要用模型，且额度耗尽时自动建单会冲垮处理人的队列）。线程停在被拒的节点上，同一会话的下一条消息作为新输入会丢弃它。每次记 `budget_exceeded tenant_id=…` 的 ERROR 日志供告警。
+- **租户公平调度**：所有租户共用一条先进先出的队列时，一个租户积压几百条，其他租户的新消息就得排在它后面。现在每个租户一条 Stream，Worker 每次取任务时按起始时间公平队列（SFQ）选租户，另外限制每个租户同时运行的任务数。
+  - Redis 里的状态：
+    - `agent_tasks:t:{tenant}`：租户的任务 Stream，消费组都是 `agent_runtime`（第一次取任务时创建）；
+    - `agent_sched:active`（ZSET）：有未投递任务的租户，score 是它下一条任务的虚拟开始时间；
+    - `agent_sched:tenants`（ZSET）：出现过的所有租户，score 是它已经被服务到的虚拟时间；接管、退出消费组、队列监控都按它遍历；
+    - `agent_sched:vtime`：全局虚拟时间，等于最近一次被服务的任务的虚拟开始时间；
+    - `agent_sched:leases:{tenant}`（ZSET）：该租户正在运行的任务，score 是租约到期时间；
+    - `agent_sched:wake`（Stream，约 100 条）：唤醒信号。
+  - 投递（应用服务的 Lua 脚本）：写入任务后，如果租户不在 `active` 里，就以 `max(全局虚拟时间, 它上次被服务到的虚拟时间)` 加入——空闲期间不攒额度，回来后不能连续插队；也不会因为清空过队列就把刚用掉的份额抹掉。
+  - 取任务（Worker 的 Lua 脚本 `pick`，一次调用取满空闲的并发槽）：按 score 从小到大看 `active` 里的租户，清掉它过期的租约；占用数达到上限就跳过（留在 `active` 里）；否则 `XREADGROUP COUNT 1`，队列里没有未投递的就把它移出 `active`，取到就写一条租约，并把它的虚拟时间设为 `max(全局虚拟时间, 自己的) + 1/权重`。取 `max` 是为了让被自己的上限卡住的租户不把那段时间攒成额度。必须是一个脚本：选租户、取任务、推进虚拟时间分开做的话，几个 Worker 会同时选中同一个租户。
+  - 效果：积压的租户之间按权重轮流，租户内部仍然先进先出；一个租户有 50 条积压、另一个刚发来 2 条，接下来取 4 条是各 2 条。
+  - **并发上限与租约**：公平队列只管取任务的顺序，不管一个租户同时占着多少个 Worker——任务都很慢的租户仍然能把所有副本占满。所以每个租户同时运行的任务数有上限（跨所有副本，默认 8，即一个副本的量）。名额用带到期时间的租约而不是计数器：Worker 被强杀时来不及把计数减回去，名额会永久泄漏；租约到期（75 秒，大于任务超时，配置里强制校验，所以活着的运行不需要续期）后下一次 `pick` 就把它清掉。Worker 处理完一次投递就释放名额，不管结果如何（确认、死信、会话忙、稍后重试、出错）；交还任务时也释放。释放时如果这个租户还有任务在等，就发唤醒信号。接管来的任务直接拿租约、不受上限限制：它之前已经被放行过。
+  - 租户配置：权重默认 1，上限默认取 `TENANT_MAX_CONCURRENCY`（0 为不限）。单个租户在 Redis 里覆盖，下一次取任务就生效：`HSET agent_sched:weight <租户 ID> 2`、`HSET agent_sched:max_concurrency <租户 ID> 16`。配置放在 Redis 里是因为 `pick` 要在脚本里读它；Redis 数据丢了就回到默认值。
+  - 空闲的 Worker 阻塞在 `agent_sched:wake` 上（最长 5 秒），投递和释放名额都会写它。Worker 记着自己读到的位置，并且在第一次取任务之前就读好，所以不会漏掉"刚查完没任务、任务就来了"的那一次唤醒。一条唤醒会叫醒所有空闲的 Worker，没抢到的再去等，这点开销在目前的规模下可以忽略。
+  - 接管按租户进行：每 10 秒一轮，对每个租户的 Stream 各做一次 `XAUTOCLAIM`。死信仍是一条 `agent_tasks:dead`，多记一个 `source_tenant`。停机时在每个租户的消费组里各退出一次。
+  - 代价与限制：
+    - `pick` 脚本访问的 key 是运行时拼出来的，不能用于 Redis Cluster（当前是单实例）；
+    - 并发上限不是"有空闲就用"：只有一个租户活跃时，超出上限的 Worker 会闲着；它的积压还会让 KEDA 扩出帮不上忙的副本，这时应该调高它的上限；
+    - 接管、监控的开销随租户数线性增长，租户上千时要改成只扫有待确认消息的租户；
+    - 调度状态和任务在同一个 Redis 里，一起丢、一起在；如果只丢了 `active`，租户下一次投递或应用服务的补偿重投会把它加回来。
+  - 切换：直接切，没有新旧队列双读。滚动发布期间写进旧 `agent_tasks` 的任务没人消费，由应用服务的补偿在 10 分钟后重投到新队列。
 - 进程形态：单进程内按信号量并发跑多个任务（默认 8，都是 IO 等待）；`/livez`、`/readyz` 只给探针用，不建 Service。任务队列放在 `TaskQueue` 接口后面，以后换 RabbitMQ 只改这一层。
 - **优雅停机**（滚动发布、KEDA 缩容、节点排空都会发 SIGTERM）：uvicorn 进入 lifespan 关闭，`TaskConsumer.stop()`：
   1. 停止取新任务。正在进行的阻塞读不取消（shield），最多 5 秒后返回，它带回、还没开始的任务直接交还；
@@ -141,6 +162,14 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
   | 强杀（SIGKILL，对照） | 1 → 2 | 被杀的任务仍要等 90 秒被接管，这是接管机制的正常行为 | |
 
   停机时间临时设成 1 秒时，任务确实被截断并交还（3 次）：别的副本从 checkpoint 续跑，投递次数不变，最长的一轮 10.6 秒。滚动重启之后的 p95 约 10 秒，来自重启期间少一个副本造成的排队。
+- 吵闹邻居演练 `scripts/chaos.py noisy`：3 个副本（共 24 个并发槽），demo 租户在 2 秒内发 80 条消息，northwind 租户随后每 1.5 秒发 1 条、共 8 条，用真实模型；排队时间取自每个任务第一次投递的 `app.queue_wait_ms`。实现公平调度前后的对比：
+
+  | 租户 | 排队时间 p50 / p95（前 → 后） | 轮次耗时 p50 / p95（前 → 后） |
+  |---|---|---|
+  | northwind（安静） | 24.5s / 26.0s → 0.0s / 0.0s | 39.8s / 42.5s → 26.9s / 30.2s |
+  | demo（吵闹） | 9.7s / 24.5s → 27.7s / 45.0s | 41.1s / 44.3s → 45.0s / 50.8s |
+
+  安静租户不再排在吵闹租户的积压后面。吵闹租户被并发上限（8）限住，自己排得更久，这是有意的代价：没有上限时它会占满 24 个槽。安静租户的轮次耗时里剩下的二十多秒不是排队：从 trace 看，时间花在运行本身——十几轮同时跑时，本机上单进程的 app-service、ai-gateway 和模型调用都变慢（要靠后面的模拟模型和压测来分清各占多少）。
 - 多租户：图的运行时上下文携带 `tenant_id`，所有工具调用、模型调用都需透传。租户级差异 V1 只有两处：知识库内容（knowledge-service 按租户分组）和工具绑定（Tool Gateway `role_tool_bindings`）；按租户自定义系统提示词、模型档位【V1 未实现】，提示词写死在 `app/graph/prompts.py`。
 - 助手身份和回复文案是通用的（"员工服务助手"、"已转给相关同事"），不提 IT；按租户自定义助手名称和开场白【V1 未实现】。
 
@@ -228,7 +257,7 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
 
 - 目标：**云无关，基于标准 Kubernetes**，不绑定具体云厂商托管服务，便于跨云/私有化部署。
 - 组件容器化，每个逻辑组件（API Gateway 除外，用 Ingress Controller）独立部署：`app-service`（Deployment，处理 HTTP/SSE）、`agent-runtime`（Deployment，作为 **无状态 Worker** 消费队列，不建 Service）、`tool-gateway`、`ai-gateway`、`knowledge-service`、`ticket-service`。
-- 弹性扩缩容（`deploy/k8s/components/autoscaling`，默认不启用）：五个 HTTP 服务（`app-service`、`tool-gateway`、`ai-gateway`、`knowledge-service`、`ticket-service`）用标准 **HPA**（CPU）；`agent-runtime` 用 **KEDA 的 redis-streams scaler**，按 `agent_tasks` 尚未投递的积压（`lagCount`，而不是 pending 数：每个副本最多同时处理 8 个，pending 会卡在 8 × 副本数）扩缩容 Worker 副本，负载突增（如上班早高峰集中反馈 VPN 问题）时可快速扩容，队列清空后缩回最小副本数（1）。缩容放慢：稳定窗口 300 秒、每分钟最多减 2 个，因为每减一个 Pod 都要先等它手上的任务跑完，积压短暂回落时也不必先缩再扩。
+- 弹性扩缩容（`deploy/k8s/components/autoscaling`，默认不启用）：五个 HTTP 服务（`app-service`、`tool-gateway`、`ai-gateway`、`knowledge-service`、`ticket-service`）用标准 **HPA**（CPU）；`agent-runtime` 用 **KEDA 的 Prometheus 触发器**，按所有租户尚未投递的积压之和（`sum(max by (app_tenant_id) (app_queue_lag))`，而不是 pending 数：每个副本最多同时处理 8 个，pending 会卡在 8 × 副本数）扩缩容 Worker 副本——任务队列是每租户一条 Stream，redis-streams scaler 只能看一条，所以改看指标，代价是扩缩容依赖 Prometheus（开发集群用 `components/observability`），反应也慢一个采样周期（15 秒）；被自己的并发上限卡住的租户同样算积压，这部分加副本也消不掉；负载突增（如上班早高峰集中反馈 VPN 问题）时可快速扩容，队列清空后缩回最小副本数（1）。缩容放慢：稳定窗口 300 秒、每分钟最多减 2 个，因为每减一个 Pod 都要先等它手上的任务跑完，积压短暂回落时也不必先缩再扩。
 - agent-runtime 的发布与中断（清单在 `deploy/k8s/base/agent-runtime.yaml`）：滚动发布 `maxSurge: 1, maxUnavailable: 0`（新 Pod 先接活，旧 Pod 再停）；`terminationGracePeriodSeconds: 90`，大于停机等待时间；PodDisruptionBudget 用 `maxUnavailable: 1`（节点排空时一次只驱逐一个；用 `minAvailable: 1` 的话，单副本时会让所有节点排空都卡住）；startupProbe 覆盖启动时连接 Redis 和 Postgres 的时间。compose 里对应的是 `stop_grace_period: 90s`（默认 10 秒会在停机中途 SIGKILL）。
 - 有状态依赖（PostgreSQL、Redis、向量库）优先使用云无关 Operator（如 CloudNativePG、Redis Operator）或直接对接任意云厂商的托管兼容服务，业务代码只依赖标准协议（Postgres wire protocol / Redis protocol），不绑定专有 SDK。
 - 可观测性：全部基于 OpenTelemetry，业务代码只依赖 OTel API，后端可换（Jaeger、SigNoz、云厂商）只改 Collector。分三个阶段：
@@ -249,7 +278,7 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
     - `scripts/show-trace.py` 把一条 trace 打印成缩进的调用树，方便不开 Grafana 时查看。
   - **阶段 3（已完成）指标、看板、告警**：
     - 指标都用 OTel metrics API，经同一条 OTLP 管道进 Prometheus（名字转换：点变下划线、单位成后缀、计数器加 `_total`）。标签只用低基数的：租户、结果、节点、意图、工具；`user_id`/`task_id`/`conversation_id` 只放 trace 和日志。直方图用显式分桶（advisory），SDK 默认分桶是给毫秒用的。
-    - agent-runtime：`app.task.deliveries`/`app.task.duration`（按 `app.result`：run 的 outcome，或 conversation_busy、skipped_stale、retry_later、dead_letter、error）、`app.queue.wait`、`app.node.duration`、`app.agent.intents`、`app.knowledge.searches`（hit/miss/unavailable）；队列 gauge（`app.queue.lag`/`pending`/`oldest_pending_age`/`dead_letters`）由 `QueueMonitor` 每 15 秒采样 Redis（XINFO/XPENDING/XLEN），每个副本报同样的值，查询用 max。
+    - agent-runtime：`app.task.deliveries`/`app.task.duration`（按 `app.result`：run 的 outcome，或 conversation_busy、skipped_stale、retry_later、dead_letter、error）、`app.queue.wait`、`app.node.duration`、`app.agent.intents`、`app.knowledge.searches`（hit/miss/unavailable）（`app.queue.wait` 带租户标签，看得出谁在排队）；队列 gauge（`app.queue.lag`/`pending`/`oldest_pending_age`/`dead_letters`，任务队列的按租户上报，整条队列的积压是各租户之和；另有 `app.queue.tenant_slots`：每个租户占用的并发名额）由 `QueueMonitor` 每 15 秒采样 Redis（XINFO/XPENDING/XLEN），每个副本报同样的值，查询用 max。
     - ai-gateway：GenAI 标准指标 `gen_ai.client.token.usage`（按 `gen_ai.token.type`）、`gen_ai.client.operation.duration`，加 `app.genai.time_to_first_token`；`app.budget.refusals`、`app.budget.utilization`（每次预算检查时更新的 gauge）。
     - app-service：`app.turn.duration`——从存下员工消息到存下回复，中间的排队、重试、重投全算在内，SLO 就算在它上面（分桶含 30 秒边界）；只在一轮第一次完成时记录，重复投递的结果不重复计。另有 `app.turn.requeues`、`app.rate_limit.refusals`、`app.sse.connections`。
     - tool-gateway：`app.tool.calls`/`app.tool.call.duration`，标签同审计行（工具、状态、错误码）；审批：`app.approvals.requested`、`app.approvals.decided`（按 `app.decision`：approved/rejected/expired，过期由 relay 记）、`app.approval.decision_time`（申请到决定，分桶 10 秒到 24 小时）；`app.approvals.pending`/`oldest_pending_age` 由发件箱 relay 每轮采样。一条审批"待决定"恰好等于它的到期检查记录还没完成（处理人决定时同一事务里把那条记录标记完成），发件箱表不开 RLS，所以一条 `GROUP BY tenant_id` 就能跨租户统计；每个副本报同样的值，查询用 max。
@@ -297,6 +326,7 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
 - 数据：同一 Postgres 实例、每服务独立 database，库内 `tenant_id` + RLS 隔离；服务间不共享表和模型代码，没有 `libs/shared`（见第 4 节）。
 - Tool Gateway：REST 策略网关；工具调用限流 V1 暂不做。HITL 审批在 Tool Gateway 做成按租户的策略（`requires_approval`），而不是写在 Agent 的图里：策略、审计和"最多执行一次"都由网关保证，Agent 只负责暂停与恢复；决定经事务性发件箱以事件发出，由应用服务开审批轮次恢复运行（见 3.2–3.4 节）。
 - 队列服务：Redis Streams（与事件流、会话锁共用一个 Redis 实例）。对比过 RabbitMQ/RocketMQ：规模用不上、事件回传仍需 Redis，V1 不引入；Redis 可能丢消息的问题由应用服务记录任务状态并重新入队弥补（阶段 5）。
+- 租户公平调度：每租户一条 Stream，取任务时用 Lua 脚本按 SFQ 选租户，每租户并发上限用带到期时间的租约；权重和上限在 Redis hash 里按租户覆盖；KEDA 改用 Prometheus 触发器（见 3.3 节、第 5 节）。没有选"每租户一个消费者池"：租户数是动态的，按租户起 Worker 既浪费又要另做编排。
 - AI Gateway：服务令牌鉴权，只有 Agent Runtime 可调用。
 - 成本防护：应用服务按员工限制发消息频率，AI Gateway 按租户设每日 token 预算（软上限，可按租户覆盖）；预算用完固定回复、不建单（见 3.2、3.3、3.5 节）。
 - 部署：V1 用 Kustomize 清单，dev overlay 自带单实例 Postgres/Redis；生产换 Operator 或托管服务（见第 5 节）。
@@ -304,7 +334,7 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
 
 ## 10. 未完成事项（待办）
 
-每一项写明现状和打算怎么做；建议的先后顺序和验收要点见实现计划的"待办（未排期）"一节。项目定位是学习 Agent 的部署、调度、队列、HITL 和可观测性，所以平台能力（10.2）排在业务功能（10.1）前面。已经完成的部分见实现计划阶段 0–9。
+每一项写明现状和打算怎么做；建议的先后顺序和验收要点见实现计划的"待办（未排期）"一节。项目定位是学习 Agent 的部署、调度、队列、HITL 和可观测性，所以平台能力（10.2）排在业务功能（10.1）前面。已经完成的部分见实现计划阶段 0–10。
 
 ### 10.1 业务功能
 
@@ -397,17 +427,6 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
   - 要做：Redis 用 Sentinel 或托管服务（Streams 需要 AOF）；Postgres 用 CloudNativePG 或托管服务（第 5 节）。
 
 **调度**
-- **租户公平调度**（方案已经出过，暂缓）：
-  - 现状：所有租户共用一条先进先出的 `agent_tasks`，一个租户积压会拖慢所有租户。
-  - 方案：
-    - 每个租户一条 Stream（`agent_tasks:t:{tenant}`）；
-    - 投递时用 Lua 脚本原子地写入任务、登记活跃租户（ZSET，score 为虚拟时间，新加入的租户从当前虚拟时间开始，不能攒额度插队）、发唤醒信号；
-    - Worker 用一个 Lua 脚本 `pick` 按加权公平队列（SFQ）选租户并 `XREADGROUP COUNT 1`；
-    - 每租户的全局并发上限用带过期的租约 ZSET，Worker 崩溃后名额自动释放；
-    - 空闲的 Worker 在唤醒 Stream 上阻塞等待；
-    - 接管、死信、补偿重投和队列监控改成按租户处理；
-    - KEDA 改用 Prometheus 触发器，看所有租户积压的总和。
-  - 待定：要不要按租户设权重、并发上限的默认值。
 - **延迟任务**：
   - 用途：上面的会话提醒和自动结束、审批到期提醒。
   - 做法：每个对象一个定时器，懒取消。存 Redis ZSET 用 Lua 挪进 Stream，或者存 Postgres 表按 `due_at` 取（和审批过期同一个模式）。
@@ -415,6 +434,7 @@ agent-runtime（LangGraph 固定状态图，无状态 Worker，多副本）
   - 用途：已解决工单自动关闭、数据清理。
   - 做法：Kubernetes CronJob（`concurrencyPolicy: Forbid`、`startingDeadlineSeconds`，任务本身幂等），本地用 `docker compose run` 执行。
 - **按任务类型的优先级**：例如审批恢复插队、交互轮次优先于批处理。
+- **公平调度的后续**：按租户设权重和上限现在要直接改 Redis，等有了租户管理后台（10.1）再放进去；租户很多时接管和监控改成只扫有待确认消息的租户；需要 Redis Cluster 时，把调度状态放进同一个 hash tag，或者改成每个分片各自调度。
 
 **队列运维**
 - **死信重放**：

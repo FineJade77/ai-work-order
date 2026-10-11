@@ -68,3 +68,4 @@ spec:
     - {name: grafana, port: 3000, targetPort: grafana}
     - {name: otlp-grpc, port: 4317, targetPort: otlp-grpc}
     - {name: otlp-http, port: 4318, targetPort: otlp-http}
+    - {name: prometheus, port: 9090, targetPort: 9090}  # queried by KEDA (components/autoscaling)

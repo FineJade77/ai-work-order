@@ -64,6 +64,12 @@ def q(p: float, metric: str, by: str = "", selector: str = T) -> str:
     return f"histogram_quantile({p}, sum by ({group}) (rate({metric}_bucket{selector}[{RI}])))"
 
 
+def _queue_total(metric: str) -> str:
+    """A queue gauge per stream. Series of the task queue carry a tenant; the other streams don't."""
+    return (f"sum by (messaging_destination_name) "
+            f"(max by (messaging_destination_name, app_tenant_id) ({metric}))")
+
+
 tenant_var = {
     "name": "tenant", "label": "租户", "type": "query", "datasource": PROM,
     "query": {"query": "label_values(app_turn_duration_seconds_count, app_tenant_id)", "refId": "tenant"},
@@ -93,15 +99,25 @@ y += 8
 
 panels.append(row("任务队列（Redis Streams）", y)); y += 1
 panels += [
-    ts("积压与待确认", [("max by (messaging_destination_name) (app_queue_lag)", "积压 {{messaging_destination_name}}"),
-                   ("max by (messaging_destination_name) (app_queue_pending)", "待确认 {{messaging_destination_name}}")],
-       0, y, description="积压：还没投递给消费组；待确认：已投递、还没 ACK（正在处理，或 worker 崩溃后等接管）。每个副本都上报同样的值，所以取 max。"),
+    ts("积压与待确认", [(_queue_total("app_queue_lag"), "积压 {{messaging_destination_name}}"),
+                   (_queue_total("app_queue_pending"), "待确认 {{messaging_destination_name}}")],
+       0, y, description="积压：还没投递给消费组；待确认：已投递、还没 ACK（正在处理，或 worker 崩溃后等接管）。每个副本都上报同样的值，所以先取 max；agent_tasks 是每租户一条 Stream，再把各租户加起来。"),
     ts("最老的待确认消息已等待", [("max by (messaging_destination_name) (app_queue_oldest_pending_age_seconds)",
                           "{{messaging_destination_name}}")], 8, y, unit="s",
        description="超过接管阈值（90s）还在涨，说明任务反复失败或 worker 卡住。"),
     stat("死信", "max(app_queue_dead_letters)", 16, y, w=4, h=8,
          thresholds=[(None, "green"), (1, "red")]),
-    stat("排队 p95", q(0.95, "app_queue_wait_seconds", selector=""), 20, y, w=4, h=8, unit="s"),
+    stat("排队 p95", q(0.95, "app_queue_wait_seconds"), 20, y, w=4, h=8, unit="s"),
+]
+y += 8
+# Fair scheduling: each tenant has its own stream and a limit on how many of its tasks run at once.
+panels += [
+    ts("各租户的积压", [(f"max by (app_tenant_id) (app_queue_lag{T})", "{{app_tenant_id}}")], 0, y,
+       description="一个租户积压很多、别的租户为 0，是公平调度在起作用：它的任务只排在自己后面。"),
+    ts("各租户占用的并发名额", [(f"max by (app_tenant_id) (app_queue_tenant_slots{T})", "{{app_tenant_id}}")], 8, y,
+       description="每个租户同时运行的任务数，上限默认 8（TENANT_MAX_CONCURRENCY，可按租户覆盖）。长时间贴着上限且有积压，说明这个租户被自己的上限限住了。"),
+    ts("排队 p95（按租户）", [(q(0.95, "app_queue_wait_seconds", by="app_tenant_id"), "{{app_tenant_id}}")], 16, y,
+       unit="s", description="从入队到被取走。吵闹的租户排队变长，其他租户应保持平稳。"),
 ]
 y += 8
 panels += [

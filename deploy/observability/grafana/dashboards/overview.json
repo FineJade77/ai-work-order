@@ -313,7 +313,7 @@
       "type": "timeseries",
       "title": "积压与待确认",
       "id": 7,
-      "description": "积压：还没投递给消费组；待确认：已投递、还没 ACK（正在处理，或 worker 崩溃后等接管）。每个副本都上报同样的值，所以取 max。",
+      "description": "积压：还没投递给消费组；待确认：已投递、还没 ACK（正在处理，或 worker 崩溃后等接管）。每个副本都上报同样的值，所以先取 max；agent_tasks 是每租户一条 Stream，再把各租户加起来。",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -354,7 +354,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "max by (messaging_destination_name) (app_queue_lag)",
+          "expr": "sum by (messaging_destination_name) (max by (messaging_destination_name, app_tenant_id) (app_queue_lag))",
           "legendFormat": "积压 {{messaging_destination_name}}",
           "refId": "A"
         },
@@ -363,7 +363,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "max by (messaging_destination_name) (app_queue_pending)",
+          "expr": "sum by (messaging_destination_name) (max by (messaging_destination_name, app_tenant_id) (app_queue_pending))",
           "legendFormat": "待确认 {{messaging_destination_name}}",
           "refId": "B"
         }
@@ -526,7 +526,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(app_queue_wait_seconds_bucket[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(app_queue_wait_seconds_bucket{app_tenant_id=~\"$tenant\"}[$__rate_interval])))",
           "refId": "A",
           "instant": true
         }
@@ -534,8 +534,161 @@
     },
     {
       "type": "timeseries",
-      "title": "每分钟投递（按结果）",
+      "title": "各租户的积压",
       "id": 11,
+      "description": "一个租户积压很多、别的租户为 0，是公平调度在起作用：它的任务只排在自己后面。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 18
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (app_tenant_id) (app_queue_lag{app_tenant_id=~\"$tenant\"})",
+          "legendFormat": "{{app_tenant_id}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "各租户占用的并发名额",
+      "id": 12,
+      "description": "每个租户同时运行的任务数，上限默认 8（TENANT_MAX_CONCURRENCY，可按租户覆盖）。长时间贴着上限且有积压，说明这个租户被自己的上限限住了。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 18
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (app_tenant_id) (app_queue_tenant_slots{app_tenant_id=~\"$tenant\"})",
+          "legendFormat": "{{app_tenant_id}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "排队 p95（按租户）",
+      "id": 13,
+      "description": "从入队到被取走。吵闹的租户排队变长，其他租户应保持平稳。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 18
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le, app_tenant_id) (rate(app_queue_wait_seconds_bucket{app_tenant_id=~\"$tenant\"}[$__rate_interval])))",
+          "legendFormat": "{{app_tenant_id}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "每分钟投递（按结果）",
+      "id": 14,
       "description": "结果是 run 的 outcome，或 conversation_busy / skipped_stale / retry_later / dead_letter / error。",
       "datasource": {
         "type": "prometheus",
@@ -545,7 +698,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 18
+        "y": 26
       },
       "fieldConfig": {
         "defaults": {
@@ -586,7 +739,7 @@
     {
       "type": "timeseries",
       "title": "单次投递处理耗时 p95（按结果）",
-      "id": 12,
+      "id": 15,
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -596,7 +749,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 18
+        "y": 26
       },
       "fieldConfig": {
         "defaults": {
@@ -637,20 +790,20 @@
     {
       "type": "row",
       "title": "Agent（LangGraph）",
-      "id": 13,
+      "id": 16,
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 26
+        "y": 34
       },
       "panels": []
     },
     {
       "type": "timeseries",
       "title": "节点耗时 p95",
-      "id": 14,
+      "id": 17,
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -660,7 +813,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 27
+        "y": 35
       },
       "fieldConfig": {
         "defaults": {
@@ -701,7 +854,7 @@
     {
       "type": "timeseries",
       "title": "每分钟分诊意图",
-      "id": 15,
+      "id": 18,
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -711,7 +864,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 27
+        "y": 35
       },
       "fieldConfig": {
         "defaults": {
@@ -752,7 +905,7 @@
     {
       "type": "timeseries",
       "title": "每分钟知识检索（按结果）",
-      "id": 16,
+      "id": 19,
       "description": "miss 会自动建单；unavailable 是检索失败后的降级（有告警）。",
       "datasource": {
         "type": "prometheus",
@@ -762,7 +915,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 27
+        "y": 35
       },
       "fieldConfig": {
         "defaults": {
@@ -803,20 +956,20 @@
     {
       "type": "row",
       "title": "大模型（ai-gateway，OTel GenAI 指标）",
-      "id": 17,
+      "id": 20,
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 35
+        "y": 43
       },
       "panels": []
     },
     {
       "type": "timeseries",
       "title": "每分钟 token（按类型）",
-      "id": 18,
+      "id": 21,
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -826,7 +979,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 36
+        "y": 44
       },
       "fieldConfig": {
         "defaults": {
@@ -867,7 +1020,7 @@
     {
       "type": "timeseries",
       "title": "模型调用耗时与首 token p95",
-      "id": 19,
+      "id": 22,
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -877,7 +1030,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 36
+        "y": 44
       },
       "fieldConfig": {
         "defaults": {
@@ -927,7 +1080,7 @@
     {
       "type": "timeseries",
       "title": "预算使用率（按租户）",
-      "id": 20,
+      "id": 23,
       "description": "1 = 当天预算用完；80% 以上告警。",
       "datasource": {
         "type": "prometheus",
@@ -937,7 +1090,7 @@
         "h": 8,
         "w": 5,
         "x": 16,
-        "y": 36
+        "y": 44
       },
       "fieldConfig": {
         "defaults": {
@@ -978,7 +1131,7 @@
     {
       "type": "stat",
       "title": "预算拒绝（24h）",
-      "id": 21,
+      "id": 24,
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -988,7 +1141,7 @@
         "h": 8,
         "w": 3,
         "x": 21,
-        "y": 36
+        "y": 44
       },
       "fieldConfig": {
         "defaults": {
@@ -1036,20 +1189,20 @@
     {
       "type": "row",
       "title": "入口与工具",
-      "id": 22,
+      "id": 25,
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 44
+        "y": 52
       },
       "panels": []
     },
     {
       "type": "timeseries",
       "title": "HTTP 请求/秒（按服务）",
-      "id": 23,
+      "id": 26,
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -1059,7 +1212,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 45
+        "y": 53
       },
       "fieldConfig": {
         "defaults": {
@@ -1100,7 +1253,7 @@
     {
       "type": "timeseries",
       "title": "HTTP 5xx 比例（按服务）",
-      "id": 24,
+      "id": 27,
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -1110,7 +1263,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 45
+        "y": 53
       },
       "fieldConfig": {
         "defaults": {
@@ -1151,7 +1304,7 @@
     {
       "type": "timeseries",
       "title": "每分钟限流拒绝 / 在线 SSE 连接",
-      "id": 25,
+      "id": 28,
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -1161,7 +1314,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 45
+        "y": 53
       },
       "fieldConfig": {
         "defaults": {
@@ -1211,7 +1364,7 @@
     {
       "type": "timeseries",
       "title": "每分钟工具调用（按工具与状态）",
-      "id": 26,
+      "id": 29,
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -1221,7 +1374,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 45
+        "y": 53
       },
       "fieldConfig": {
         "defaults": {
@@ -1262,20 +1415,20 @@
     {
       "type": "row",
       "title": "审批（HITL）",
-      "id": 27,
+      "id": 30,
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 53
+        "y": 61
       },
       "panels": []
     },
     {
       "type": "stat",
       "title": "待审批",
-      "id": 28,
+      "id": 31,
       "description": "等待处理人审批的工具调用",
       "datasource": {
         "type": "prometheus",
@@ -1285,7 +1438,7 @@
         "h": 8,
         "w": 4,
         "x": 0,
-        "y": 54
+        "y": 62
       },
       "fieldConfig": {
         "defaults": {
@@ -1337,7 +1490,7 @@
     {
       "type": "stat",
       "title": "最久等待",
-      "id": 29,
+      "id": 32,
       "description": "最老的待审批已等待多久；超过 1 小时会告警",
       "datasource": {
         "type": "prometheus",
@@ -1347,7 +1500,7 @@
         "h": 8,
         "w": 4,
         "x": 4,
-        "y": 54
+        "y": 62
       },
       "fieldConfig": {
         "defaults": {
@@ -1399,7 +1552,7 @@
     {
       "type": "timeseries",
       "title": "每小时审批（申请 / 按结果）",
-      "id": 30,
+      "id": 33,
       "description": "approved / rejected 由处理人决定，expired 为超时未处理",
       "datasource": {
         "type": "prometheus",
@@ -1409,7 +1562,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 54
+        "y": 62
       },
       "fieldConfig": {
         "defaults": {
@@ -1459,7 +1612,7 @@
     {
       "type": "timeseries",
       "title": "审批耗时 p50 / p95（申请到决定）",
-      "id": 31,
+      "id": 34,
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -1469,7 +1622,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 54
+        "y": 62
       },
       "fieldConfig": {
         "defaults": {

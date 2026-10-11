@@ -12,15 +12,27 @@ from app.metrics import QueueMonitor
 from app.tracing import inject_into
 from app.worker.consumer import TaskConsumer
 from app.worker.locks import ConversationLock
-from app.worker.queue import CONSUMER_GROUP, DEAD_LETTER_STREAM, TASK_STREAM, RedisStreamTaskQueue, floor_key
+from app.worker.queue import (
+    ACTIVE_TENANTS,
+    CONSUMER_GROUP,
+    DEAD_LETTER_STREAM,
+    KNOWN_TENANTS,
+    VIRTUAL_TIME,
+    WAKE_STREAM,
+    RedisStreamTaskQueue,
+    floor_key,
+    task_stream,
+)
 from tests.conftest import metric_total
 from tests.fakes import make_task
 
 pytestmark = pytest.mark.anyio
 
 
-def queue(redis, consumer="c1", idle_ms=300):
-    return RedisStreamTaskQueue(redis, consumer, claim_idle_ms=idle_ms, claim_interval_s=0)
+def queue(redis, consumer="c1", idle_ms=300, max_concurrency=0, lease_ms=60_000):
+    return RedisStreamTaskQueue(
+        redis, consumer, claim_idle_ms=idle_ms, max_concurrency=max_concurrency, lease_ms=lease_ms, claim_interval_s=0
+    )
 
 
 def task_fields(task) -> dict[str, str]:
@@ -28,8 +40,36 @@ def task_fields(task) -> dict[str, str]:
     return {k: str(v) for k, v in task.model_dump().items() if v is not None}
 
 
+# app-service's enqueue script (app-service/app/clients/agent_bus.py), without the floor.
+_ENQUEUE = """
+local id = redis.call('XADD', KEYS[1], '*', unpack(ARGV, 2))
+if not redis.call('ZSCORE', KEYS[2], ARGV[1]) then
+  local vtime = tonumber(redis.call('GET', KEYS[4]) or '0')
+  local served = tonumber(redis.call('ZSCORE', KEYS[3], ARGV[1]) or '0')
+  local start = string.format('%.17g', math.max(vtime, served))
+  redis.call('ZADD', KEYS[2], start, ARGV[1])
+  redis.call('ZADD', KEYS[3], start, ARGV[1])
+end
+redis.call('XADD', KEYS[5], 'MAXLEN', '~', 100, '*', 'tenant', ARGV[1])
+return id
+"""
+
+
+async def enqueue(redis, fields: dict[str, str], tenant: object = None) -> str:
+    """Puts a message on its tenant's stream as app-service does. Returns its id."""
+    tenant = str(tenant or fields["tenant_id"])
+    return await redis.eval(
+        _ENQUEUE, 5, task_stream(tenant), ACTIVE_TENANTS, KNOWN_TENANTS, VIRTUAL_TIME, WAKE_STREAM,
+        tenant, *(item for pair in fields.items() for item in pair),
+    )
+
+
 async def pending_count(redis):
-    return (await redis.xpending(TASK_STREAM, CONSUMER_GROUP))["pending"]
+    """Delivered and not yet acknowledged, over every tenant's stream."""
+    total = 0
+    for tenant in await redis.zrange(KNOWN_TENANTS, 0, -1):
+        total += (await redis.xpending(task_stream(tenant), CONSUMER_GROUP))["pending"]
+    return total
 
 
 class FakeRunner:
@@ -47,7 +87,7 @@ class FakeRunner:
 async def test_acked_task_is_not_redelivered(redis):
     q = queue(redis)
     await q.setup()
-    await redis.xadd(TASK_STREAM, task_fields(make_task(uuid.uuid4(), "hi")))
+    await enqueue(redis, task_fields(make_task(uuid.uuid4(), "hi")))
     [delivery] = await q.receive(4, block_ms=100)
     assert delivery.attempt == 1
     await q.ack(delivery)
@@ -59,7 +99,7 @@ async def test_acked_task_is_not_redelivered(redis):
 async def test_abandoned_task_is_reclaimed_by_another_consumer(redis):
     first, second = queue(redis, "c1"), queue(redis, "c2")
     await first.setup()
-    msg_id = await redis.xadd(TASK_STREAM, task_fields(make_task(uuid.uuid4(), "hi")))
+    msg_id = await enqueue(redis, task_fields(make_task(uuid.uuid4(), "hi")))
     await first.receive(4, block_ms=100)  # c1 "crashes" without acknowledging
 
     assert await second.receive(4, block_ms=100) == []  # not idle long enough yet
@@ -72,7 +112,7 @@ async def test_abandoned_task_is_reclaimed_by_another_consumer(redis):
 async def test_only_a_finished_run_is_acknowledged(redis, settings, raises, acked):
     q = queue(redis)
     await q.setup()
-    await redis.xadd(TASK_STREAM, task_fields(make_task(uuid.uuid4(), "hi")))
+    await enqueue(redis, task_fields(make_task(uuid.uuid4(), "hi")))
     [delivery] = await q.receive(1, block_ms=100)
     runner = FakeRunner(raises)
     consumer = TaskConsumer(q, runner, redis, settings)
@@ -88,7 +128,7 @@ async def test_only_a_finished_run_is_acknowledged(redis, settings, raises, acke
 async def test_malformed_task_is_dead_lettered_without_running(redis, settings):
     q = queue(redis)
     await q.setup()
-    await redis.xadd(TASK_STREAM, {"task_id": "not-a-uuid", "content": "hi"})
+    await enqueue(redis, {"task_id": "not-a-uuid", "content": "hi"}, tenant="some-tenant")
     [delivery] = await q.receive(1, block_ms=100)
     runner = FakeRunner()
     await TaskConsumer(q, runner, redis, settings).handle(delivery)
@@ -102,7 +142,7 @@ async def test_task_past_max_deliveries_is_dead_lettered_and_reported(redis, set
     q = queue(redis, idle_ms=0)
     await q.setup()
     task = make_task(uuid.uuid4(), "hi")
-    await redis.xadd(TASK_STREAM, task_fields(task))
+    await enqueue(redis, task_fields(task))
     for _ in range(settings.max_deliveries + 1):
         [delivery] = await q.receive(1, block_ms=100)
     assert delivery.attempt == settings.max_deliveries + 1
@@ -121,7 +161,7 @@ async def test_busy_conversation_leaves_the_task_pending(redis, settings):
     q = queue(redis)
     await q.setup()
     task = make_task(uuid.uuid4(), "hi")
-    await redis.xadd(TASK_STREAM, task_fields(task))
+    await enqueue(redis, task_fields(task))
     [delivery] = await q.receive(1, block_ms=100)
     held = ConversationLock(redis, task.conversation_id, 10)
     assert await held.acquire()
@@ -137,7 +177,7 @@ async def test_task_below_the_conversation_floor_is_acked_without_running(redis,
     await q.setup()
     task = make_task(uuid.uuid4(), "hi", seq=seq)
     await redis.set(floor_key(task.conversation_id), 2)  # app-service has since enqueued turn 2
-    await redis.xadd(TASK_STREAM, task_fields(task))
+    await enqueue(redis, task_fields(task))
     [delivery] = await q.receive(1, block_ms=100)
 
     runner = FakeRunner()
@@ -154,7 +194,7 @@ async def test_a_task_continues_the_trace_it_was_sent_from(redis, settings, span
     task = make_task(uuid.uuid4(), "hi")
     with trace.get_tracer("test").start_as_current_span("send agent_tasks") as producer:
         fields = inject_into(task_fields(task))  # what app-service does when it enqueues
-    await redis.xadd(TASK_STREAM, fields)
+    await enqueue(redis, fields)
     [delivery] = await q.receive(1, block_ms=100)
 
     await TaskConsumer(q, FakeRunner(), redis, settings).handle(delivery)
@@ -174,7 +214,7 @@ async def test_skipping_a_stale_copy_is_visible_on_the_span(redis, settings, spa
     await q.setup()
     task = make_task(uuid.uuid4(), "hi", seq=1)
     await redis.set(floor_key(task.conversation_id), 2)
-    await redis.xadd(TASK_STREAM, task_fields(task))
+    await enqueue(redis, task_fields(task))
     [delivery] = await q.receive(1, block_ms=100)
     await TaskConsumer(q, FakeRunner(), redis, settings).handle(delivery)
     [consumer] = [s for s in spans.get_finished_spans() if s.name == "process agent_tasks"]
@@ -195,7 +235,7 @@ async def test_each_delivery_is_counted_by_what_came_of_it(redis, settings):
     q = queue(redis)
     await q.setup()
     task = make_task(uuid.uuid4(), "hi")
-    await redis.xadd(TASK_STREAM, task_fields(task))
+    await enqueue(redis, task_fields(task))
     [delivery] = await q.receive(1, block_ms=100)
     labels = {"app__result": "replied", "app__tenant_id": str(task.tenant_id)}
     before = (metric_total("app.task.deliveries", **labels), metric_total("app.task.duration", **labels))
@@ -207,14 +247,17 @@ async def test_each_delivery_is_counted_by_what_came_of_it(redis, settings):
 async def test_queue_monitor_reports_backlog_pending_and_dead_letters(redis):
     q = queue(redis)
     await q.setup()
+    busy, waiting = uuid.uuid4(), uuid.uuid4()
     for content in ("a", "b", "c"):
-        await redis.xadd(TASK_STREAM, task_fields(make_task(uuid.uuid4(), content)))
+        await enqueue(redis, task_fields(make_task(uuid.uuid4(), content, tenant_id=busy)))
     await q.receive(1, block_ms=100)  # one delivered and left unacknowledged
+    await enqueue(redis, task_fields(make_task(uuid.uuid4(), "d", tenant_id=waiting)))  # never picked: no group yet
     await redis.xadd(DEAD_LETTER_STREAM, {"reason": "test"})
 
-    monitor = QueueMonitor(redis, {TASK_STREAM: CONSUMER_GROUP}, dead_letter_stream=DEAD_LETTER_STREAM)
+    monitor = QueueMonitor(redis, {}, dead_letter_stream=DEAD_LETTER_STREAM)
     await monitor.sample()
-    tasks = monitor.latest[TASK_STREAM]
-    assert (tasks["lag"], tasks["pending"]) == (2, 1)
+    tasks = monitor.tenants[str(busy)]
+    assert (tasks["lag"], tasks["pending"], tasks["slots"]) == (2, 1, 1)
     assert 0 <= tasks["oldest_pending_age"] < 60
+    assert monitor.tenants[str(waiting)] == {"lag": 1, "pending": 0, "oldest_pending_age": 0.0, "slots": 0}
     assert monitor.latest[DEAD_LETTER_STREAM] == {"dead_letters": 1}
