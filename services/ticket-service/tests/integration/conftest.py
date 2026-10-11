@@ -23,7 +23,11 @@ def client():
 
 @pytest.fixture(scope="session")
 def db():
-    with psycopg.connect(ADMIN_DB_URL, autocommit=True) as conn:
+    try:
+        conn = psycopg.connect(ADMIN_DB_URL, autocommit=True)
+    except psycopg.OperationalError as exc:
+        pytest.skip(f"ticket_service database not reachable: {exc}")
+    with conn:
         yield conn
 
 
