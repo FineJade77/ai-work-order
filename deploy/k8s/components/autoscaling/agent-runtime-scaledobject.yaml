@@ -1,8 +1,12 @@
 # agent-runtime scales on queue backlog, not CPU: its tasks mostly wait on the model (needs KEDA).
-# lagCount counts entries not yet delivered to the consumer group (KEDA 2.12+, Redis 7+; check the
-# field names against the installed KEDA's redis-streams scaler). pendingEntriesCount would be the
-# wrong signal: each replica only takes as many tasks as it runs (WORKER_CONCURRENCY, default 8),
-# so pending entries plateau at 8 x replicas however long the queue grows.
+# The backlog is the tasks not yet delivered, summed over every tenant's stream (agent_tasks:t:*).
+# KEDA's redis-streams scaler watches a single stream, so the number comes from Prometheus instead:
+# app_queue_lag, sampled by agent-runtime every 15 s. This component therefore needs a Prometheus
+# that receives the services' metrics (components/observability in a dev cluster).
+# Pending entries would be the wrong signal: each replica only takes as many tasks as it runs
+# (WORKER_CONCURRENCY, default 8), so they plateau at 8 x replicas however long the queue grows.
+# A tenant held at its own concurrency limit also shows as backlog, which more replicas do not
+# clear; raise its limit (agent_sched:max_concurrency) if that is what keeps the replicas up.
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
@@ -27,9 +31,9 @@ spec:
               value: 2
               periodSeconds: 60
   triggers:
-    - type: redis-streams
+    - type: prometheus
       metadata:
-        address: redis:6379
-        stream: agent_tasks
-        consumerGroup: agent_runtime
-        lagCount: "8"
+        serverAddress: http://observability:9090
+        # Every replica reports the same values: max per tenant, then the sum over tenants.
+        query: sum(max by (app_tenant_id) (app_queue_lag{messaging_destination_name="agent_tasks"}))
+        threshold: "8"

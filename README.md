@@ -8,7 +8,7 @@
 
 ```
 浏览器 ──HTTP/SSE──▶ app-service
-                       ├─ XADD agent_tasks ──────────────▶ Redis Streams ──▶ agent-runtime（LangGraph Worker）
+                       ├─ XADD agent_tasks:t:{租户} ─────▶ Redis Streams ──▶ agent-runtime（LangGraph Worker，按租户公平取任务）
                        ├─ 读 agent_results、每会话事件 Stream ◀─ Redis ◀──────── agent-runtime 写入
                        └─ 工单页面（查询 / 流转）─────────▶ ticket-service
 
@@ -27,7 +27,7 @@ agent-runtime ─┬─▶ tool-gateway ─┬─▶ knowledge-service
 | knowledge-service | 8005 | 知识检索，V1 为按租户写死的数据 | 无 |
 | ticket-service | 8006 | 工单生命周期：4 状态状态机、乐观锁、处理记录 | `ticket_service` |
 
-一个 Postgres 实例、每个服务一个库，服务之间不共享表和代码；Redis 同时承担任务队列、结果与事件回传、会话锁、会话下限（跳过旧轮次的副本）和发消息限流计数。
+一个 Postgres 实例、每个服务一个库，服务之间不共享表和代码；Redis 同时承担任务队列（每个租户一条 Stream，Worker 按租户轮流取，见「租户公平调度」）、结果与事件回传、会话锁、会话下限（跳过旧轮次的副本）和发消息限流计数。
 
 ## 快速开始
 
@@ -222,6 +222,25 @@ docker compose exec postgres psql -U work_order -d app_service -c \
 
 - 每个员工每分钟最多发 6 条消息、每天 200 条，超出返回 429 `RATE_LIMITED`（带 `Retry-After`）。用 app-service 的 `MESSAGE_RATE_PER_MINUTE`、`MESSAGE_RATE_PER_DAY` 调整。
 
+### 租户公平调度
+
+每个租户有自己的任务队列，agent-runtime 按租户轮流取任务：一个租户积压再多，也只排在自己后面，不会拖慢别的租户。另外每个租户同时运行的任务数有上限（跨所有副本，默认 8，agent-runtime 的 `TENANT_MAX_CONCURRENCY`，0 为不限），任务很慢的租户占不满所有 Worker。原理见架构设计文档 3.3 节。
+
+单个租户的权重和上限在 Redis 里设置，下一次取任务就生效（Redis 数据清空后回到默认值）：
+
+```bash
+docker compose exec redis redis-cli HSET agent_sched:weight <租户 ID> 2             # 积压时被服务的频率是别人的 2 倍
+docker compose exec redis redis-cli HSET agent_sched:max_concurrency <租户 ID> 16   # 同时最多 16 个任务
+```
+
+查看现状：
+
+```bash
+docker compose exec redis redis-cli ZRANGE agent_sched:active 0 -1 WITHSCORES     # 有任务在排队的租户和它的虚拟时间
+docker compose exec redis redis-cli ZCARD agent_sched:leases:<租户 ID>             # 这个租户占用的并发名额
+docker compose exec redis redis-cli XINFO GROUPS agent_tasks:t:<租户 ID>           # lag：还没取走；pending：处理中
+```
+
 ## 可观测性
 
 `docker compose up` 会一起启动 `observability`（`grafana/otel-lgtm`：OTel Collector + Tempo + Prometheus + Loki + Grafana），六个服务把 trace、指标、日志经 OTLP 发给它。数据存在容器里，重建容器就清空。
@@ -248,11 +267,13 @@ docker compose exec postgres psql -U work_order -d app_service -c \
 - 结果落库是另一条 trace（`process agent_results`），用 link 指回 Agent 的那次运行。
 - 服务的标准输出也是一行一个 JSON：`docker compose logs app-service`。
 - **看板**（Grafana → Dashboards → ai-work-order）：
-  - **系统总览**：轮次与 SLO（30 秒内完成的比例、p95）、任务队列（积压、待确认、最老待确认、死信、每次投递的结果）、Agent（节点耗时、意图、检索命中）、大模型（token、调用耗时、首 token、各租户预算使用率）、入口与工具（HTTP、5xx、限流、SSE、工具调用）、审批（待审批数、最久等待、每小时申请与各结果、审批耗时）。顶部可按租户过滤。
+  - **系统总览**：轮次与 SLO（30 秒内完成的比例、p95）、任务队列（积压、待确认、最老待确认、死信、每次投递的结果）、Agent（节点耗时、意图、检索命中）、大模型（token、调用耗时、首 token、各租户预算使用率）、入口与工具（HTTP、5xx、限流、SSE、工具调用）；任务队列一行里有各租户的积压、占用的并发名额和排队 p95、审批（待审批数、最久等待、每小时申请与各结果、审批耗时）。顶部可按租户过滤。
   - **单轮排查**：填会话 id 列出它的各轮 trace；填 trace id 看调用树和这一轮在所有服务里的日志。
 - **告警**（Grafana → Alerting）：任务积压、任务长时间未确认、新死信、检索降级、预算超过 80%、SLO 快速燃烧、5xx 过高、审批超过 1 小时没人处理。本地没有接通知渠道，在 Alerting 页面看状态。想看它们触发，可以：
   ```bash
-  docker compose exec redis redis-cli XADD agent_tasks '*' task_id not-a-uuid content broken   # 死信
+  docker compose exec redis redis-cli XADD agent_tasks:t:broken '*' task_id not-a-uuid content broken   # 死信：
+  docker compose exec redis redis-cli ZADD agent_sched:active 0 broken                                  # 一条格式不对的任务
+  docker compose exec redis redis-cli ZREM agent_sched:tenants broken                                   # 看完后去掉这个假租户
   docker compose stop knowledge-service && scripts/demo.sh vpn; docker compose start knowledge-service   # 检索降级
   ```
   告警每分钟评估一次，一两分钟后变成 Alerting。
@@ -277,9 +298,10 @@ scripts/chaos.py rolling     # 逐个重启副本（SIGTERM，相当于滚动发
 scripts/chaos.py kill        # SIGKILL 手上任务最多的副本（崩溃）
 scripts/chaos.py scale-in    # 从 3 个副本缩到 1 个（相当于 KEDA 缩容）
 scripts/chaos.py all
+scripts/chaos.py noisy       # 不注入故障：demo 租户 2 秒内发 80 条，northwind 陆续发 8 条，看后者是否被拖慢
 ```
 
-agent-runtime 收到 SIGTERM 会先停止取新任务，等手上的任务跑完（最多 70 秒），跑不完的交还给其他副本，所以滚动重启和缩容不会打断正在进行的对话。强杀没有机会做这些，被杀副本的任务约 90 秒后由其他副本接管，从 checkpoint 续跑。结果对比见架构设计文档 3.3 节。
+agent-runtime 收到 SIGTERM 会先停止取新任务，等手上的任务跑完（最多 70 秒），跑不完的交还给其他副本，所以滚动重启和缩容不会打断正在进行的对话。强杀没有机会做这些，被杀副本的任务约 90 秒后由其他副本接管，从 checkpoint 续跑。`noisy` 检查的是租户公平调度：安静租户的排队 p95 要低于 2 秒（改造前是 26 秒）。结果对比见架构设计文档 3.3 节。
 
 ## 部署到 Kubernetes
 

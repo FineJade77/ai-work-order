@@ -23,6 +23,7 @@ def test_defaults_are_consistent():
     [
         {"task_timeout_seconds": 80},  # a live run could outlast its lock
         {"conversation_lock_seconds": 120},  # a reclaimed task would bounce off a dead worker's lock
+        {"tenant_lease_seconds": 30},  # a live run would lose its slot in the tenant's limit
     ],
 )
 def test_inconsistent_timing_is_rejected(timing):

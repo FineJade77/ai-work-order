@@ -15,6 +15,8 @@ from opentelemetry.metrics import CallbackOptions, Observation
 from redis.asyncio import Redis
 from redis.exceptions import RedisError, ResponseError
 
+from app.worker.queue import CONSUMER_GROUP, KNOWN_TENANTS, TASK_STREAM, leases_key, task_stream
+
 meter = metrics.get_meter("agent_runtime")
 logger = logging.getLogger("agent_runtime.metrics")
 
@@ -47,7 +49,9 @@ KNOWLEDGE_SEARCHES = meter.create_counter(
 class QueueMonitor:
     """Samples the Redis Streams every interval for gauges an alert can watch: backlog not yet
     delivered (lag), delivered but unacknowledged (pending), how long the oldest pending one has
-    waited, and dead letters. Every replica reports the same values; query them with max()."""
+    waited, and dead letters. The task queue is a stream per tenant, so its gauges carry the tenant
+    (sum them for the whole queue), along with how many slots of its concurrency limit each tenant
+    holds. Every replica reports the same values; query them with max()."""
 
     def __init__(self, redis: Redis, streams: dict[str, str], dead_letter_stream: str, interval_s: float = 15):
         self._redis = redis
@@ -55,6 +59,7 @@ class QueueMonitor:
         self._dead_letters = dead_letter_stream
         self._interval_s = interval_s
         self.latest: dict[str, dict[str, float]] = {}
+        self.tenants: dict[str, dict[str, float]] = {}  # the task queue, by tenant
         meter.create_observable_gauge(
             "app.queue.lag", callbacks=[self._observe("lag")], description="Entries not yet delivered to the group",
         )
@@ -68,12 +73,19 @@ class QueueMonitor:
         meter.create_observable_gauge(
             "app.queue.dead_letters", callbacks=[self._observe("dead_letters")], description="Dead-lettered tasks",
         )
+        meter.create_observable_gauge(
+            "app.queue.tenant_slots", callbacks=[self._observe("slots")],
+            description="Tasks a tenant has running, as counted against its concurrency limit",
+        )
 
     def _observe(self, key: str):
         def callback(_: CallbackOptions) -> Iterable[Observation]:
             for stream, values in self.latest.items():
                 if key in values:
                     yield Observation(values[key], {"messaging.destination.name": stream})
+            for tenant, values in self.tenants.items():
+                if key in values:
+                    yield Observation(values[key], {"messaging.destination.name": TASK_STREAM, "app.tenant_id": tenant})
         return callback
 
     async def run(self) -> None:
@@ -86,15 +98,29 @@ class QueueMonitor:
 
     async def sample(self) -> None:
         for stream, group in self._streams.items():
-            try:
-                groups = await self._redis.xinfo_groups(stream)
-            except ResponseError:  # the stream doesn't exist yet
-                continue
-            info = next((g for g in groups if g["name"] == group), None)
-            if info is None:
-                continue
-            summary = await self._redis.xpending(stream, group)
-            oldest = summary.get("min")
-            age = max(0.0, time.time() - int(oldest.split("-", 1)[0]) / 1000) if oldest else 0.0
-            self.latest[stream] = {"lag": info.get("lag") or 0, "pending": info["pending"], "oldest_pending_age": age}
+            if (values := await self._group(stream, group)) is not None:
+                self.latest[stream] = values
         self.latest[self._dead_letters] = {"dead_letters": await self._redis.xlen(self._dead_letters)}
+        tenants = {}
+        now_ms = int(time.time() * 1000)
+        for tenant in await self._redis.zrange(KNOWN_TENANTS, 0, -1):
+            values = await self._group(task_stream(tenant), CONSUMER_GROUP)
+            if values is None:  # no group until the tenant's first task is picked: all of it is backlog
+                values = {"lag": await self._redis.xlen(task_stream(tenant)), "pending": 0, "oldest_pending_age": 0.0}
+            # Expired leases are only removed by the next pick; don't count them meanwhile.
+            values["slots"] = await self._redis.zcount(leases_key(tenant), f"({now_ms}", "+inf")
+            tenants[tenant] = values
+        self.tenants = tenants
+
+    async def _group(self, stream: str, group: str) -> dict[str, float] | None:
+        try:
+            groups = await self._redis.xinfo_groups(stream)
+        except ResponseError:  # the stream doesn't exist yet
+            return None
+        info = next((g for g in groups if g["name"] == group), None)
+        if info is None:
+            return None
+        summary = await self._redis.xpending(stream, group)
+        oldest = summary.get("min")
+        age = max(0.0, time.time() - int(oldest.split("-", 1)[0]) / 1000) if oldest else 0.0
+        return {"lag": info.get("lag") or 0, "pending": info["pending"], "oldest_pending_age": age}

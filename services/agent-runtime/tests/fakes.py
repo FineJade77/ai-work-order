@@ -15,14 +15,15 @@ LEAVE_HIT = {"category": "leave", "question": "年假怎么申请？", "answer":
 
 
 def make_task(
-    conversation_id: uuid.UUID, content: str, *, user_id: uuid.UUID | None = None, seq: int = 1, **approval
+    conversation_id: uuid.UUID, content: str, *, user_id: uuid.UUID | None = None, seq: int = 1,
+    tenant_id: uuid.UUID | None = None, **approval
 ) -> AgentTask:
     """A message task; pass kind="approval", approval_id=..., decision=... for a decision task."""
     return AgentTask(
         task_id=uuid.uuid4(),
         seq=seq,
         conversation_id=conversation_id,
-        tenant_id=TENANT,
+        tenant_id=tenant_id or TENANT,
         user_id=user_id or uuid.uuid4(),
         content=content,
         **approval,

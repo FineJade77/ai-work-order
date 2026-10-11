@@ -32,6 +32,10 @@ class TaskConsumer:
     (crash, timeout, error, RetryLater) leaves it pending, to be reclaimed by some consumer
     after claim_idle_seconds and resumed from its last checkpoint.
 
+    Which task comes next is the queue's business: it serves tenants in turn and caps how many
+    tasks each has running. The slot a delivery holds in that cap is given back when this consumer
+    is done with it, whatever came of it.
+
     stop() shuts down gracefully (SIGTERM: a rolling deploy, a scale-in): take no more work, let
     the runs in flight finish for up to shutdown_drain_seconds, hand back whatever is left so
     another replica takes it at once, and leave the consumer group.
@@ -44,7 +48,7 @@ class TaskConsumer:
         self._settings = settings
         self._slots = anyio.Semaphore(settings.worker_concurrency)
         self._intake = anyio.CancelScope()
-        self._running: dict[str, anyio.CancelScope] = {}  # delivery id -> its run
+        self._running: dict[tuple[str, str], anyio.CancelScope] = {}  # (tenant, delivery id) -> its run
         self._unstarted: list[Delivery] = []
         self.stopping = False
         self._drain_deadline = 0.0
@@ -128,16 +132,26 @@ class TaskConsumer:
         except (RedisError, OSError):
             logger.warning("handing back %s failed; it is reclaimed once idle", delivery.id, exc_info=True)
 
+    async def _release(self, delivery: Delivery) -> None:
+        try:
+            with anyio.CancelScope(shield=True):
+                await self._queue.release(delivery)
+        except (RedisError, OSError):
+            logger.warning("releasing %s's tenant slot failed; it frees itself when the lease expires", delivery.id, exc_info=True)
+
     async def _process(self, delivery: Delivery) -> None:
+        key = (delivery.tenant, delivery.id)
         with anyio.CancelScope() as scope:
-            self._running[delivery.id] = scope
+            self._running[key] = scope
             try:
                 await self.handle(delivery)
             except Exception:
                 logger.exception("task delivery %s failed; it stays pending for redelivery", delivery.id)
-        del self._running[delivery.id]
+        del self._running[key]
         if scope.cancelled_caught:  # cut off by stop()
             await self._hand_back(delivery)
+        else:
+            await self._release(delivery)
         self._slots.release()
 
     async def handle(self, delivery: Delivery) -> None:
@@ -154,7 +168,7 @@ class TaskConsumer:
             "app.delivery_attempt": delivery.attempt,
             "app.queue_wait_ms": queue_wait_ms(delivery.id),
         }
-        QUEUE_WAIT.record(attributes["app.queue_wait_ms"] / 1000)
+        QUEUE_WAIT.record(attributes["app.queue_wait_ms"] / 1000, {"app.tenant_id": fields.get("tenant_id", "")})
         started = time.monotonic()
         result = "error"
         with tracer.start_as_current_span(

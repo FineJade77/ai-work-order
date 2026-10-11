@@ -18,9 +18,10 @@ from app.events import RESULT_STREAM, EventPublisher, event_stream_key
 from app.graph import prompts
 from app.graph.builder import build_graph
 from app.worker.consumer import TaskConsumer
-from app.worker.queue import CONSUMER_GROUP, TASK_STREAM, RedisStreamTaskQueue, floor_key
+from app.worker.queue import RedisStreamTaskQueue, floor_key, task_stream
 from app.worker.runner import TaskRunner
 from tests.fakes import TENANT, FakeModels, make_task
+from tests.integration.test_queue import enqueue, pending_count
 from tests.integration.env import (
     CHECKPOINT_ADMIN_DB_URL,
     CHECKPOINT_DB_URL,
@@ -71,7 +72,9 @@ class Worker:
             lambda t: EventPublisher(self.redis, t),
         )
         queue = RedisStreamTaskQueue(
-            self.redis, "e2e", claim_idle_ms=int(self.settings.claim_idle_seconds * 1000), claim_interval_s=0.2
+            self.redis, "e2e", claim_idle_ms=int(self.settings.claim_idle_seconds * 1000),
+            max_concurrency=self.settings.tenant_max_concurrency,
+            lease_ms=int(self.settings.tenant_lease_seconds * 1000), claim_interval_s=0.2,
         )
         self._consumer = asyncio.create_task(TaskConsumer(queue, runner, self.redis, self.settings).run())
 
@@ -139,16 +142,14 @@ def task_fields(task) -> dict[str, str]:
 
 async def send(w: Worker, content: str, *, tenant_id: uuid.UUID | None = None) -> list[tuple[str, dict]]:
     """Enqueues the conversation's next message the way app-service does (floor raised to its seq
-    in the same transaction) and waits for its run's 'done' event."""
+    first) and waits for its run's 'done' event."""
     w.seq += 1
     task = make_task(w.conversation, content, user_id=w.user, seq=w.seq)
     if tenant_id:
         task = task.model_copy(update={"tenant_id": tenant_id})
     w.last_task = task
-    async with w.redis.pipeline(transaction=True) as pipe:
-        pipe.set(floor_key(w.conversation), task.seq)
-        pipe.xadd(TASK_STREAM, task_fields(task))
-        await pipe.execute()
+    await w.redis.set(floor_key(w.conversation), task.seq)
+    await enqueue(w.redis, task_fields(task))
     with anyio.fail_after(20):
         while True:
             entries = await w.redis.xrange(event_stream_key(w.conversation))
@@ -191,7 +192,7 @@ async def test_crash_after_the_ticket_was_created_does_not_file_a_second_one(wor
 
 
 async def _drained(redis) -> bool:
-    [group] = await redis.xinfo_groups(TASK_STREAM)
+    [group] = await redis.xinfo_groups(task_stream(TENANT))
     return group["lag"] == 0 and group["pending"] == 0
 
 
@@ -211,7 +212,7 @@ async def test_stale_copy_of_an_older_turn_is_skipped(worker, floor):
 
     if floor == "lost":
         await worker.redis.delete(floor_key(worker.conversation))
-    await worker.redis.xadd(TASK_STREAM, task_fields(first))
+    await enqueue(worker.redis, task_fields(first))
     with anyio.fail_after(10):
         while not await _drained(worker.redis):
             await anyio.sleep(0.1)
@@ -253,7 +254,7 @@ async def test_budget_refusal_is_acknowledged_not_retried(worker):
 async def nothing_pending(w) -> None:
     """The task is acknowledged just after its done event is published: wait for it."""
     with anyio.fail_after(2):
-        while (await w.redis.xpending(TASK_STREAM, CONSUMER_GROUP))["pending"]:
+        while await pending_count(w.redis):
             await anyio.sleep(0.02)
 
 
@@ -279,7 +280,7 @@ async def send_decision(w: Worker, approval_id: str, decision: str) -> list[tupl
     task = make_task(w.conversation, "", user_id=w.user, seq=w.seq, kind="approval", approval_id=approval_id,
                      decision=decision)
     w.last_task = task
-    await w.redis.xadd(TASK_STREAM, task_fields(task))
+    await enqueue(w.redis, task_fields(task))
     with anyio.fail_after(20):
         while True:
             entries = await w.redis.xrange(event_stream_key(w.conversation))

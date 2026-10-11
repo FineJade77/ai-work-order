@@ -5,7 +5,7 @@ Kustomize 清单，`kubectl` 自带 kustomize，不需要额外工具。
 ```
 base/                      与环境无关：命名空间、ConfigMap（服务地址）、各服务 Deployment/Service、迁移 Job
 overlays/dev/              开发集群用：单实例 Postgres/Redis、db-init Job、seed Job、开发凭据、本地镜像名
-components/autoscaling/    可选：HTTP 服务的 HPA，agent-runtime 的 KEDA redis-streams ScaledObject
+components/autoscaling/    可选：HTTP 服务的 HPA，agent-runtime 的 KEDA ScaledObject（Prometheus 触发器）
 components/observability/  可选：打开六个服务的 OpenTelemetry，部署 grafana/otel-lgtm（看板和告警规则与 compose 同源）
 apply-dev.sh               按依赖顺序部署 dev overlay
 ```
@@ -62,7 +62,7 @@ kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/k8s/overlays/dev
 - **Postgres / Redis**：换成 Operator（CloudNativePG、Redis Operator）或托管服务，修改连接串和 `REDIS_URL`；建库建账号交给基础设施，不用 db-init Job。Redis 至少开启 AOF，否则主从切换可能丢任务（app-service 的补偿机制会在 10 分钟后重新投递）。
 - **部署顺序**：用 Helm hook 或 Argo CD sync wave 表达"迁移完成后再更新服务"，替代 apply-dev.sh。
 - **扩缩容**：在 overlay 里启用 `components/autoscaling`，需要 metrics-server，agent-runtime 还需要 KEDA。
-  - agent-runtime 按队列积压（`lagCount`）扩缩容，而不是 CPU，因为它的任务大部分时间在等模型。缩容有 300 秒稳定窗口、每分钟最多减 2 个：被缩掉的 Pod 要先等手上的任务跑完。
+  - agent-runtime 按队列积压扩缩容，而不是 CPU，因为它的任务大部分时间在等模型。任务队列是每租户一条 Stream，积压取各租户之和，由 KEDA 的 Prometheus 触发器查询 `app_queue_lag`，所以启用这个组件还需要一个收得到服务指标的 Prometheus（开发集群启用 `components/observability`，它的 Service 暴露 9090；生产环境把 `serverAddress` 改成自己的 Prometheus）。缩容有 300 秒稳定窗口、每分钟最多减 2 个：被缩掉的 Pod 要先等手上的任务跑完。
   - 数值只是起点，按架构文档第 5 节调优。
 - **入口**：清单只有 ClusterIP Service。对外只应暴露 app-service，经 API Gateway（架构文档 3.1 节）或 Ingress；其余服务都是内部接口。
 - **可观测性**：`components/observability` 只适合开发集群（一体化容器、数据在 Pod 里、不记录提示词内容）。生产环境用 OTel Operator 或独立的 Collector，Tempo/Loki/Prometheus（或 Mimir）/Grafana 各自持久化部署，把 `otel-env` 里的 `OTEL_EXPORTER_OTLP_ENDPOINT` 指向 Collector，在 Collector 做尾部采样，告警接值班系统。访问开发集群里的 Grafana：`kubectl -n ai-work-order port-forward svc/observability 3000:3000`。

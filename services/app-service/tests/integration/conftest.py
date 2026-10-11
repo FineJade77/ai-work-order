@@ -9,6 +9,7 @@ import httpx
 import psycopg
 import pytest
 from redis.asyncio import Redis
+from redis.exceptions import RedisError
 
 from app.core.config import get_settings
 from app.core.security import hash_password
@@ -61,7 +62,7 @@ async def redis():
     client = Redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=20)
     try:
         await client.ping()
-    except OSError as exc:
+    except (RedisError, OSError) as exc:
         await client.aclose()
         pytest.skip(f"Redis not reachable at {REDIS_URL}: {exc}")
     await client.flushdb()  # the dedicated test database only
